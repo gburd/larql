@@ -166,6 +166,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     // MLA fields
     let kv_lora_rank = text_config["kv_lora_rank"].as_u64().map(|v| v as usize);
     let q_lora_rank = text_config["q_lora_rank"].as_u64().map(|v| v as usize);
+    let qk_nope_head_dim = text_config["qk_nope_head_dim"].as_u64().map(|v| v as usize);
+    let qk_rope_head_dim = text_config["qk_rope_head_dim"].as_u64().map(|v| v as usize);
+    let v_head_dim = text_config["v_head_dim"].as_u64().map(|v| v as usize);
 
     // RoPE scaling. Four shapes appear in the wild:
     //
@@ -295,6 +298,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         num_shared_experts,
         kv_lora_rank,
         q_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
         rope_scaling,
         attn_logit_softcapping,
         final_logit_softcapping,
