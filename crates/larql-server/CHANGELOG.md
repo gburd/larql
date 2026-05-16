@@ -6,6 +6,77 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-17] — Synthetic-vindex test fixture + coverage push begins
+
+Phase 1 of the larql-server coverage push (target: total ≥ 90%). Built
+a reusable test fixture that constructs a complete f32 vindex on disk
+from synthetic deterministic weights, then drove the pilot file
+`routes/explain.rs` from 44.86% → 93.46% (clears the 90% per-file
+floor). Total server coverage 69.82% → 71.18%; included-files
+coverage 91.87% → 91.98%.
+
+### Added
+
+- **`tests/common/synthetic_vindex.rs`** — `build()` produces a tempdir
+  with `index.json` (`has_model_weights: true`), `weight_manifest.json`,
+  `gate_vectors.bin`, `attn_weights.bin`, `up_weights.bin`,
+  `down_weights.bin`, `norms.bin`, `lm_head.bin`, `embeddings.bin`,
+  `down_meta.bin`, and `tokenizer.json` — exactly what
+  `larql_vindex::load_model_weights_with_opts` consumes. Synthetic
+  weights match `larql-vindex/tests/test_vindex.rs::make_synthetic_model`:
+  2 layers × hidden=8 × intermediate=4, vocab=16. Build time ~10ms.
+- **`tests/common/mod.rs::model_with_real_weights(id)`** — returns
+  `(Arc<LoadedModel>, SyntheticVindex)`. `LoadedModel.path` points at
+  the fixture so `get_or_load_weights()` (called by every
+  `full_output=true` route handler) succeeds. Sibling
+  `_and_labels(id, labels)` variant seeds `probe_labels` for tests of
+  the `relations_only` branches.
+- **`tests/test_synthetic_vindex.rs`** — 9 tests:
+  fixture smoke (2) + explain-handler coverage (7 — basic, attention,
+  relations_only, relations + labels, band filter, multi-model,
+  multi-model 404, invalid JSON). Runs in ~30ms.
+
+### Changed
+
+- **`coverage-policy.json`** — `routes/explain.rs` removed from
+  `exclude_globs`; per-file 90% default now applies. 27 files (was 26)
+  clear the default; 10 debt baselines unchanged. Total floor
+  unchanged at 65%, included floor unchanged at 90%.
+
+### Playbook for next sessions (Tasks #94 — remaining 7 excluded files)
+
+Pattern that worked on explain.rs:
+
+1. Pick the next excluded file from `coverage-policy.json::exclude_globs`.
+   Recommended order by ROI: `routes/walk_ffn.rs` (874 missed lines, biggest
+   single gain), `routes/openai/chat.rs` (547), `routes/openai/completions.rs`
+   (303), `routes/stream.rs` (421), `routes/infer.rs` (195),
+   `routes/expert/*` (5 files at 0-57%), `grpc.rs` (302).
+2. Write one smoke test using `common::model_with_real_weights` that POSTs
+   to the file's main route handler. Measure coverage delta.
+3. Add 4-6 more tests targeting uncovered branches surfaced by
+   `cargo llvm-cov report --package larql-server --json`. The vocab in
+   `synthetic_vindex.rs` is small — most uncovered ranges are
+   reachable by adjusting query params (`band`, `relations_only`,
+   `with_attention`, `top_k`, full_output flags) or by giving the
+   fixture a payload it can run through.
+4. When the file clears 90%, remove it from `exclude_globs` and
+   confirm `make larql-server-coverage` passes.
+
+Caveats observed during the pilot:
+
+- The fixture's tokenizer needs at least a small WordLevel vocab.
+  An empty BPE encodes every prompt to 0 tokens; every per-token
+  branch in the route handler then stays uncovered. The shipped
+  fixture uses 12 WordLevel entries; adjust as needed.
+- The fixture's intermediate / hidden sizes are tiny on purpose
+  (build time matters). If a route needs larger shapes to exercise a
+  specific branch (e.g. multi-head attention paths), bump
+  `ModelDims` in `make_weights()`.
+- `LoadedModel` is `!Clone`; pass `probe_labels` at construction
+  via `model_with_real_weights_and_labels(id, labels)` rather than
+  mutating after `Arc::new`.
+
 ## [2026-05-16] — Mode B / QUIC ROADMAP backfill + GT5 end-to-end test
 
 ROADMAP-drift sweep: three G-MODEB / G-TRANSPORT items previously

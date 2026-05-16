@@ -75,7 +75,8 @@ pub fn run_ffn(
     // Layer-0 (or LARQL_STAGE_DUMP_LAYER) stage dumps — matches the Metal
     // `LARQL_METAL_DUMP_LAYERS` convention. Lets us diff per-stage
     // intermediates between CPU and Metal.
-    let stage_dump_dir = super::dump_config::DumpConfig::get().stage_dir(layer);
+    let dump_cfg = super::dump_config::DumpConfig::get();
+    let stage_dump_dir = dump_cfg.stage_dir(layer);
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
         if let Some(dir) = stage_dump_dir {
             let slice = arr.as_slice().unwrap_or(&[]);

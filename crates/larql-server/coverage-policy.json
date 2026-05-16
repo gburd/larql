@@ -11,7 +11,6 @@
     "crates/larql-server/src/grpc.rs",
     "crates/larql-server/src/grpc_expert.rs",
     "crates/larql-server/src/openapi.rs",
-    "crates/larql-server/src/routes/explain.rs",
     "crates/larql-server/src/routes/infer.rs",
     "crates/larql-server/src/routes/stream.rs",
     "crates/larql-server/src/routes/walk_ffn.rs",

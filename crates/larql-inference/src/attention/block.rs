@@ -333,7 +333,8 @@ fn run_attention_block_core(
     // Default is layer 0 (noise budget); set LARQL_STAGE_DUMP_LAYER=<N> to
     // capture a specific layer instead — Gemma 4 global layers (5, 11, …)
     // are useful for bisecting partial-RoPE / V-norm interactions.
-    let stage_dump = crate::forward::dump_config::DumpConfig::get().stage_dir(layer);
+    let dump_cfg = crate::forward::dump_config::DumpConfig::get();
+    let stage_dump = dump_cfg.stage_dir(layer);
     let dump_f32 = |name: &str, arr: &Array2<f32>| {
         if let Some(dir) = stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);

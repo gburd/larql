@@ -3,8 +3,14 @@
 //! Uses axum's tower::ServiceExt::oneshot pattern — requests are dispatched
 //! in-process to the full router with no network socket. Every test builds a
 //! synthetic in-memory VectorIndex (1 layer, 3 features, hidden=4).
+//!
+//! For tests that need a real `LoadedModel.weights`-populating model on
+//! disk (`full_output=true` paths into walk_ffn / explain / generation),
+//! see [`synthetic_vindex`] + [`model_with_real_weights`].
 
 #![allow(dead_code, unused_imports)]
+
+pub mod synthetic_vindex;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -284,6 +290,89 @@ impl ModelBuilder {
 
 pub fn model(id: &str) -> Arc<LoadedModel> {
     ModelBuilder::new(id).build()
+}
+
+/// Build a `LoadedModel` backed by a real synthetic vindex on disk.
+/// `LoadedModel.path` points at the tempdir and
+/// `LoadedModel.get_or_load_weights()` will mmap the synthetic
+/// tensors when the route handler calls it — so `full_output=true`
+/// paths (walk_ffn, explain, generation, lm_head) all execute their
+/// real codepaths instead of bailing on the empty `OnceLock`.
+///
+/// The returned `SyntheticVindex` owns the tempdir; the test must
+/// keep it alive for the duration of the test (drop after assertions).
+pub fn model_with_real_weights(id: &str) -> (Arc<LoadedModel>, synthetic_vindex::SyntheticVindex) {
+    model_with_real_weights_and_labels(id, HashMap::new())
+}
+
+/// Like [`model_with_real_weights`] but seeds `LoadedModel.probe_labels`
+/// so the `relations_only` branches in `routes/explain.rs` actually fire.
+pub fn model_with_real_weights_and_labels(
+    id: &str,
+    probe_labels: HashMap<(usize, usize), String>,
+) -> (Arc<LoadedModel>, synthetic_vindex::SyntheticVindex) {
+    use larql_vindex::{SilentLoadCallbacks, VectorIndex};
+
+    let fixture = synthetic_vindex::build();
+    let mut cb = SilentLoadCallbacks;
+    let index = VectorIndex::load_vindex(&fixture.dir, &mut cb).expect("load synthetic vindex");
+    let config = larql_vindex::load_vindex_config(&fixture.dir).expect("load vindex config");
+
+    // Reload the same tokenizer the fixture wrote to disk so the
+    // route handler's `model.tokenizer.encode(prompt)` produces real
+    // token ids (and therefore exercises the per-token branches in
+    // walk_ffn / explain / predict). Without this, an empty BPE
+    // tokenizer would encode every prompt to 0 tokens and the meat
+    // of the route handlers stays uncovered.
+    let tok_bytes = std::fs::read(fixture.dir.join("tokenizer.json")).expect("read tokenizer.json");
+    let fixture_tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(&tok_bytes)
+        .expect("parse fixture tokenizer");
+
+    // Embed matrix — copy what `build_vindex` wrote so the embed
+    // lookup hits a non-zero row per token. We reload it from the
+    // fixture so the test sees the exact same data the loader would.
+    let embed_path = fixture.dir.join("embeddings.bin");
+    let embed_bytes = std::fs::read(&embed_path).expect("read embeddings.bin");
+    let n_floats = embed_bytes.len() / std::mem::size_of::<f32>();
+    let mut embed_floats = Vec::with_capacity(n_floats);
+    for chunk in embed_bytes.chunks_exact(4) {
+        embed_floats.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    let embeddings = Array2::from_shape_vec((fixture.vocab_size, fixture.hidden), embed_floats)
+        .expect("embeddings shape");
+
+    let model = Arc::new(LoadedModel {
+        id: id.to_string(),
+        path: fixture.dir.clone(),
+        config,
+        patched: std::sync::Arc::new(tokio::sync::RwLock::new(PatchedVindex::new(index))),
+        embeddings,
+        embed_scale: 1.0,
+        tokenizer: fixture_tokenizer,
+        infer_disabled: false,
+        ffn_only: false,
+        embed_only: false,
+        embed_store: None,
+        release_mmap_after_request: false,
+        weights: std::sync::OnceLock::new(),
+        probe_labels,
+        ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        requests_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        expert_filter: None,
+        unit_filter: None,
+        moe_remote: None,
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
+    });
+    (model, fixture)
 }
 
 // ══════════════════════════════════════════════════════════════

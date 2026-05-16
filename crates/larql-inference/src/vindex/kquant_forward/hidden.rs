@@ -25,7 +25,8 @@ pub fn predict_kquant_hidden(
 
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
     let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
-    let dump_dir = crate::forward::dump_config::DumpConfig::get().layer_dir();
+    let dump_cfg = crate::forward::dump_config::DumpConfig::get();
+    let dump_dir = dump_cfg.layer_dir();
     if let Some(dir) = dump_dir {
         let slice = h.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -183,7 +184,8 @@ fn run_moe_layer_cpu(
 
     let combined = &h1 + &h2;
 
-    let l0_stage_dump = crate::forward::dump_config::DumpConfig::get().stage_dir(layer);
+    let l0_dump_cfg = crate::forward::dump_config::DumpConfig::get();
+    let l0_stage_dump = l0_dump_cfg.stage_dir(layer);
     let dump_l0_arr = |name: &str, arr: &Array2<f32>| {
         if let Some(dir) = l0_stage_dump {
             let slice = arr.as_slice().unwrap_or(&[]);
