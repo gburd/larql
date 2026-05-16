@@ -9,8 +9,8 @@ keywords = ["matmul", "cpu", "blas", "quantization", "trait"]
 categories = ["science"]
 
 [dependencies]
-# Matrix types
-ndarray = { version = "0.16", features = ["blas"] }
+# Matrix types — blas feature added per-platform below where a backend exists
+ndarray = "0.16"
 # MoE expert parallelism: top-k experts run independently per token.
 rayon = "1.10"
 # Wire-format constants (Q4_K_BLOCK_ELEMS, etc.) for padding decisions.
@@ -18,13 +18,18 @@ rayon = "1.10"
 larql-models = { path = "../larql-models" }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
 openblas-src = { version = "0.10", features = ["system"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# `metal` + `objc` moved to `larql-compute-metal` per ADR-019. This crate
+# is CPU-only; Metal GPU dependencies live in the sibling crate.
+ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["accelerate"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
 openblas-src = { version = "0.10", features = ["system"] }
 
