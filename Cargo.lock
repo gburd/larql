@@ -2289,6 +2289,7 @@ version = "0.1.0"
 dependencies = [
  "larql-core",
  "larql-inference",
+ "larql-kv",
  "larql-lql",
  "larql-models",
  "larql-vindex",

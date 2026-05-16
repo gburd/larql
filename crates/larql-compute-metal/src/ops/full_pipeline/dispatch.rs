@@ -19,18 +19,6 @@ use crate::buffers::BufferCache;
 use crate::ops::q4_common::Q4Pipelines;
 use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
-/// Weights for one transformer layer — ALL Q4 + norm weights.
-/// Matches `larql_compute::FullPipelineLayer` but with borrowed Metal-friendly data.
-pub struct LayerWeights<'a> {
-    pub wq_q4: &'a [u8],
-    pub wk_q4: &'a [u8],
-    pub wv_q4: &'a [u8],
-    pub wo_q4: &'a [u8],
-    pub gate_q4: &'a [u8],
-    pub up_q4: &'a [u8],
-    pub down_t_q4: &'a [u8],
-}
-
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn encode_rms_norm(
     enc: &ComputeCommandEncoderRef,

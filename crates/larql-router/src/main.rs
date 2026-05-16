@@ -238,6 +238,19 @@ struct Cli {
     #[arg(long)]
     saturation_ceiling: Option<u32>,
 
+    /// ADR-0021: hedged-dispatch delay in milliseconds. When set, the
+    /// multi-shard fan-out picks a secondary replica per sub-request
+    /// and dispatches it after `--hedge-after-ms` if the primary
+    /// hasn't responded. Halves p99 tail latency in topologies with
+    /// `--target-replicas ≥ 2` at the cost of ~2× shard load on the
+    /// tail. Default disabled (matches pre-ADR-0021 behavior); only
+    /// fires on multi-shard requests, never on single-shard
+    /// `proxy_raw`. Operator signals: `larql_router_route_hedge_fires_total`
+    /// (how often the hedge fires) and `larql_router_route_hedge_wins_total`
+    /// (how often it actually beats the primary).
+    #[arg(long)]
+    hedge_after_ms: Option<u64>,
+
     /// ADR-0014 hysteresis: ratio of the elevation threshold below
     /// which a hot shard demotes. Default `0.8` means elevate at
     /// `--hot-shard-rps T`, demote only when the rate falls below
@@ -477,6 +490,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
+        // ADR-0021 — hedged-dispatch info log; the AppState already
+        // carries the delay through to handle_walk_ffn_inner.
+        if let Some(ms) = cli.hedge_after_ms {
+            info!(
+                hedge_after_ms = ms,
+                "Hedged dispatch: enabled (fires a secondary replica when primary > {ms} ms)"
+            );
+        }
+
         let svc = GridServiceServer::new(
             GridServiceImpl::new_with_key(state.clone(), cli.grid_key.clone())
                 .with_metrics(metrics.clone()),
@@ -562,6 +584,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         metrics: Some(metrics.clone()),
         #[cfg(feature = "http3")]
         h3_client,
+        hedge_after: cli.hedge_after_ms.map(std::time::Duration::from_millis),
     });
 
     let app = build_router(state);

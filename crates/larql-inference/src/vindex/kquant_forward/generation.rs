@@ -4,17 +4,17 @@ use tokenizers::Tokenizer;
 
 use crate::forward::PredictResult;
 
-use super::hidden::predict_q4k_hidden;
+use super::hidden::predict_kquant_hidden;
 
 /// End-to-end predict on a Q4_K/Q6_K vindex.
-pub fn predict_q4k(
+pub fn predict_kquant(
     weights: &mut ModelWeights,
     tokenizer: &Tokenizer,
     token_ids: &[u32],
     top_k: usize,
     index: &VectorIndex,
 ) -> PredictResult {
-    let h = predict_q4k_hidden(weights, token_ids, index, None);
+    let h = predict_kquant_hidden(weights, token_ids, index, None);
     crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 
@@ -33,7 +33,7 @@ pub fn is_end_of_turn(token: &str) -> bool {
 }
 
 /// CPU autoregressive generation against a Q4_K / Q6_K vindex.
-pub fn generate_q4k_cpu(
+pub fn generate_kquant_cpu(
     weights: &mut ModelWeights,
     tokenizer: &Tokenizer,
     prompt_ids: &[u32],
@@ -43,7 +43,7 @@ pub fn generate_q4k_cpu(
     let mut ids = prompt_ids.to_vec();
     let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
     for _ in 0..max_tokens {
-        let result = predict_q4k(weights, tokenizer, &ids, 1, index);
+        let result = predict_kquant(weights, tokenizer, &ids, 1, index);
         let next_id = match result.token_ids.first() {
             Some(&id) => id,
             None => break,
@@ -63,7 +63,7 @@ pub fn generate_q4k_cpu(
     out
 }
 
-/// Like [`generate_q4k_cpu`] but dispatches MoE expert matmuls to remote shard
+/// Like [`generate_kquant_cpu`] but dispatches MoE expert matmuls to remote shard
 /// servers via [`crate::ffn::RemoteMoeBackend`].
 pub fn generate_q4k_cpu_remote(
     weights: &mut ModelWeights,
@@ -76,7 +76,7 @@ pub fn generate_q4k_cpu_remote(
     let mut ids = prompt_ids.to_vec();
     let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
     for _ in 0..max_tokens {
-        let h = predict_q4k_hidden(weights, &ids, index, Some(moe_remote));
+        let h = predict_kquant_hidden(weights, &ids, index, Some(moe_remote));
         let last = h.nrows().saturating_sub(1);
         let h_last = h.slice(ndarray::s![last..last + 1, ..]).to_owned();
         let logits = crate::forward::hidden_to_raw_logits(weights, &h_last);
@@ -99,7 +99,7 @@ pub fn generate_q4k_cpu_remote(
     out
 }
 
-/// Constrained variant of [`generate_q4k_cpu`]. Greedy under the mask.
+/// Constrained variant of [`generate_kquant_cpu`]. Greedy under the mask.
 pub fn generate_q4k_cpu_constrained<M>(
     weights: &mut ModelWeights,
     tokenizer: &Tokenizer,
@@ -215,7 +215,7 @@ where
     let mut sampler = crate::layer_graph::Sampler::new(sampling);
 
     for _ in 0..max_tokens {
-        let h = predict_q4k_hidden(weights, &ids, index, None);
+        let h = predict_kquant_hidden(weights, &ids, index, None);
         let last_hidden = h.row(h.nrows().saturating_sub(1)).to_owned();
         let last_2d = ndarray::Array2::from_shape_vec((1, last_hidden.len()), last_hidden.to_vec())
             .expect("shape");

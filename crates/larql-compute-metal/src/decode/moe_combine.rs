@@ -30,7 +30,7 @@ use larql_compute::FullPipelineLayer;
 /// `h_post_attn + (_1(dense) + _2(moe))`.
 ///
 /// Routes through `cpu::ops::outer_combine` so the GPU MoE path and
-/// the CPU MoE path (`vindex/q4k_forward.rs::run_moe_layer_cpu`) share
+/// the CPU MoE path (`vindex/kquant_forward.rs::run_moe_layer_cpu`) share
 /// a single implementation of the math. Earlier the two backends had
 /// independent transcriptions of the same formula and silently drifted
 /// on Gemma 4 26B-A4B.

@@ -51,6 +51,17 @@ pub struct RouterMetrics {
     /// values mean the grid needs more capacity OR the ceiling is
     /// set too low.
     pub route_saturation_total: IntCounter,
+    /// ADR-0021 — count of hedged sub-requests where the primary's
+    /// reply didn't arrive within `--hedge-after-ms` and the
+    /// secondary replica was dispatched. Operator's signal of how
+    /// often the tail-clipping path is active.
+    pub route_hedge_fires_total: IntCounter,
+    /// ADR-0021 — count of times the hedge actually beat the
+    /// primary (the slow-primary case it's designed for).
+    /// `route_hedge_wins_total / route_hedge_fires_total` is the
+    /// useful ratio: ~1.0 means hedging clips real tail; ~0.0 means
+    /// it's just doubling wire load.
+    pub route_hedge_wins_total: IntCounter,
 
     // ── Histograms (event-driven) ──────────────────────────────────────────────
     pub walk_ffn_duration_seconds: HistogramVec, // (currently no labels; HistogramVec used for future expansion)
@@ -202,6 +213,29 @@ impl RouterMetrics {
             .register(Box::new(route_saturation_total.clone()))
             .unwrap();
 
+        let route_hedge_fires_total = IntCounter::new(
+            "larql_router_route_hedge_fires_total",
+            "ADR-0021 — count of hedged sub-requests where the primary's \
+             reply didn't arrive within --hedge-after-ms and a secondary \
+             replica was dispatched.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(route_hedge_fires_total.clone()))
+            .unwrap();
+
+        let route_hedge_wins_total = IntCounter::new(
+            "larql_router_route_hedge_wins_total",
+            "ADR-0021 — count of times the hedge actually beat the primary. \
+             route_hedge_wins_total / route_hedge_fires_total ≈ 1 means \
+             hedging is clipping real tail latency; ≈ 0 means it's just \
+             doubling wire load.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(route_hedge_wins_total.clone()))
+            .unwrap();
+
         let walk_ffn_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "larql_router_walk_ffn_duration_seconds",
@@ -268,6 +302,8 @@ impl RouterMetrics {
             rtt_probes_total,
             walk_ffn_requests_total,
             route_saturation_total,
+            route_hedge_fires_total,
+            route_hedge_wins_total,
             walk_ffn_duration_seconds,
         })
     }
@@ -353,6 +389,8 @@ mod tests {
             "larql_router_rtt_probes_total",
             "larql_router_walk_ffn_requests_total",
             "larql_router_route_saturation_total",
+            "larql_router_route_hedge_fires_total",
+            "larql_router_route_hedge_wins_total",
             "larql_router_walk_ffn_duration_seconds",
         ] {
             assert!(names.contains(&required), "missing metric {required}");

@@ -141,7 +141,7 @@ impl StageCapture {
             ENV_STAGE_DUMP_LAYER,
             &layer.to_string(),
             || {
-                let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
+                let _ = crate::vindex::predict_kquant_hidden(weights, ids, index, None);
             },
         )?;
         let prefix = cpu_stage_prefix(layer);

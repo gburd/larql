@@ -16,8 +16,8 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::dispatch::{
-    build_subrequest_body, group_layers_by_url, merge_shard_responses, resolve_static_only,
-    unique_candidate_urls,
+    build_subrequest_body, group_layers_by_url, hedged_post_json, merge_shard_responses,
+    resolve_static_only, unique_candidate_urls, HedgeOutcome,
 };
 use crate::grid::GridState;
 use crate::metrics::{encode_metrics_text, RouterMetrics};
@@ -46,6 +46,12 @@ pub struct AppState {
     /// built without the `http3` feature.
     #[cfg(feature = "http3")]
     pub h3_client: Option<Arc<larql_router_protocol::transport::h3::H3Client>>,
+    /// ADR-0021 — hedged-dispatch delay. When `Some(d)`, the
+    /// multi-shard fan-out picks a secondary replica per sub-request
+    /// and dispatches it `d` after the primary if the primary hasn't
+    /// responded yet. `None` disables hedging (pre-ADR-0021
+    /// behaviour); operators opt in via `--hedge-after-ms M`.
+    pub hedge_after: Option<std::time::Duration>,
 }
 
 impl AppState {
@@ -399,28 +405,78 @@ async fn handle_walk_ffn_inner(
 
     let by_url = group_layers_by_url(&layer_urls);
 
+    // ADR-0021 — derive a secondary URL per primary group, if hedging
+    // is enabled AND the grid actually offers a second replica. Static-
+    // shard fall-back groups (no grid replica) get None and dispatch
+    // through the non-hedged path.
+    let hedge_after = state.hedge_after;
+    let secondary_by_primary: HashMap<String, Option<String>> = if hedge_after.is_some() {
+        let mut out = HashMap::with_capacity(by_url.len());
+        if let Some(grid) = &state.grid {
+            let guard = grid.read().await;
+            for (primary, shard_layers) in &by_url {
+                // Any layer in the group resolves the same replica set
+                // (groups share a primary URL → same owning shard range).
+                let probe_layer = *shard_layers.first().unwrap_or(&0) as u32;
+                let ranked = guard.route_with_rank(mid, probe_layer, 2);
+                // Pick the first ranked URL that isn't the primary —
+                // route_with_rank's ordering can change between the
+                // resolve_all snapshot and this read if a heartbeat
+                // landed in between.
+                let secondary = ranked.into_iter().find(|u| u != primary);
+                out.insert(primary.clone(), secondary);
+            }
+        }
+        out
+    } else {
+        HashMap::new()
+    };
+
     let mut handles = Vec::new();
     for (url, shard_layers) in &by_url {
         let sub_body = build_subrequest_body(&body_value, shard_layers);
         let client = state.client.clone();
-        let target = format!("{url}/v1/walk-ffn");
+        let primary = url.clone();
+        let secondary = secondary_by_primary
+            .get(url)
+            .and_then(|s| s.clone());
         handles.push(tokio::spawn(async move {
-            client
-                .post(&target)
-                .json(&sub_body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .json::<Value>()
-                .await
-                .map_err(|e| e.to_string())
+            let (result, outcome) = hedged_post_json(
+                &client,
+                &primary,
+                secondary.as_deref(),
+                hedge_after,
+                "/v1/walk-ffn",
+                &sub_body,
+            )
+            .await;
+            (result, outcome)
         }));
     }
 
-    let responses: Vec<Value> = futures::future::join_all(handles)
-        .await
+    let joined: Vec<(Result<Value, String>, HedgeOutcome)> =
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|jh| jh.unwrap_or_else(|e| (Err(e.to_string()), HedgeOutcome::default())))
+            .collect();
+
+    // Surface hedge outcomes to metrics before the early-return on
+    // shard-error so even a failed hedge still increments the counter.
+    if let Some(m) = &state.metrics {
+        for (_, outcome) in &joined {
+            if outcome.fired {
+                m.route_hedge_fires_total.inc();
+            }
+            if outcome.won {
+                m.route_hedge_wins_total.inc();
+            }
+        }
+    }
+
+    let responses: Vec<Value> = joined
         .into_iter()
-        .map(|jh| jh.map_err(|e| e.to_string()).and_then(|r| r))
+        .map(|(result, _)| result)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("shard error: {e}")))?;
 

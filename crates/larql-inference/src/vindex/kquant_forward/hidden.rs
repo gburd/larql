@@ -14,7 +14,7 @@ use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
 /// Compute the final hidden state for `token_ids` against a Q4_K/Q6_K
 /// vindex, dequantising attn + FFN one layer at a time. Returns the
 /// `[seq_len, hidden]` array; caller owns the lm_head step.
-pub fn predict_q4k_hidden(
+pub fn predict_kquant_hidden(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,

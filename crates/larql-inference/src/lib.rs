@@ -261,7 +261,7 @@ pub use trace::{
     ContextStore, ContextTier, ContextWriter, LayerSummary, ResidualTrace, TraceNode,
     TracePositions, TraceStore, TraceWriter,
 };
-pub use vindex::{open_inference_vindex, predict_q4k, FfnL1Cache, WalkFfn, WalkFfnConfig};
+pub use vindex::{open_inference_vindex, predict_kquant, FfnL1Cache, WalkFfn, WalkFfnConfig};
 
 /// Stable, application-facing inference imports.
 ///
@@ -271,7 +271,7 @@ pub use vindex::{open_inference_vindex, predict_q4k, FfnL1Cache, WalkFfn, WalkFf
 pub mod prelude {
     pub use crate::{
         default_backend, generate, generate_streaming, generate_with_sampling, load_model_dir,
-        load_tokenizer, open_inference_vindex, predict, predict_q4k, resolve_model_path,
+        load_tokenizer, open_inference_vindex, predict, predict_kquant, resolve_model_path,
         try_generate, try_generate_streaming, try_generate_with_sampling, wrap_chat_prompt,
         wrap_prompt_raw, wrap_with_vindex_template, ChatWrap, ComputeBackend, Detokenizer,
         EosConfig, GenerateError, GenerateResult, InferenceError, ModelWeights, Sampler,

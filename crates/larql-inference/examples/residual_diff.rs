@@ -1,4 +1,4 @@
-//! Per-layer residual diff between CPU (`predict_q4k_hidden`) and Metal
+//! Per-layer residual diff between CPU (`predict_kquant_hidden`) and Metal
 //! (`dispatch_full_pipeline`) forward passes.
 //!
 //! Invariant under test: for the same input prompt, both backends should

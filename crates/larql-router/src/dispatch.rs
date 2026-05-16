@@ -97,6 +97,95 @@ fn round_to_tenth(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+/// ADR-0021 — outcome of a (possibly hedged) sub-request. The caller
+/// uses these flags to bump the two ADR-0021 counters without having
+/// to pass metrics handles down into the helper.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HedgeOutcome {
+    /// True when the secondary replica was actually dispatched (the
+    /// primary's reply didn't arrive within `hedge_after`).
+    pub fired: bool,
+    /// True when the secondary's reply beat the primary's. Implies
+    /// `fired`. Used to compute the wins/fires ratio in metrics.
+    pub won: bool,
+}
+
+/// ADR-0021 — race a primary HTTP POST against a delayed secondary.
+///
+/// Sends `body` to `primary_url`. If the primary hasn't responded
+/// within `hedge_after`, dispatches the same request to
+/// `secondary_url` and returns whichever response arrives first.
+/// When `secondary_url` is `None` or `hedge_after` is `None`, behaves
+/// exactly like a single POST to `primary_url` (no hedging).
+///
+/// `target_path` is appended to both URLs (e.g. `/v1/walk-ffn`). The
+/// returned `Value` is the parsed JSON body of the winning response.
+/// `HedgeOutcome` lets the caller bump the right metrics.
+pub async fn hedged_post_json(
+    client: &reqwest::Client,
+    primary_url: &str,
+    secondary_url: Option<&str>,
+    hedge_after: Option<std::time::Duration>,
+    target_path: &str,
+    body: &serde_json::Value,
+) -> (Result<serde_json::Value, String>, HedgeOutcome) {
+    let primary_target = format!("{primary_url}{target_path}");
+    let primary_fut = async {
+        client
+            .post(&primary_target)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())
+    };
+
+    let (Some(secondary_url), Some(hedge_after)) = (secondary_url, hedge_after) else {
+        return (primary_fut.await, HedgeOutcome::default());
+    };
+
+    // Primary first; if it lands before the deadline we never hedge.
+    tokio::pin!(primary_fut);
+    let sleeper = tokio::time::sleep(hedge_after);
+    tokio::pin!(sleeper);
+
+    tokio::select! {
+        biased;
+        result = &mut primary_fut => {
+            return (result, HedgeOutcome::default());
+        }
+        _ = &mut sleeper => {
+            // Hedge: race primary vs newly-dispatched secondary.
+        }
+    }
+
+    let secondary_target = format!("{secondary_url}{target_path}");
+    let secondary_fut = async {
+        client
+            .post(&secondary_target)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())
+    };
+    tokio::pin!(secondary_fut);
+
+    tokio::select! {
+        biased;
+        result = &mut primary_fut => {
+            (result, HedgeOutcome { fired: true, won: false })
+        }
+        result = &mut secondary_fut => {
+            (result, HedgeOutcome { fired: true, won: true })
+        }
+    }
+}
+
 /// Build a deduped list of candidate shard URLs from the grid + static
 /// pool. Grid URLs come first so a healthy grid is queried before any
 /// stale static config.

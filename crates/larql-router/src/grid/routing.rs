@@ -158,6 +158,86 @@ impl GridState {
         Ok(out)
     }
 
+    /// ADR-0021 — up to `max` candidate URLs for `(model_id, layer)`,
+    /// ordered by the same three-tier comparator [`Self::route`] uses,
+    /// with the ADR-0020 saturation filter applied. Returned slice's
+    /// first element equals what `route()` would return; subsequent
+    /// elements are the next-best fallbacks (e.g. hedge targets).
+    ///
+    /// Returns an empty `Vec` when no replica owns the layer, or every
+    /// owner is over the saturation ceiling. Bounded by the actual
+    /// candidate count — never returns more than the topology allows.
+    pub fn route_with_rank(
+        &self,
+        model_id: Option<&str>,
+        layer: u32,
+        max: usize,
+    ) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let ids = match model_id {
+            Some(m) => self.route_table.get(&(m.to_owned(), layer)),
+            None => self.any_model_table.get(&layer),
+        };
+        let Some(server_ids) = ids else {
+            return Vec::new();
+        };
+        let ceiling = self.saturation_ceiling;
+        let mut candidates: Vec<&ServerEntry> = server_ids
+            .iter()
+            .filter_map(|id| self.servers.get(id))
+            .filter(|e| match ceiling {
+                Some(c) => e.requests_in_flight < c,
+                None => true,
+            })
+            .collect();
+        candidates.sort_by(|a, b| compare_servers_for_route(a, b, layer));
+        candidates
+            .into_iter()
+            .take(max)
+            .map(|s| s.listen_url.clone())
+            .collect()
+    }
+
+    /// ADR-0021 — MoE sibling of [`Self::route_with_rank`]. Returns up
+    /// to `max` candidate URLs for `(model_id, layer, expert_id)` in
+    /// comparator order, saturation-filtered.
+    pub fn route_expert_with_rank(
+        &self,
+        model_id: Option<&str>,
+        layer: u32,
+        expert_id: u32,
+        max: usize,
+    ) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let ids = match model_id {
+            Some(m) => self.route_table.get(&(m.to_owned(), layer)),
+            None => self.any_model_table.get(&layer),
+        };
+        let Some(server_ids) = ids else {
+            return Vec::new();
+        };
+        let ceiling = self.saturation_ceiling;
+        let mut candidates: Vec<&ServerEntry> = server_ids
+            .iter()
+            .filter_map(|id| self.servers.get(id))
+            .filter(|e| e.owns_expert(expert_id))
+            .filter(|e| match ceiling {
+                Some(c) => e.requests_in_flight < c,
+                None => true,
+            })
+            .collect();
+        candidates.sort_by(|a, b| compare_servers_for_route(a, b, layer));
+        candidates
+            .into_iter()
+            .take(max)
+            .map(|s| s.listen_url.clone())
+            .collect()
+    }
+
     /// Rebuild layer→servers index. Called only on join/leave (cold path).
     pub(super) fn rebuild_route_table(&mut self) {
         let mut rt: HashMap<(String, u32), Vec<String>> = HashMap::new();

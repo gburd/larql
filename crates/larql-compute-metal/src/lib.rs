@@ -130,3 +130,18 @@ pub fn metal_backend() -> Option<MetalBackend> {
 pub fn metal_backend_with_options(options: BackendOptions) -> Option<MetalBackend> {
     MetalBackend::with_options(options)
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metal_backend_returns_some_on_apple_silicon_or_none_off_host() {
+        let _ = metal_backend();
+    }
+
+    #[test]
+    fn metal_backend_with_options_threads_through_to_backend_constructor() {
+        let _ = metal_backend_with_options(BackendOptions::default());
+    }
+}

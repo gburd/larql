@@ -10,7 +10,7 @@
 //! ## What's covered
 //!
 //! - `prefill.rs`:  `prefill_with_kv` hidden state shape, finiteness, matches
-//!                  `predict_q4k_hidden` at the last position.
+//!                  `predict_kquant_hidden` at the last position.
 //! - `pipeline_layer.rs`: `build_pipeline_layers` produces the right number of
 //!                         layers, each with correct head_dim/norm weights.
 //! - `template.rs`: `TemplateUniverse::build` with real entities populates
@@ -41,7 +41,7 @@ use larql_inference::{
         TemplatePattern,
         TemplateUniverse,
     },
-    vindex::predict_q4k_hidden,
+    vindex::predict_kquant_hidden,
 };
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer, SilentLoadCallbacks,
@@ -157,8 +157,8 @@ fn prefill_with_kv_matches_predict_q4k_hidden() {
         0..weights.num_layers,
     );
 
-    // predict_q4k_hidden dequantises layer-by-layer
-    let h_q4k = predict_q4k_hidden(&mut weights, &prompt_ids, &q4_index, None);
+    // predict_kquant_hidden dequantises layer-by-layer
+    let h_q4k = predict_kquant_hidden(&mut weights, &prompt_ids, &q4_index, None);
 
     // The two paths use different FFN implementations — cosine similarity should
     // be > 0.95 at the last position (they differ mainly in FFN quantisation).
@@ -177,7 +177,7 @@ fn prefill_with_kv_matches_predict_q4k_hidden() {
     } else {
         0.0
     };
-    eprintln!("prefill_with_kv vs predict_q4k_hidden: cosine = {cos:.6}");
+    eprintln!("prefill_with_kv vs predict_kquant_hidden: cosine = {cos:.6}");
     assert!(
         cos > 0.90,
         "last-pos cosine {cos:.4} < 0.90 — paths diverged unexpectedly"

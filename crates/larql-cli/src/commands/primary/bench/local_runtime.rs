@@ -109,7 +109,7 @@ pub(super) fn run_larql(
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if args.verbose {
-        let (slots, bytes) = q4_index.q4k_ffn_cache_stats();
+        let (slots, bytes) = q4_index.kquant_ffn_cache_stats();
         eprintln!(
             "{}",
             format_q4k_cache_log(backend_name_for(metal), slots, bytes)

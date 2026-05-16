@@ -35,7 +35,7 @@ pub fn predict_q4k_metal(
                     "Q4_K" => QuantFormat::Q4_K,
                     "Q6_K" => QuantFormat::Q6_K,
                     other => panic!(
-                        "q4k_forward: registry tag {other:?} has no compute::QuantFormat mapping"
+                        "kquant_forward: registry tag {other:?} has no compute::QuantFormat mapping"
                     ),
                 }
             }
@@ -91,7 +91,7 @@ pub fn predict_q4k_metal(
 /// seq_len positions have correct positional encodings. The intervention hooks
 /// in `dispatch_full_pipeline` zero head `target_head` at `target_layer` and
 /// inject `replacement_delta` in its place.
-pub fn predict_q4k_metal_with_replaced_head_residual_delta(
+pub fn predict_kquant_metal_with_replaced_head_residual_delta(
     weights: &ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -191,7 +191,7 @@ pub fn predict_q4k_metal_with_replaced_head_residual_delta(
 /// ensuring bit-identical residuals between the baseline and program passes.
 ///
 /// Returns `None` if the backend does not support the path.
-pub fn predict_q4k_metal_hidden(
+pub fn predict_kquant_metal_hidden(
     weights: &ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -284,7 +284,7 @@ pub fn predict_q4k_metal_hidden(
 ///
 /// For L0H6 (target_layer=0): only runs 1/34 GPU layers vs the full CPU pass.
 /// The caller uses the captured data to compute oracle PQ codes on CPU.
-pub fn predict_q4k_metal_capture_pre_wo(
+pub fn predict_kquant_metal_capture_pre_wo(
     weights: &ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,

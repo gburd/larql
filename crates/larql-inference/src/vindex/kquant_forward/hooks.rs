@@ -16,7 +16,7 @@ use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
 ///
 /// This is the Q4K/vindex-backed counterpart to
 /// `forward::trace_forward_full_hooked`: it keeps the mmap/dequant layer-scope
-/// behavior of `predict_q4k_hidden` while exposing pre-layer, post-attention,
+/// behavior of `predict_kquant_hidden` while exposing pre-layer, post-attention,
 /// optional attention-weight/FFN-activation, and post-layer hook points.
 pub fn predict_q4k_hidden_hooked(
     weights: &mut ModelWeights,

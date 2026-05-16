@@ -2,7 +2,7 @@
 //!
 //! Each `ResidualCapture::*` constructor drives the corresponding backend
 //! once with its existing per-layer dump hook (file-based env-var, owned
-//! by `vindex/q4k_forward.rs` / `metal/ops/full_pipeline.rs` /
+//! by `vindex/kquant_forward.rs` / `metal/ops/full_pipeline.rs` /
 //! `metal/decode/mod.rs`), then reads the resulting `.f32` blobs into a
 //! typed in-memory `Vec<Vec<f32>>`. The temp dir is cleaned up on drop —
 //! callers don't need to know it ever existed.
@@ -79,7 +79,7 @@ impl ResidualCapture {
 }
 
 impl ResidualCapture {
-    /// CPU full prefill via `predict_q4k_hidden`. Drives the per-layer
+    /// CPU full prefill via `predict_kquant_hidden`. Drives the per-layer
     /// dump hook (`LARQL_CPU_DUMP_LAYERS=<dir>`) at file `cpu_layer_NN.f32`
     /// per layer, then reads them back into a `Vec<Vec<f32>>`.
     pub fn cpu_prefill(
@@ -92,7 +92,7 @@ impl ResidualCapture {
         let seq_len = ids.len();
 
         let dir = run_with_dump_dir(ENV_CPU_DUMP_LAYERS, || {
-            let _ = crate::vindex::predict_q4k_hidden(weights, ids, index, None);
+            let _ = crate::vindex::predict_kquant_hidden(weights, ids, index, None);
         })?;
 
         let layers = (0..num_layers)

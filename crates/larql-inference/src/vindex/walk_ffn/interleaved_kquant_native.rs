@@ -1,7 +1,7 @@
 //! Native Q4_K/Q6_K FFN walk — fused decode + dot via `kquant_matmul_transb`.
 //!
 //! Mirrors the inner gated-FFN block of [`crate::vindex::ffn_decode_step_native`]
-//! (q4k_forward/cached.rs) but operates as an `FfnBackend`: input is already
+//! (kquant_forward/cached.rs) but operates as an `FfnBackend`: input is already
 //! pre-FFN-normed by the caller (`run_ffn` in `forward/layer.rs`), so this
 //! module skips the norm step and just runs the three matmuls + activation.
 //!

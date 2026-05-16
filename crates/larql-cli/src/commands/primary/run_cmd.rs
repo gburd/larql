@@ -677,7 +677,7 @@ fn run_with_remote_ffn(
 /// | vindex quant | `--metal` | strategy                                    |
 /// |--------------|-----------|---------------------------------------------|
 /// | Q4_K         | yes       | `layer_graph::generate` (KV-cached, fast)   |
-/// | Q4_K         | no        | `vindex::generate_q4k_cpu` (per-step, slow) |
+/// | Q4_K         | no        | `vindex::generate_kquant_cpu` (per-step, slow) |
 /// | f32          | any       | `forward::generate_cached` (CPU, F32)       |
 ///
 /// Chat mode (no prompt): drops into a stdin REPL over the same loaded model.
@@ -697,7 +697,7 @@ mod experts {
     enum Strategy {
         /// Q4_K vindex + Metal backend. KV-cached decode via `layer_graph::generate`.
         MetalQ4K,
-        /// Q4_K vindex, no Metal. Loops `predict_q4k` per token (O(N²)).
+        /// Q4_K vindex, no Metal. Loops `predict_kquant` per token (O(N²)).
         CpuQ4K,
         /// Non-quantised vindex. CPU `generate_cached` with full f32 weights.
         CpuF32,
@@ -805,7 +805,7 @@ mod experts {
                             |ids, logits| mask.apply(ids, logits),
                         )
                     } else {
-                        larql_inference::vindex::generate_q4k_cpu(
+                        larql_inference::vindex::generate_kquant_cpu(
                             &mut self.weights,
                             &self.tokenizer,
                             &token_ids,

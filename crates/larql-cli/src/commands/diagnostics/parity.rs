@@ -530,7 +530,7 @@ fn run_moe_block(
 
 // ── layer: full hybrid-MoE layer CPU vs Metal residual diff ──────────────────
 //
-// Runs CPU `predict_q4k_hidden` and Metal `generate` on the same prompt with
+// Runs CPU `predict_kquant_hidden` and Metal `generate` on the same prompt with
 // their respective dump hooks enabled, then compares per-layer residuals.
 //
 // CPU dumps:   LARQL_CPU_DUMP_LAYERS → cpu_layer_{LL}.f32 (last-position row)
@@ -551,7 +551,7 @@ fn run_layer_diff(
     args: &ParityArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use larql_inference::layer_graph::{generate::generate, CachedLayerGraph};
-    use larql_inference::vindex::predict_q4k_hidden;
+    use larql_inference::vindex::predict_kquant_hidden;
 
     let num_layers = config.num_layers;
     let hidden = config.hidden_size;
@@ -635,7 +635,7 @@ fn run_layer_diff(
     std::env::set_var("LARQL_CPU_DUMP_LAYERS", cpu_path);
     std::env::set_var("LARQL_CPU_STAGE_DUMP", cpu_path);
     println!("Running CPU…");
-    predict_q4k_hidden(&mut w_cpu, &token_ids, &q4_index, None);
+    predict_kquant_hidden(&mut w_cpu, &token_ids, &q4_index, None);
     std::env::remove_var("LARQL_CPU_DUMP_LAYERS");
     std::env::remove_var("LARQL_CPU_STAGE_DUMP");
 

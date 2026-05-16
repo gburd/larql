@@ -115,7 +115,7 @@ fn vindex_stores_v_as_q6k_for_gemma4_global_layers() {
     );
 }
 
-/// Numerical invariant: when `predict_q4k_hidden` loads L5's weights,
+/// Numerical invariant: when `predict_kquant_hidden` loads L5's weights,
 /// the resulting `w_k` and `w_v` tensors must differ element-wise —
 /// proving the Q6_K V dequant path returns a distinct approximation of
 /// the same underlying data. Equivalent tensors would silently re-open
@@ -141,13 +141,13 @@ fn cpu_q4k_load_produces_distinct_w_k_and_w_v_for_gemma4_global() {
     let weights = load_model_weights_q4k(&vindex, &mut cb).expect("load weights");
     let arch = &*weights.arch;
 
-    // Exercise the predict_q4k_hidden tensor-load path directly. It
+    // Exercise the predict_kquant_hidden tensor-load path directly. It
     // dequantises attn weights per layer and inserts them into
     // `weights.tensors`. We only need the shapes and a sample of
     // values — run the loader enough to populate L5's Q/K/V, then
     // compare W_k vs W_v directly.
     //
-    // `predict_q4k_hidden` is not public, but its per-layer tensor
+    // `predict_kquant_hidden` is not public, but its per-layer tensor
     // insertion is what drives CPU attention. We replicate the
     // equivalent load here — dequantise L5's Q/K/V/O into
     // `weights.tensors` the same way the forward pass does.

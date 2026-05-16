@@ -1,18 +1,11 @@
 {
-  "policy_note": "Default policy is 90% line coverage per source file. The per-file entries below are debt baselines locked at current measured coverage (floor(pct) - 1) so any regression fails the check and any test addition immediately ratchets the floor up. The 90% target is the goal — the multi-day coverage arc is sweeping these toward 90 file-by-file via the close-then-close strategy. Files NOT listed here already clear the 90% default. Coverage runs use `--test-threads=1` (see Makefile) to serialise env-sensitive tests across lib + integration binaries. Session 6 (2026-05-16): 53 files at ≥90%, TOTAL 78.98%. decode_hybrid.rs (94.41%), decode/encode_attn.rs (99.53%), decode/encode_ffn.rs (92.86%) all cleared this session via BackendOptions-direct + PROFILE_SPLIT + non-gated FFN tests.",
+  "policy_note": "Default policy is 90% line coverage per source file. Every src/ file in this crate now clears the 90% floor without per-file debt baselines. Coverage runs use `--test-threads=1` (see Makefile) to serialise env-sensitive tests across lib + integration binaries. Session 6 close (2026-05-16): TOTAL 97.28%, 59/59 files at ≥90%. The static `CALL_COUNT < 3` guard in `decode/diag.rs::log_decode_entry` is exercised via `tests/test_decode_diag.rs`, a dedicated integration binary that gets a fresh process where the counter starts at 0.",
   "include_globs": [
     "crates/larql-compute-metal/src/*.rs",
     "crates/larql-compute-metal/src/**/*.rs"
   ],
   "exclude_globs": [],
   "default_line_min_percent": 90.0,
-  "total_line_min_percent": 78.0,
-  "per_file_line_min_percent": {
-    "crates/larql-compute-metal/src/decode/diag.rs": 85.0,
-    "crates/larql-compute-metal/src/diag/kernel_profile.rs": 0.0,
-    "crates/larql-compute-metal/src/diag/shader_bench.rs": 4.0,
-    "crates/larql-compute-metal/src/lib.rs": 0.0,
-    "crates/larql-compute-metal/src/moe_dispatch.rs": 38.0,
-    "crates/larql-compute-metal/src/pipeline.rs": 26.0
-  }
+  "total_line_min_percent": 97.0,
+  "per_file_line_min_percent": {}
 }

@@ -1,6 +1,6 @@
 //! KV-cached CPU Q4_K decode.
 //!
-//! `predict_q4k_hidden` (sibling module) reprocesses the entire
+//! `predict_kquant_hidden` (sibling module) reprocesses the entire
 //! `token_ids` sequence at every decode step — O(N²) work where N
 //! grows with each generated token. This module splits that into
 //! prefill (full-sequence pass that captures K/V per layer) plus
@@ -13,7 +13,7 @@
 //!
 //! Scope: dense architectures only. Hybrid-MoE (Gemma 4 26B A4B)
 //! and cross-layer KV sharing (Gemma 4 E2B) fall back to the slow
-//! `predict_q4k_hidden` path — the caller decides via
+//! `predict_kquant_hidden` path — the caller decides via
 //! [`supports_cached_decode`].
 
 // `cache[layer]` indexing reads more naturally than the iterator
@@ -485,7 +485,7 @@ pub fn metal_fused_decode_step(
 /// `h_new` must be a single-row residual (1 × hidden). Multi-row
 /// prefill is handled by `predict_q4k_prefill` (separate shape; the
 /// `q4k_` in that name is pre-existing debt — see ROADMAP U8/U9 for
-/// the broader quant-agnostic rename of the q4k_forward module).
+/// the broader quant-agnostic rename of the kquant_forward module).
 ///
 /// Returns `None` if the layer has no quantised attention data in the
 /// index or if the backend's matvec for the format is unavailable.
@@ -726,7 +726,7 @@ fn run_ffn_decode_step_q4k_direct(
     let (up_bytes, up_fmt) = ffn[1];
     let (down_bytes, down_fmt) = ffn[2];
 
-    // Only Gated FFNs reach this path today (it's what predict_q4k_hidden
+    // Only Gated FFNs reach this path today (it's what predict_kquant_hidden
     // currently dequantises). Non-gated archs route through the dequant
     // fallback via the per-layer gate at the caller.
     if arch.ffn_type() != larql_models::FfnType::Gated {

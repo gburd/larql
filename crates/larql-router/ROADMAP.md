@@ -661,19 +661,18 @@ inline.
 How an operator actually gets a 26B / 70B / 405B model running on a
 heterogeneous cluster.
 
-**Shipped:** Static `--shards` + Mode B available pool.
-
-**P1 — gap surfaced in this session:**
-
-- **Vindex shard-download endpoint.** `AssignMsg` carries an
-  `origin_url`; the spare downloads the matching slice. Confirm the
-  server-side `GET /v1/shard/{model}/{start}-{end}` endpoint exists
-  and is documented in router-spec.md. (Today the assign path assumes
-  the spare can resolve the URL; the actual served endpoint needs an
-  audit pass.)
-- **Multi-host deploy walkthrough.** `docs/hot-shard-demo.md` covers a
-  single-host topology; a real 2-host LAN deployment doesn't have a
-  step-by-step doc. Build one alongside the existing demo script.
+**Shipped:** Static `--shards` + Mode B available pool, multi-host
+deploy walkthrough ([`crates/larql-router/docs/multi-host-demo.md`](docs/multi-host-demo.md)
+— 3-box LAN topology covering router + 2 shards over `--grid-key`,
+firewall rules, NTP, MTU gotchas, plus a QUIC variant for ADR-0010
+and a MoE variant for V3/V4-scale models), vindex shard-download
+endpoint ([`crates/larql-server/docs/router-spec.md`](../larql-server/docs/router-spec.md)
+§4 — `GET /v1/shard/{model_id}/{start}-{end}` serves the vindex
+directory as a streamed tar, client side at
+`crates/larql-server/src/shard_loader.rs` is idempotent + SHA-256
+verified + atomic-unpack, exercised end-to-end by
+`crates/larql-server/tests/test_grid_mode_b.rs::mode_b_full_vertical_handoff`
+against a real donor; 2026-05-16 audit closed the docs gap).
 
 **P2 — extends auto-shard planner:**
 
@@ -750,7 +749,11 @@ sharded into 2 hosts (15 hops × 2 = 30 layers serial), wire alone is
 
 **Shipped:** 3-tier route() (ADR-0013), GT3 layer-latency in
 heartbeats, active-probe RTT, 110 ns route() in production-shape
-benches, connection pool tuning.
+benches, connection pool tuning, real HTTP/3 shard transport with
+per-stream independence (ADR-0019, 2026-05-16 — `--http3-shards` /
+`--http3-port` opt-in, `H3Client::post_json` + `serve_axum` in
+larql-router-protocol, used by the MoE expert fan-out path when
+`h3_client: Some(_)`).
 
 **P1 — biggest near-term win:**
 
@@ -774,15 +777,14 @@ benches, connection pool tuning.
   ~150 µs per call vs loopback TCP. Detect same-host via
   `listen_url` and prefer UDS when available.
 
-**P3:**
-
-- **Real HTTP/3 with per-stream independence.** Today's GT7 (ADR-0010)
-  wraps HTTP/2 over a single QUIC bi-stream — fine for the one-stream
-  `Join` call, but for expert fan-out (8 parallel streams per token)
-  HoL blocking on one stream stalls the rest. Real HTTP/3 (via the
-  `h3` crate + hyper-h3) unlocks per-stream independence. Only worth
-  it once expert routing is shipped — the fan-out has to exist before
-  the HoL cost matters.
+**Shipped (was P3):** Real HTTP/3 with per-stream independence — see
+the **Latency-shipped** entry above and ADR-0019. Both prerequisites
+landed in the same session: MoE expert fan-out (ADR-0018) and the h3
+transport (ADR-0019, h3 0.0.8 + h3-quinn 0.0.10 + h3-axum 0.2,
+`--http3-shards` / `--http3-port`). The fan-out path branches to h3
+when `h3_client: Some(_)` is wired into `AppState`. No HoL benchmark
+yet — needs real multi-shard MoE traffic to surface (separate P2
+item under Throughput).
 
 ---
 
@@ -796,13 +798,27 @@ fleet can sustain.
 **Shipped:** Bench harness (ADR-0012 GT9), production-shape +
 worst-case bench scenarios.
 
-**P1 — bench-driven:**
+**Shipped:** Concurrent-route bench
+(`benches/routing.rs::bench_route_concurrent`, 2026-05-16) drives
+`route()` from 1 / 4 / 8 / 16 parallel tokio tasks against a single
+`Arc<tokio::sync::RwLock<GridState>>` (the lock shape
+`AppState::resolve_all` actually uses). Surfaced a clear contention
+plateau: throughput rises from 5.6 Melem/s @ 1 worker to 8.7 Melem/s
+@ 4, then collapses to 4.0 Melem/s @ 8 and 3.6 Melem/s @ 16. So a
+single router instance plateaus at ~4 concurrent in-flight `route()`
+readers before the lock acquisition cost dominates the ~110 ns
+critical section.
 
-- **Concurrent-route bench.** Today's `routing.rs` bench is
-  single-threaded. Add a `route_concurrent` group that drives
-  `route()` from N parallel tokio tasks against a single
-  `Arc<RwLock<GridState>>`. Surfaces lock contention before
-  production does.
+**P1 — bench-driven, surfaced by the new concurrent-route bench:**
+
+- **Lock primitive swap for the routing snapshot.** Replace
+  `tokio::sync::RwLock<GridState>` with either `arc_swap::ArcSwap`
+  (read-mostly snapshot, writers swap a fresh `Arc<GridState>`) or
+  `parking_lot::RwLock` (synchronous, cheap for short critical
+  sections). The concurrent-route bench is the regression gate;
+  target is monotonic scaling through 16 workers. ArcSwap is the
+  cleaner fit because reads happen on every request and writes only
+  on rebalancer ticks / heartbeats.
 - **Per-shard concurrency cap.** Hot-shard elevation reacts to
   `req_per_sec` but doesn't *cap* a shard. A misconfigured client
   flooding one shard can knock it over. Per-shard semaphore in the

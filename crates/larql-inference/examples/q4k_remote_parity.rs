@@ -1,7 +1,7 @@
 //! Q4_K dense-remote parity check — the Act 1.5 story as a cargo example.
 //!
 //! Drives both ends of the Q4_K remote-FFN split on a single machine:
-//! local `predict_q4k` vs `predict_q4k_with_ffn` pointing at a running
+//! local `predict_kquant` vs `predict_q4k_with_ffn` pointing at a running
 //! `larql serve --ffn-only` on the same vindex. Asserts:
 //!
 //! - top-1 token id matches between local and remote forwards
@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use larql_inference::ffn::{RemoteFfnConfig, RemoteWalkBackend};
-use larql_inference::vindex::{predict_q4k, predict_q4k_with_ffn};
+use larql_inference::vindex::{predict_kquant, predict_q4k_with_ffn};
 use larql_vindex::{
     load_model_weights_q4k, load_vindex_config, load_vindex_tokenizer, QuantFormat,
     SilentLoadCallbacks, VectorIndex,
@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     local_index.load_interleaved_q4k(&vindex_path)?;
 
     let t_local = Instant::now();
-    let local_result = predict_q4k(
+    let local_result = predict_kquant(
         &mut weights_local,
         &tokenizer,
         &token_ids,

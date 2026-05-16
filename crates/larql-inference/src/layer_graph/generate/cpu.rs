@@ -14,12 +14,12 @@ use larql_compute::prelude::*;
 // `generate` / `generate_constrained` assume the backend implements the fused
 // Q4 prefill + KV-cached decode pipeline (currently: Metal). Backends that
 // lack it (CpuBackend) delegate to the per-layer CPU Q4K dequant path
-// (`predict_q4k_hidden`), which mutates `weights.tensors` per layer — that's
+// (`predict_kquant_hidden`), which mutates `weights.tensors` per layer — that's
 // the single reason these functions take `&mut ModelWeights`.
 
 /// True when the backend can handle the fused Q4 prefill + decode pipeline
 /// directly. Metal: yes. Pure CPU: no — that path produces correct forward
-/// results via the vindex Q4K dequant loop in `crate::vindex::q4k_forward`.
+/// results via the vindex Q4K dequant loop in `crate::vindex::kquant_forward`.
 pub(super) fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -> bool {
     backend.supports(Capability::PrefillQ4) && backend.supports(Capability::DecodeToken)
 }
@@ -29,7 +29,7 @@ pub(super) fn backend_supports_fused_q4_pipeline(backend: &dyn ComputeBackend) -
 /// driver in [`crate::vindex::predict_q4k_prefill`] +
 /// [`crate::vindex::predict_q4k_decode_step`]: full prompt once at
 /// prefill, then 1-row attention + 1-row FFN per generated token.
-/// Falls back to the original O(N²) per-step `predict_q4k_hidden`
+/// Falls back to the original O(N²) per-step `predict_kquant_hidden`
 /// loop for hybrid MoE (Gemma 4 26B A4B) and Gemma 4 E2B
 /// (cross-layer KV sharing).
 pub(super) fn generate_via_cpu_q4k(
@@ -225,7 +225,7 @@ fn generate_via_cpu_q4k_cached(
 }
 
 /// Legacy O(N²) loop for architectures the cached path can't handle
-/// (hybrid MoE, KV sharing). Re-runs `predict_q4k_hidden` over the
+/// (hybrid MoE, KV sharing). Re-runs `predict_kquant_hidden` over the
 /// growing token sequence at every decode step.
 fn generate_via_cpu_q4k_uncached(
     weights: &mut ModelWeights,
@@ -355,7 +355,7 @@ fn predict_q4k_timed(
     index: &larql_vindex::VectorIndex,
 ) -> (PredictResult, f64, f64) {
     let hidden_start = std::time::Instant::now();
-    let h = crate::vindex::predict_q4k_hidden(weights, token_ids, index, None);
+    let h = crate::vindex::predict_kquant_hidden(weights, token_ids, index, None);
     let hidden_ms = hidden_start.elapsed().as_secs_f64() * 1000.0;
 
     let lm_head_start = std::time::Instant::now();

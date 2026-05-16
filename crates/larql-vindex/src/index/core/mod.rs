@@ -213,7 +213,7 @@ mod refactor_tests {
         // FfnStore defaults — only Q4_K dequant cache + FP4 storage
         // remain. All file-backed mmaps moved to `MmapStorage`.
         assert!(v.ffn.fp4_storage.is_none());
-        assert_eq!(v.ffn.q4k_ffn_cache.lock().unwrap().len(), 3);
+        assert_eq!(v.ffn.kquant_ffn_cache.lock().unwrap().len(), 3);
         assert!(!v.storage.has_down_features());
         assert!(!v.storage.has_up_features());
         assert!(!v.storage.has_interleaved_f32());
@@ -319,14 +319,14 @@ mod refactor_tests {
         v.gate.hnsw_enabled.store(true, Ordering::Relaxed);
         v.gate.hnsw_ef_search.store(42, Ordering::Relaxed);
         v.gate.gate_cache_max_layers.store(7, Ordering::Relaxed);
-        v.ffn.q4k_ffn_cache_max_layers.store(3, Ordering::Relaxed);
+        v.ffn.kquant_ffn_cache_max_layers.store(3, Ordering::Relaxed);
 
         let cloned = v.clone();
         assert!(cloned.gate.hnsw_enabled.load(Ordering::Relaxed));
         assert_eq!(cloned.gate.hnsw_ef_search.load(Ordering::Relaxed), 42);
         assert_eq!(cloned.gate.gate_cache_max_layers.load(Ordering::Relaxed), 7);
         assert_eq!(
-            cloned.ffn.q4k_ffn_cache_max_layers.load(Ordering::Relaxed),
+            cloned.ffn.kquant_ffn_cache_max_layers.load(Ordering::Relaxed),
             3
         );
 
@@ -338,17 +338,17 @@ mod refactor_tests {
     fn q4k_ffn_cache_lru_evicts_when_capped() {
         let v = VectorIndex::empty(5, 8);
         {
-            let mut cache = v.ffn.q4k_ffn_cache.lock().unwrap();
-            let mut lru = v.ffn.q4k_ffn_cache_lru.lock().unwrap();
+            let mut cache = v.ffn.kquant_ffn_cache.lock().unwrap();
+            let mut lru = v.ffn.kquant_ffn_cache_lru.lock().unwrap();
             for layer in 0..5 {
                 cache[layer][0] = Some(Arc::new(vec![0.0f32; 8]));
                 lru.push_front(layer);
             }
         }
-        v.set_q4k_ffn_cache_max_layers(2);
-        let (slots, _) = v.q4k_ffn_cache_stats();
+        v.set_kquant_ffn_cache_max_layers(2);
+        let (slots, _) = v.kquant_ffn_cache_stats();
         assert_eq!(slots, 2);
-        let cache = v.ffn.q4k_ffn_cache.lock().unwrap();
+        let cache = v.ffn.kquant_ffn_cache.lock().unwrap();
         assert!(cache[0][0].is_none());
         assert!(cache[1][0].is_none());
         assert!(cache[3][0].is_some() || cache[4][0].is_some());

@@ -394,7 +394,7 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
 /// `feature_major_down=true`, load, then ask the dispatch path for one
 /// feature's down vector. With the new file present, the dispatch
 /// should serve the row from `down_features_q4k.bin` and skip the
-/// cache (asserted via `q4k_ffn_cache_stats`).
+/// cache (asserted via `kquant_ffn_cache_stats`).
 #[test]
 fn q4k_feature_major_down_round_trip() {
     use larql_vindex::QuantFormat;
@@ -463,7 +463,7 @@ fn q4k_feature_major_down_round_trip() {
         index.kquant_down_feature_scaled_add(layer, feat, alpha, &mut out),
         "feature-major down decode must succeed when the file is present"
     );
-    let (cache_slots, cache_bytes) = index.q4k_ffn_cache_stats();
+    let (cache_slots, cache_bytes) = index.kquant_ffn_cache_stats();
     assert_eq!(
         (cache_slots, cache_bytes),
         (0, 0),

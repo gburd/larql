@@ -403,7 +403,7 @@ pub(super) fn run_oracle_pq_exception(
         }
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let baseline_hidden =
-            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
@@ -776,7 +776,7 @@ fn measure_fit_prompt_base_pq_kl(
         }
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let baseline_hidden =
-            larql_inference::vindex::predict_q4k_hidden(weights, &token_ids, index, None);
+            larql_inference::vindex::predict_kquant_hidden(weights, &token_ids, index, None);
         let baseline_logits = final_logits(weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         for head in heads {
@@ -842,7 +842,7 @@ fn measure_fit_position_restore_gains(
         }
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let baseline_hidden =
-            larql_inference::vindex::predict_q4k_hidden(weights, &token_ids, index, None);
+            larql_inference::vindex::predict_kquant_hidden(weights, &token_ids, index, None);
         let baseline_logits = final_logits(weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
@@ -989,7 +989,7 @@ fn forward_q4k_oracle_pq_exception_head(
     stratum: &str,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
     let hidden_size = weights.hidden_size;
-    larql_inference::vindex::predict_q4k_hidden_with_mapped_head_residual_delta(
+    larql_inference::vindex::predict_kquant_hidden_with_mapped_head_residual_delta(
         weights,
         token_ids,
         index,
@@ -1039,7 +1039,7 @@ fn forward_q4k_oracle_pq_position_restore_head(
     stratum: &str,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
     let hidden_size = weights.hidden_size;
-    larql_inference::vindex::predict_q4k_hidden_with_mapped_head_residual_delta(
+    larql_inference::vindex::predict_kquant_hidden_with_mapped_head_residual_delta(
         weights,
         token_ids,
         index,

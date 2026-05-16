@@ -1,5 +1,5 @@
 //! Q4_K dequant cache vs row-level — measures the trade-off the LRU
-//! bound (`set_q4k_ffn_cache_max_layers`) controls.
+//! bound (`set_kquant_ffn_cache_max_layers`) controls.
 //!
 //! Two strategies for serving full-K FFN compute on Q4_K bytes:
 //!

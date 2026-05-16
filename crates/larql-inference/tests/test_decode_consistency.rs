@@ -29,7 +29,7 @@
 //! For each available Q4K vindex, for `k ∈ {1, 2, 4}` decode steps:
 //!
 //!   metal_decode = prefill(prompt_ids) + decode(t1) + decode(t2) + …
-//!   cpu_ref      = predict_q4k_hidden(prompt_ids ++ [t1, t2, …])
+//!   cpu_ref      = predict_kquant_hidden(prompt_ids ++ [t1, t2, …])
 //!
 //! Each decode step's per-layer hidden (1 position) must match
 //! `cpu_ref`'s last-position slice at that layer with cos ≥ 0.99995

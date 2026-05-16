@@ -142,7 +142,7 @@ pub(super) fn run_sanity_check(args: SanityCheckArgs) -> Result<(), Box<dyn std:
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
 
         let baseline_hidden =
-            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
 
@@ -214,7 +214,7 @@ fn forward_q4k_noop_replace_pre_o_head(
     index: &VectorIndex,
     head: HeadId,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    larql_inference::vindex::predict_q4k_hidden_with_mapped_pre_o_head(
+    larql_inference::vindex::predict_kquant_hidden_with_mapped_pre_o_head(
         weights,
         token_ids,
         index,
@@ -231,7 +231,7 @@ fn forward_q4k_subtract_pre_o_head(
     index: &VectorIndex,
     head: HeadId,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    larql_inference::vindex::predict_q4k_hidden_with_subtracted_pre_o_heads(
+    larql_inference::vindex::predict_kquant_hidden_with_subtracted_pre_o_heads(
         weights,
         token_ids,
         index,
@@ -247,7 +247,7 @@ fn forward_q4k_noop_replace_head_residual_delta(
     index: &VectorIndex,
     head: HeadId,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    larql_inference::vindex::predict_q4k_hidden_with_original_head_residual_delta(
+    larql_inference::vindex::predict_kquant_hidden_with_original_head_residual_delta(
         weights, token_ids, index, head.layer, head.head,
     )
     .map_err(Into::into)

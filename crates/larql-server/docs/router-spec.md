@@ -196,6 +196,36 @@ takes priority). `layer` / `layers` (dense) and `experts` /
 
 Always returns 200.
 
+### GET /v1/shard/{model_id}/{start}-{end}
+
+Served by every `larql-server` that owns the requested layer range.
+Used by Mode B spares to download a vindex slice after they receive
+an `AssignMsg` from the router (`AssignMsg.origin_url` points at any
+live replica of the range; the spare appends
+`/v1/shard/{model_id}/{start}-{end}` and fetches).
+
+- **Response**: `200 OK`, `Content-Type: application/x-tar`,
+  streaming body (chunked) containing the on-disk vindex directory
+  packaged as a tar archive. Symlinks are followed during archive
+  creation so the spare receives a self-contained slice.
+- **Layer range semantics**: `start` and `end` are inclusive and
+  validated (400 on `start > end` or malformed range). The server
+  ships its full vindex directory in the tar; the receiver applies
+  its own `--layers` filter on unpack — this keeps the streaming
+  path simple and matches today's vindex layout.
+- **Errors**: `400` on malformed range; `404` if `model_id` is not
+  loaded; `500` on disk-side tar failures.
+
+Client side: `larql-server` calls `shard_loader::download_and_load_shard()`
+(in `crates/larql-server/src/shard_loader.rs`) on every `AssignMsg`.
+The call is idempotent (skips download if the unpacked path already
+exists), verifies SHA-256 against `AssignMsg.expected_hash` when set,
+and unpacks atomically into `{store}/{model_id}/layers-{start}-{end}/`
+via a temp-dir-then-rename. End-to-end integration test:
+`crates/larql-server/tests/test_grid_mode_b.rs::mode_b_full_vertical_handoff`
+spawns a real donor and exercises the download → unpack → ReadyMsg
+path against the live HTTP endpoint.
+
 ---
 
 ## 5. Dispatch Logic
@@ -420,12 +450,18 @@ Tracked in ADR-0003 / ADR-0004:
 
 - **gRPC transport to backends** — fan-out currently uses HTTP/JSON; a future version
   will use raw f32 bytes over gRPC (ADR-0003 Phase 2)
-- **MoE expert dispatch** — routing by expert ID for mixture-of-experts models
 
 Already shipped (see `crates/larql-router/ROADMAP.md` for details):
 Mode B + Phase B2 drain/reassign, stale heartbeat eviction, admin CLI
 (`status` / `gaps` / `drain` / `assign`), dynamic rebalancing including
-hot-shard load-rate replication, QUIC transport.
+hot-shard load-rate replication + two-threshold hysteresis (ADR-0014),
+QUIC transport (ADR-0010), Prometheus `/metrics` (ADR-0017), MoE
+expert dispatch by `(layer, expert-range)` ownership with JSON
+`experts` / `layer_experts` request shapes (ADR-0018), HTTP/3 shard
+transport opt-in via `--http3-shards` / `--http3-port` (ADR-0019),
+backpressure tier in `route()` with `--saturation-ceiling N` →
+`503 Retry-After: 0.5` (ADR-0020), and the `GET /v1/shard/...`
+endpoint documented above.
 
 ---
 

@@ -167,7 +167,7 @@ pub fn load_single_vindex(
         );
     }
     if opts.max_q4k_cache_layers > 0 {
-        index.set_q4k_ffn_cache_max_layers(opts.max_q4k_cache_layers);
+        index.set_kquant_ffn_cache_max_layers(opts.max_q4k_cache_layers);
         info!(
             "  Q4K FFN cache: LRU, max {} layers",
             opts.max_q4k_cache_layers

@@ -22,7 +22,7 @@ mod runner {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
 
-    use larql_inference::vindex::{predict_q4k_hidden_with_ffn, WalkFfn};
+    use larql_inference::vindex::{predict_kquant_hidden_with_ffn, WalkFfn};
     use larql_inference::{encode_prompt, hidden_to_raw_logits, open_inference_vindex};
     use larql_vindex::{load_model_weights_q4k, load_vindex_tokenizer};
     use serde::{Deserialize, Serialize};
@@ -293,7 +293,7 @@ mod runner {
         let weights_ref: &larql_models::ModelWeights =
             unsafe { &*(weights as *const larql_models::ModelWeights) };
         let walk_ffn = WalkFfn::new(weights_ref, index, feature_top_k);
-        let h = predict_q4k_hidden_with_ffn(weights, token_ids, index, &walk_ffn);
+        let h = predict_kquant_hidden_with_ffn(weights, token_ids, index, &walk_ffn);
         let seq_len = h.shape()[0];
         let h_last = h.slice(ndarray::s![seq_len - 1..seq_len, ..]).to_owned();
         let logits = hidden_to_raw_logits(weights, &h_last);

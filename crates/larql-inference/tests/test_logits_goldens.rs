@@ -322,7 +322,7 @@ fn capture_top5(
     // (test_cpu_metal_parity passes), and the LM head matvec is the
     // same `f32_gemv` either way. What we're isolating in this test
     // is "did the model's output for this prompt drift?"
-    let h_full = larql_inference::vindex::predict_q4k_hidden(weights, prompt_ids, index, None);
+    let h_full = larql_inference::vindex::predict_kquant_hidden(weights, prompt_ids, index, None);
     let last_pos = h_full.shape()[0] - 1;
     let h_last = h_full.row(last_pos).to_owned();
 

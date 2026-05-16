@@ -120,7 +120,7 @@ impl InferenceWeights {
         match self {
             Self::Dense(weights) => predict(weights, tokenizer, token_ids, top_k),
             Self::Quantised { weights, index } => {
-                crate::vindex::predict_q4k(weights, tokenizer, token_ids, top_k, index)
+                crate::vindex::predict_kquant(weights, tokenizer, token_ids, top_k, index)
             }
         }
     }

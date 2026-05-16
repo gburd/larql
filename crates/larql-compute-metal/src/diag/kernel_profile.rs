@@ -750,3 +750,70 @@ pub fn profile_all(n_layers: usize, warmup: usize, iters: usize) -> Vec<KernelRe
 
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mean_and_stddev_match_textbook_formulas() {
+        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!((mean(&v) - 3.0).abs() < 1e-12);
+        // Population stddev of 1..=5 is √2.
+        assert!((stddev(&v) - 2.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn synth_f32_returns_requested_length() {
+        let v = synth_f32(7, 0.1);
+        assert_eq!(v.len(), 7);
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn ms_per_token_scales_linearly_with_layer_count() {
+        let r = KernelResult {
+            name: "k".into(),
+            mb_per_call: 1.0,
+            isolated_ms: 0.5,
+            isolated_sd_ms: 0.01,
+            isolated_gbs: 2000.0,
+            batched_ms_per_layer: 0.1,
+            batched_gbs: 10_000.0,
+        };
+        assert!((r.ms_per_token(34) - 3.4).abs() < 1e-12);
+        assert!((r.ms_per_token(0) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn is_compute_bound_flags_low_throughput_kernels() {
+        let mut r = KernelResult {
+            name: "k".into(),
+            mb_per_call: 1.0,
+            isolated_ms: 0.5,
+            isolated_sd_ms: 0.01,
+            isolated_gbs: 2000.0,
+            batched_ms_per_layer: 0.1,
+            batched_gbs: 250.0,
+        };
+        assert!(r.is_compute_bound());
+        r.batched_gbs = 320.0;
+        assert!(!r.is_compute_bound());
+    }
+
+    /// Drive `profile_all` end-to-end at minimum params (n_layers=1
+    /// warmup=0 iters=1) so the per-kernel `measure_isolated` +
+    /// `measure_single_cmdbuf_batched` + cold-cache loops all run on
+    /// real Metal. Skips on hosts without a Metal device.
+    #[test]
+    fn profile_all_smoke_runs_every_kernel_once() {
+        if crate::MetalBackend::new().is_none() {
+            return;
+        }
+        let results = profile_all(1, 0, 1);
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.batched_ms_per_layer.is_finite()
+            && r.isolated_ms.is_finite()
+            && r.batched_gbs.is_finite()));
+    }
+}

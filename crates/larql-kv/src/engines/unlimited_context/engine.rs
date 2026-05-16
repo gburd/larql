@@ -133,7 +133,7 @@ impl UnlimitedContextEngine {
         let out = rs_extend_from_checkpoint_backend(
             weights,
             tokens,
-            &prior,
+            prior,
             abs_offset,
             self.backend.as_ref(),
         )?;
@@ -224,7 +224,7 @@ impl UnlimitedContextEngine {
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
-        let out = rs_extend_from_checkpoint_q4k(weights, index, chunk, &prior, abs_start, backend)?;
+        let out = rs_extend_from_checkpoint_q4k(weights, index, chunk, prior, abs_start, backend)?;
 
         self.last_hidden = Some(out.last_hidden);
         self.current_window_kv = Some(out.kv_cache);
@@ -260,7 +260,7 @@ impl UnlimitedContextEngine {
         let out = rs_extend_from_checkpoint_backend(
             weights,
             chunk,
-            &prior,
+            prior,
             abs_start,
             self.backend.as_ref(),
         )?;

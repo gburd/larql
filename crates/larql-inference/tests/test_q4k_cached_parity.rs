@@ -1,5 +1,5 @@
 //! Parity: KV-cached CPU Q4K decode must produce the same tokens as
-//! the legacy O(N²) `predict_q4k_hidden`-per-step path.
+//! the legacy O(N²) `predict_kquant_hidden`-per-step path.
 //!
 //! Catches:
 //! - RoPE absolute-position drift between prefill (positions 0..N) and
@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use larql_compute::CpuBackend;
 use larql_inference::vindex::{
-    predict_q4k_decode_step, predict_q4k_decode_step_direct, predict_q4k_hidden,
+    predict_q4k_decode_step, predict_q4k_decode_step_direct, predict_kquant_hidden,
     predict_q4k_prefill, supports_cached_decode, supports_direct_matvec_decode,
 };
 use larql_vindex::{
@@ -113,14 +113,14 @@ fn cached_decode_matches_uncached_tokens() {
         cached_ids.push(next_id);
     }
 
-    // ── Path B: uncached predict_q4k_hidden per step ──────────────
+    // ── Path B: uncached predict_kquant_hidden per step ──────────────
     let mut ids = prompt_ids.clone();
-    let h_full = predict_q4k_hidden(&mut weights_b, &ids, &q4_index, None);
+    let h_full = predict_kquant_hidden(&mut weights_b, &ids, &q4_index, None);
     let mut next_id = argmax_token(&weights_b, &tokenizer, &h_full);
     let mut uncached_ids = vec![next_id];
     ids.push(next_id);
     for _ in 1..STEPS {
-        let h_full = predict_q4k_hidden(&mut weights_b, &ids, &q4_index, None);
+        let h_full = predict_kquant_hidden(&mut weights_b, &ids, &q4_index, None);
         next_id = argmax_token(&weights_b, &tokenizer, &h_full);
         uncached_ids.push(next_id);
         ids.push(next_id);

@@ -70,7 +70,7 @@ pub const ENV_METAL_DUMP_LAYERS: &str = "LARQL_METAL_DUMP_LAYERS";
 // ── Filename templates (producer and consumer share these) ──────────────────
 
 /// `{dir}/cpu_layer_NN.f32` — end-of-layer CPU residual (from
-/// `vindex/q4k_forward/hidden.rs`).
+/// `vindex/kquant_forward/hidden.rs`).
 pub fn cpu_layer_path(dir: &str, layer: usize) -> String {
     format!("{dir}/cpu_layer_{layer:02}.f32")
 }

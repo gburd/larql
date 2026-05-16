@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // twice.
     let t0 = Instant::now();
     let cpu_hidden_full =
-        larql_inference::vindex::predict_q4k_hidden(&mut w_cpu, &appended_ids, &q4_index, None);
+        larql_inference::vindex::predict_kquant_hidden(&mut w_cpu, &appended_ids, &q4_index, None);
     let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let cpu_last = cpu_hidden_full
         .row(cpu_hidden_full.nrows().saturating_sub(1))
@@ -189,14 +189,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metal_prefill_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     // Decode one token. Returns the [hidden] output of the final
-    // layer — same shape predict_q4k_hidden's last-row gives us.
+    // layer — same shape predict_kquant_hidden's last-row gives us.
     let dec_embed = larql_inference::forward::embed_tokens_pub(&w_metal, &[token_0_id]);
     let dec_x: Vec<f32> = dec_embed.row(0).to_vec();
 
     // Set up per-layer decode dump (gated inside the decode shader by
     // LARQL_DECODE_DUMP_LAYERS). We also need the CPU per-layer dumps
     // at seq_len=19 to compare against — drive CPU through a second
-    // predict_q4k_hidden call with its dump env var set to the same dir.
+    // predict_kquant_hidden call with its dump env var set to the same dir.
     let decode_dump = tempfile::tempdir()?;
     let cpu_dump = tempfile::tempdir()?;
     std::env::set_var("LARQL_DECODE_DUMP_LAYERS", decode_dump.path());
@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // prefill we already paid for.
     let mut w_cpu2 = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
     let _ =
-        larql_inference::vindex::predict_q4k_hidden(&mut w_cpu2, &appended_ids, &q4_index, None);
+        larql_inference::vindex::predict_kquant_hidden(&mut w_cpu2, &appended_ids, &q4_index, None);
 
     println!(
         "  B) Metal prefill({} tok) + decode(1 tok) took {:>5.1} + {:>5.1} ms",

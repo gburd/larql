@@ -12,7 +12,6 @@
 //! see `docs/specs/kv-engine-unification.md` for the migration rationale.
 
 use larql_inference::attention::SharedKV;
-use ndarray::Array2;
 
 /// Per-layer K/V cache. Can grow unbounded or be clamped to a fixed
 /// sliding window (Markov-residual-bounded strategy — keep the last W

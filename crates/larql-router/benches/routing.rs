@@ -11,7 +11,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use std::sync::Arc;
+
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use tokio::sync::RwLock;
 
 use larql_router::grid::{GridState, ServerEntry};
 use larql_router_protocol::LayerLatency;
@@ -407,6 +410,63 @@ fn bench_route_saturation_filter(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Concurrent route() — RwLock contention (Throughput P1) ───────────────────
+
+/// Drive `route()` from N parallel tokio tasks against a single
+/// `Arc<RwLock<GridState>>` — matches the lock shape used in
+/// `crates/larql-router/src/http.rs::AppState::resolve_all`. Surfaces
+/// read-lock contention before production does.
+///
+/// Criterion's `Throughput::Elements` reports req/s; per-route ns
+/// drops out of the timing data. Topology is fixed at the production-
+/// shape middle scenario (10 shards × 2 replicas, 30 layers) so the
+/// only axis is worker count.
+fn bench_route_concurrent(c: &mut Criterion) {
+    const ROUTES_PER_WORKER: usize = 256;
+    let worker_counts: &[usize] = &[1, 4, 8, 16];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let grid = Arc::new(RwLock::new(build_realistic_state(30, 10, 2)));
+
+    let mut group = c.benchmark_group("routing/route_concurrent");
+    for &n_workers in worker_counts {
+        group.throughput(Throughput::Elements((n_workers * ROUTES_PER_WORKER) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(n_workers),
+            &n_workers,
+            |b, &n_workers| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let mut handles = Vec::with_capacity(n_workers);
+                        for w in 0..n_workers {
+                            let grid = grid.clone();
+                            handles.push(tokio::spawn(async move {
+                                // Each worker rotates through layers so the
+                                // bench isn't degenerate on one route_table
+                                // bucket; that would understate contention
+                                // if `route()` ever cached recent results.
+                                for i in 0..ROUTES_PER_WORKER {
+                                    let layer = ((w * ROUTES_PER_WORKER + i) % 30) as u32;
+                                    let _ = grid.read().await.route(Some("bench-model"), layer);
+                                }
+                            }));
+                        }
+                        for h in handles {
+                            h.await.unwrap();
+                        }
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_route_single_layer,
@@ -419,5 +479,6 @@ criterion_group!(
     bench_single_register,
     bench_register_cascade,
     bench_route_saturation_filter,
+    bench_route_concurrent,
 );
 criterion_main!(benches);

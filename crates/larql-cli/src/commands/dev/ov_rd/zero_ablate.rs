@@ -194,7 +194,7 @@ pub(super) fn run_zero_ablate(args: ZeroAblateArgs) -> Result<(), Box<dyn std::e
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
 
         let baseline_hidden =
-            larql_inference::vindex::predict_q4k_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
@@ -293,7 +293,7 @@ pub(super) fn forward_q4k_zero_pre_o_head(
     index: &VectorIndex,
     head: HeadId,
 ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    larql_inference::vindex::predict_q4k_hidden_with_zeroed_pre_o_heads(
+    larql_inference::vindex::predict_kquant_hidden_with_zeroed_pre_o_heads(
         weights,
         token_ids,
         index,

@@ -1,7 +1,7 @@
 //! Q4_K/Q6_K dequant cache — `kquant_ffn_layer` lazily decodes a whole
 //! layer to f32 (transposing down from `[hidden, intermediate]` to
 //! feature-major), shares the result via `Arc`, and bounds memory
-//! via an LRU controlled by `set_q4k_ffn_cache_max_layers`.
+//! via an LRU controlled by `set_kquant_ffn_cache_max_layers`.
 //!
 //! **The cache is the legacy path.** Production Metal decode bypasses
 //! it entirely (`kquant_matmul_transb` streams Q4_K bytes through the
@@ -20,13 +20,13 @@ use super::FFN_DOWN;
 use crate::index::core::VectorIndex;
 
 impl VectorIndex {
-    /// Diagnostic: count of populated `q4k_ffn_cache` slots and the
+    /// Diagnostic: count of populated `kquant_ffn_cache` slots and the
     /// total f32 bytes they hold. Used by perf probes that need to know
     /// whether a decode actually exercised the dequant cache (the hot
     /// path on Metal does NOT — it streams Q4_K bytes through
     /// `kquant_matmul_transb`). Returns `(populated_slots, bytes)`.
-    pub fn q4k_ffn_cache_stats(&self) -> (usize, usize) {
-        let cache = self.ffn.q4k_ffn_cache.lock().unwrap();
+    pub fn kquant_ffn_cache_stats(&self) -> (usize, usize) {
+        let cache = self.ffn.kquant_ffn_cache.lock().unwrap();
         let mut slots = 0usize;
         let mut bytes = 0usize;
         for slot in cache.iter() {
@@ -38,7 +38,7 @@ impl VectorIndex {
         (slots, bytes)
     }
 
-    /// Cap the number of layers held in `q4k_ffn_cache`. Mirror of
+    /// Cap the number of layers held in `kquant_ffn_cache`. Mirror of
     /// `set_gate_cache_max_layers` for the FFN dequant cache. `0`
     /// (default) means unbounded. Setting a smaller cap shrinks the
     /// cache eagerly via the LRU.
@@ -49,13 +49,13 @@ impl VectorIndex {
     /// feature-major down enabled at extract time, the cache is
     /// only used for non-Q4K interleaved fallback paths and can
     /// be capped at 1.
-    pub fn set_q4k_ffn_cache_max_layers(&self, max_layers: usize) {
+    pub fn set_kquant_ffn_cache_max_layers(&self, max_layers: usize) {
         self.ffn
-            .q4k_ffn_cache_max_layers
+            .kquant_ffn_cache_max_layers
             .store(max_layers, std::sync::atomic::Ordering::Relaxed);
         if max_layers > 0 {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
-            let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
+            let mut cache = self.ffn.kquant_ffn_cache.lock().unwrap();
+            let mut lru = self.ffn.kquant_ffn_cache_lru.lock().unwrap();
             while lru.len() > max_layers {
                 if let Some(evict) = lru.pop_back() {
                     if evict < cache.len() {
@@ -67,7 +67,7 @@ impl VectorIndex {
     }
 
     /// Record an access to a Q4_K-cached layer and evict if the LRU
-    /// has grown beyond `q4k_ffn_cache_max_layers`. Must be called
+    /// has grown beyond `kquant_ffn_cache_max_layers`. Must be called
     /// with `cache` already locked by the caller; `just_inserted` is
     /// true when this call just dequantised a fresh layer.
     fn touch_q4k_ffn_cache_lru(
@@ -78,12 +78,12 @@ impl VectorIndex {
     ) {
         let max = self
             .ffn
-            .q4k_ffn_cache_max_layers
+            .kquant_ffn_cache_max_layers
             .load(std::sync::atomic::Ordering::Relaxed);
         if max == 0 {
             return;
         }
-        let mut lru = self.ffn.q4k_ffn_cache_lru.lock().unwrap();
+        let mut lru = self.ffn.kquant_ffn_cache_lru.lock().unwrap();
         if let Some(pos) = lru.iter().position(|&l| l == layer) {
             lru.remove(pos);
         }
@@ -118,7 +118,7 @@ impl VectorIndex {
             return None;
         }
         {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
+            let mut cache = self.ffn.kquant_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get(layer) {
                 if let Some(ref arc) = slot[component] {
                     let arc = arc.clone();
@@ -161,7 +161,7 @@ impl VectorIndex {
         };
         let arc = std::sync::Arc::new(final_data);
         {
-            let mut cache = self.ffn.q4k_ffn_cache.lock().unwrap();
+            let mut cache = self.ffn.kquant_ffn_cache.lock().unwrap();
             if let Some(slot) = cache.get_mut(layer) {
                 slot[component] = Some(arc.clone());
             }
@@ -223,7 +223,7 @@ impl VectorIndex {
         if component > 2 {
             return None;
         }
-        let once = self.ffn.q4k_ffn_once.get(layer)?.get(component)?;
+        let once = self.ffn.kquant_ffn_once.get(layer)?.get(component)?;
 
         let result = once.get_or_init(|| {
             let slices = self.interleaved_kquant_layer_data(layer)?;
@@ -284,16 +284,16 @@ mod tests {
     }
 
     fn install_cache_entry(v: &VectorIndex, layer: usize, component: usize, data: Vec<f32>) {
-        let mut cache = v.ffn.q4k_ffn_cache.lock().unwrap();
+        let mut cache = v.ffn.kquant_ffn_cache.lock().unwrap();
         cache[layer][component] = Some(Arc::new(data));
     }
 
-    // ── q4k_ffn_cache_stats ────────────────────────────────────────
+    // ── kquant_ffn_cache_stats ────────────────────────────────────────
 
     #[test]
     fn cache_stats_zero_when_empty() {
         let v = fresh(3, 8);
-        let (slots, bytes) = v.q4k_ffn_cache_stats();
+        let (slots, bytes) = v.kquant_ffn_cache_stats();
         assert_eq!(slots, 0);
         assert_eq!(bytes, 0);
     }
@@ -304,22 +304,22 @@ mod tests {
         install_cache_entry(&v, 0, 0, vec![0.0_f32; 4]); // 16 bytes
         install_cache_entry(&v, 0, 1, vec![0.0_f32; 8]); // 32 bytes
         install_cache_entry(&v, 2, 2, vec![0.0_f32; 16]); // 64 bytes
-        let (slots, bytes) = v.q4k_ffn_cache_stats();
+        let (slots, bytes) = v.kquant_ffn_cache_stats();
         assert_eq!(slots, 3);
         assert_eq!(bytes, 16 + 32 + 64);
     }
 
-    // ── set_q4k_ffn_cache_max_layers ───────────────────────────────
+    // ── set_kquant_ffn_cache_max_layers ───────────────────────────────
 
     #[test]
     fn set_max_layers_zero_unbounded_does_not_evict() {
         let v = fresh(4, 8);
         for layer in 0..4 {
             install_cache_entry(&v, layer, 0, vec![0.0_f32; 4]);
-            v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(layer);
+            v.ffn.kquant_ffn_cache_lru.lock().unwrap().push_front(layer);
         }
-        v.set_q4k_ffn_cache_max_layers(0);
-        let (slots, _) = v.q4k_ffn_cache_stats();
+        v.set_kquant_ffn_cache_max_layers(0);
+        let (slots, _) = v.kquant_ffn_cache_stats();
         assert_eq!(slots, 4, "max=0 means unbounded");
     }
 
@@ -328,15 +328,15 @@ mod tests {
         let v = fresh(5, 8);
         for layer in 0..5 {
             install_cache_entry(&v, layer, 0, vec![0.0_f32; 4]);
-            v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(layer);
+            v.ffn.kquant_ffn_cache_lru.lock().unwrap().push_front(layer);
         }
         // After this lru = [4, 3, 2, 1, 0] (front=most-recent).
-        v.set_q4k_ffn_cache_max_layers(2);
-        let (slots, _) = v.q4k_ffn_cache_stats();
+        v.set_kquant_ffn_cache_max_layers(2);
+        let (slots, _) = v.kquant_ffn_cache_stats();
         assert_eq!(slots, 2, "shrinks to cap");
-        assert_eq!(v.ffn.q4k_ffn_cache_max_layers.load(Ordering::Relaxed), 2);
+        assert_eq!(v.ffn.kquant_ffn_cache_max_layers.load(Ordering::Relaxed), 2);
         // The two MRU entries (layers 3 and 4) survive; LRU tail (0,1,2) evicted.
-        let cache = v.ffn.q4k_ffn_cache.lock().unwrap();
+        let cache = v.ffn.kquant_ffn_cache.lock().unwrap();
         assert!(cache[3][0].is_some() || cache[4][0].is_some());
         assert!(cache[0][0].is_none());
         assert!(cache[1][0].is_none());
@@ -349,9 +349,9 @@ mod tests {
         // the cache was resized). The eviction must skip that slot
         // without panicking.
         let v = fresh(3, 8);
-        v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(99);
-        v.ffn.q4k_ffn_cache_lru.lock().unwrap().push_front(0);
-        v.set_q4k_ffn_cache_max_layers(1);
+        v.ffn.kquant_ffn_cache_lru.lock().unwrap().push_front(99);
+        v.ffn.kquant_ffn_cache_lru.lock().unwrap().push_front(0);
+        v.set_kquant_ffn_cache_max_layers(1);
         // Survives without panic; the OoB index is ignored.
     }
 
@@ -377,20 +377,20 @@ mod tests {
     #[test]
     fn q4k_ffn_layer_cache_hit_bumps_lru() {
         let v = fresh(3, 8);
-        v.set_q4k_ffn_cache_max_layers(3);
+        v.set_kquant_ffn_cache_max_layers(3);
         install_cache_entry(&v, 0, 0, vec![1.0_f32; 4]);
         install_cache_entry(&v, 1, 0, vec![2.0_f32; 4]);
         install_cache_entry(&v, 2, 0, vec![3.0_f32; 4]);
         // Seed LRU with 0, 1, 2 (front=most-recent).
         {
-            let mut lru = v.ffn.q4k_ffn_cache_lru.lock().unwrap();
+            let mut lru = v.ffn.kquant_ffn_cache_lru.lock().unwrap();
             lru.push_back(0);
             lru.push_back(1);
             lru.push_back(2);
         }
         // Hit on layer 0 — moves it to the front.
         let _ = v.kquant_ffn_layer(0, 0).unwrap();
-        let lru = v.ffn.q4k_ffn_cache_lru.lock().unwrap();
+        let lru = v.ffn.kquant_ffn_cache_lru.lock().unwrap();
         assert_eq!(lru.front().copied(), Some(0), "hit promotes to MRU");
     }
 

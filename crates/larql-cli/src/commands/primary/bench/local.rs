@@ -55,7 +55,7 @@ pub(super) fn append_cpu_fallback_note(note: String, cached: bool) -> String {
 /// Verbose log line for the Q4K dequant-cache stats after a run.
 pub(super) fn format_q4k_cache_log(backend_label: &str, slots: usize, bytes: usize) -> String {
     format!(
-        "[bench] q4k_ffn_cache after {}: {} populated slots, {:.1} MB",
+        "[bench] kquant_ffn_cache after {}: {} populated slots, {:.1} MB",
         backend_label,
         slots,
         bytes as f64 / 1_048_576.0,

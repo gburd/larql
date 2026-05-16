@@ -146,7 +146,7 @@ pub(crate) fn apply_layer_scalar(weights: &ModelWeights, h: &mut Array2<f32>, la
 ///
 /// Handles: attention → FFN → per-layer embedding → layer_scalar.
 /// All four steps are needed for Gemma 4 correctness. Exposed `pub` so
-/// alternate forward drivers (notably `vindex::predict_q4k`) get the same
+/// alternate forward drivers (notably `vindex::predict_kquant`) get the same
 /// sequence as `predict_with_temperature` without duplicating logic.
 #[allow(clippy::type_complexity)]
 pub fn run_layer_with_ffn(

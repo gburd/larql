@@ -50,7 +50,7 @@ use crate::cache::KvCache;
 /// `max_new_tokens` have been produced.
 pub fn generate_cached<F>(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -76,7 +76,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn generate_cached_backend<F>(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -107,7 +107,7 @@ where
 /// unbounded growth.
 pub fn generate_cached_with_window<F>(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -132,7 +132,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn generate_cached_bounded(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -181,7 +181,7 @@ fn generate_cached_bounded(
 #[allow(clippy::too_many_arguments)]
 pub fn generate_cached_hooked<F>(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -223,7 +223,7 @@ where
 pub fn generate_with_engine<F>(
     engine: &mut dyn crate::KvEngine,
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -380,7 +380,7 @@ pub fn kv_decode_step_run(
 #[allow(clippy::too_many_arguments)]
 fn generate_cached_hooked_inner(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -446,7 +446,7 @@ fn last_row_as_2d(h: &Array2<f32>) -> Array2<f32> {
 
 fn argmax_next_token(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     h_single: &Array2<f32>,
 ) -> Option<(u32, String)> {
     let result = logits_to_predictions_pub(weights, h_single, tokenizer, 1, 1.0);
@@ -476,7 +476,7 @@ fn is_stop_token_str(s: &str) -> bool {
 /// output and restricts the vocabulary to tokens valid at each position.
 pub fn generate_cached_constrained<F, M>(
     weights: &ModelWeights,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     max_new_tokens: usize,
@@ -562,7 +562,7 @@ where
     generated
 }
 
-fn masked_argmax(logits: &[f32], tokenizer: &tokenizers::Tokenizer) -> Option<(u32, String)> {
+fn masked_argmax(logits: &[f32], tokenizer: &larql_inference::tokenizers::Tokenizer) -> Option<(u32, String)> {
     let (idx, _) = logits
         .iter()
         .enumerate()

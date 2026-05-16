@@ -134,6 +134,7 @@ fn make_router(static_shards: &str) -> axum::Router {
         metrics: None,
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     build_router(state)
 }
@@ -431,6 +432,7 @@ async fn walk_ffn_routes_via_grid_when_grid_state_is_set() {
         metrics: None,
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -489,6 +491,7 @@ async fn walk_ffn_grid_layer_missing_falls_back_to_static_shards() {
         metrics: None,
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -546,6 +549,7 @@ async fn metrics_endpoint_serves_prometheus_text_with_zero_values() {
         metrics: Some(metrics.clone()),
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -676,6 +680,7 @@ async fn moe_request_with_no_owner_returns_503() {
         metrics: None,
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -758,6 +763,7 @@ async fn moe_request_fans_out_to_owning_shards_and_merges() {
         metrics: None,
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -806,6 +812,7 @@ async fn walk_ffn_5xx_increments_error_counter() {
         metrics: Some(metrics.clone()),
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -911,6 +918,7 @@ async fn moe_fanout_dispatches_through_h3_client_when_configured() {
         client,
         metrics: None,
         h3_client: Some(h3_client),
+        hedge_after: None,
     });
     let app = build_router(state);
 
@@ -989,6 +997,7 @@ async fn walk_ffn_returns_503_with_retry_after_when_replicas_saturated() {
         metrics: Some(metrics.clone()),
         #[cfg(feature = "http3")]
         h3_client: None,
+        hedge_after: None,
     });
     let app = build_router(state);
 

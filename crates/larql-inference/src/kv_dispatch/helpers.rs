@@ -221,117 +221,26 @@ fn last_row_as_2d(h: &Array2<f32>) -> Array2<f32> {
 
 #[cfg(test)]
 mod tests {
-    //! Parity tests: dispatch-based helpers must produce bit-identical
-    //! output to legacy `kv_prefill_run` / `kv_decode_step_run` when
-    //! driven against `CpuBackend` (since `CpuBackend::KvDispatch`
-    //! delegates to the same underlying functions).
+    //! Sync vs async dispatch parity, plus dispatch edge cases.
+    //!
+    //! Parity against the legacy `kv_prefill_run` / `kv_decode_step_run`
+    //! reference lives in `larql-kv/tests/dispatch_parity.rs` — moved
+    //! out of this module so it can import both crates without forcing
+    //! a dev-dep cycle that compiles `larql-inference` twice.
 
     use super::super::KvDispatch;
     use super::*;
     use crate::ffn::WeightFfn;
-    use crate::forward::{kv_decode_step_run, kv_prefill_run, NoopHook};
     use crate::test_utils::make_test_weights;
     use larql_compute::CpuBackend;
 
     #[test]
-    fn prefill_via_dispatch_matches_legacy_kv_prefill_run() {
-        let weights = make_test_weights();
-        let backend = CpuBackend;
-        let ffn = WeightFfn { weights: &weights };
-        let prompt = vec![0u32, 1, 2, 3];
-
-        // Trait dispatch.
-        let (h_trait, _handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).expect("prefill");
-
-        // Legacy direct.
-        let (h_legacy, _cache) =
-            kv_prefill_run(&weights, &ffn, &prompt, None, Some(&backend), &mut NoopHook)
-                .expect("legacy prefill");
-
-        assert_eq!(
-            h_trait, h_legacy,
-            "prefill_via_dispatch hidden must match legacy bit-for-bit"
-        );
-    }
-
-    #[test]
-    fn prefill_via_dispatch_windowed_matches_legacy() {
-        let weights = make_test_weights();
-        let backend = CpuBackend;
-        let ffn = WeightFfn { weights: &weights };
-        let prompt = vec![0u32, 1, 2, 3, 4];
-        let window = Some(2);
-
-        let (h_trait, _handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).expect("prefill");
-
-        let (h_legacy, _cache) = kv_prefill_run(
-            &weights,
-            &ffn,
-            &prompt,
-            window,
-            Some(&backend),
-            &mut NoopHook,
-        )
-        .expect("legacy prefill");
-
-        assert_eq!(
-            h_trait, h_legacy,
-            "windowed prefill_via_dispatch must match legacy bit-for-bit"
-        );
-    }
-
-    #[test]
-    fn decode_step_via_dispatch_matches_legacy_kv_decode_step_run() {
-        let weights = make_test_weights();
-        let backend = CpuBackend;
-        let ffn = WeightFfn { weights: &weights };
-        let prompt = vec![0u32, 1, 2];
-
-        // Set up both paths with the same prefill state.
-        let (_, mut handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
-        let (_, mut cache) =
-            kv_prefill_run(&weights, &ffn, &prompt, None, Some(&backend), &mut NoopHook).unwrap();
-
-        // Decode the same next token through both paths.
-        let next_token = 3u32;
-        let abs_position = prompt.len();
-
-        let h_trait = kv_decode_step_via_dispatch(
-            &backend,
-            &weights,
-            &ffn,
-            &mut handles,
-            next_token,
-            abs_position,
-            None,
-            None,
-        )
-        .expect("decode step trait");
-
-        let h_legacy = kv_decode_step_run(
-            &weights,
-            &ffn,
-            &mut cache,
-            next_token,
-            Some(&backend),
-            &mut NoopHook,
-        )
-        .expect("legacy decode step");
-
-        assert_eq!(
-            h_trait, h_legacy,
-            "decode_step_via_dispatch must match legacy bit-for-bit"
-        );
-    }
-
-    #[test]
-    fn multi_step_decode_via_dispatch_matches_legacy() {
+    fn multi_step_decode_via_dispatch_keeps_handles_finite() {
         // Three decode steps in sequence — verifies the handle state
-        // carries forward correctly across calls (same as the legacy
-        // KvCache).
+        // carries forward correctly across calls (same shape as
+        // bit-parity test in larql-kv/tests/dispatch_parity.rs, but
+        // self-contained: no legacy reference, just the dispatch path
+        // and a finite-ness invariant).
         let weights = make_test_weights();
         let backend = CpuBackend;
         let ffn = WeightFfn { weights: &weights };
@@ -339,8 +248,6 @@ mod tests {
 
         let (_, mut handles) =
             kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
-        let (_, mut cache) =
-            kv_prefill_run(&weights, &ffn, &prompt, None, Some(&backend), &mut NoopHook).unwrap();
 
         for step in 0..3 {
             let token = (2 + step) as u32;
@@ -356,18 +263,9 @@ mod tests {
                 None,
             )
             .expect("decode trait");
-            let h_legacy = kv_decode_step_run(
-                &weights,
-                &ffn,
-                &mut cache,
-                token,
-                Some(&backend),
-                &mut NoopHook,
-            )
-            .expect("decode legacy");
-            assert_eq!(
-                h_trait, h_legacy,
-                "step {step} hidden must match legacy bit-for-bit"
+            assert!(
+                h_trait.iter().all(|v| v.is_finite()),
+                "step {step} produced non-finite hidden state"
             );
         }
     }

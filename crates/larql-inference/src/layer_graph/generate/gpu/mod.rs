@@ -205,7 +205,7 @@ where
     // Per-Layer Embeddings (Gemma 4 E2B `hidden_size_per_layer_input`):
     // when `LARQL_METAL_PLE=1`, route through the Metal decode loop with
     // PLE applied per layer (see `metal/decode/encode_ple.rs`).  Otherwise
-    // fall back to the CPU `q4k_forward.rs` path — without PLE applied,
+    // fall back to the CPU `kquant_forward.rs` path — without PLE applied,
     // the residual stream would be missing a per-layer per-position
     // contribution on every layer and the model produces multilingual
     // gibberish; the CPU path produces coherent reasoning text.
@@ -349,7 +349,7 @@ where
     };
 
     // CPU-vs-Metal comparison mode (LARQL_METAL_COMPARE_CPU=1). Runs the
-    // known-correct `predict_q4k` CPU path on the same prompt and diffs
+    // known-correct `predict_kquant` CPU path on the same prompt and diffs
     // the top-5 predicted tokens against the Metal path.
     if runtime.compare_cpu {
         diag_compare_cpu_topk(tokenizer, weights, index, backend, &h_1d);

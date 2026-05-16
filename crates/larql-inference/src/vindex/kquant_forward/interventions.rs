@@ -17,7 +17,7 @@ use crate::forward::{
 use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
 
 #[allow(clippy::type_complexity)]
-fn predict_q4k_hidden_with_target_layer_step<F>(
+fn predict_kquant_hidden_with_target_layer_step<F>(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -97,7 +97,7 @@ where
 
 /// Compute final hidden states on a Q4_K/Q6_K vindex while mapping one
 /// pre-W_O head at `target_layer`.
-pub fn predict_q4k_hidden_with_mapped_pre_o_head<F>(
+pub fn predict_kquant_hidden_with_mapped_pre_o_head<F>(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -108,7 +108,7 @@ pub fn predict_q4k_hidden_with_mapped_pre_o_head<F>(
 where
     F: FnMut(&Array2<f32>) -> Result<Array2<f32>, String>,
 {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -140,7 +140,7 @@ where
 
 /// Compute final hidden states while replacing one pre-W_O head with a fixed
 /// `(seq_len, head_dim)` matrix at `target_layer`.
-pub fn predict_q4k_hidden_with_replaced_pre_o_head(
+pub fn predict_kquant_hidden_with_replaced_pre_o_head(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -148,7 +148,7 @@ pub fn predict_q4k_hidden_with_replaced_pre_o_head(
     target_head: usize,
     replacement: &Array2<f32>,
 ) -> Result<Array2<f32>, String> {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -171,14 +171,14 @@ pub fn predict_q4k_hidden_with_replaced_pre_o_head(
 
 /// Compute final hidden states while zeroing selected pre-W_O heads at one
 /// target layer.
-pub fn predict_q4k_hidden_with_zeroed_pre_o_heads(
+pub fn predict_kquant_hidden_with_zeroed_pre_o_heads(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
     target_layer: usize,
     heads: &[usize],
 ) -> Result<Array2<f32>, String> {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -200,14 +200,14 @@ pub fn predict_q4k_hidden_with_zeroed_pre_o_heads(
 
 /// Compute final hidden states while subtracting selected pre-W_O heads at one
 /// target layer after W_O projection.
-pub fn predict_q4k_hidden_with_subtracted_pre_o_heads(
+pub fn predict_kquant_hidden_with_subtracted_pre_o_heads(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
     target_layer: usize,
     heads: &[usize],
 ) -> Result<Array2<f32>, String> {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -229,7 +229,7 @@ pub fn predict_q4k_hidden_with_subtracted_pre_o_heads(
 
 /// Compute final hidden states while replacing one attention head's residual
 /// contribution at one target layer.
-pub fn predict_q4k_hidden_with_replaced_head_residual_delta(
+pub fn predict_kquant_hidden_with_replaced_head_residual_delta(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -237,7 +237,7 @@ pub fn predict_q4k_hidden_with_replaced_head_residual_delta(
     target_head: usize,
     replacement_delta: &Array2<f32>,
 ) -> Result<Array2<f32>, String> {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -260,7 +260,7 @@ pub fn predict_q4k_hidden_with_replaced_head_residual_delta(
 
 /// Compute final hidden states while mapping one original pre-W_O head to a
 /// residual-space replacement delta at `target_layer`.
-pub fn predict_q4k_hidden_with_mapped_head_residual_delta<F>(
+pub fn predict_kquant_hidden_with_mapped_head_residual_delta<F>(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
@@ -271,7 +271,7 @@ pub fn predict_q4k_hidden_with_mapped_head_residual_delta<F>(
 where
     F: FnMut(&Array2<f32>) -> Result<Array2<f32>, String>,
 {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,
@@ -305,14 +305,14 @@ where
 
 /// Compute final hidden states while replacing one head's residual contribution
 /// with its original `pre_W_O @ W_O_head` delta at `target_layer`.
-pub fn predict_q4k_hidden_with_original_head_residual_delta(
+pub fn predict_kquant_hidden_with_original_head_residual_delta(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,
     target_layer: usize,
     target_head: usize,
 ) -> Result<Array2<f32>, String> {
-    predict_q4k_hidden_with_target_layer_step(
+    predict_kquant_hidden_with_target_layer_step(
         weights,
         token_ids,
         index,

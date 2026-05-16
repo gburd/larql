@@ -223,7 +223,12 @@ fn run_experts_prestaged_metal_smoke() {
     let expert_bufs: Vec<_> = gate_up
         .iter()
         .zip(down.iter())
-        .map(|(gu, dn)| (metal.cached_buffer_for_bytes(gu), metal.cached_buffer_for_bytes(dn)))
+        .map(|(gu, dn)| {
+            (
+                metal.cached_buffer_for_bytes(gu),
+                metal.cached_buffer_for_bytes(dn),
+            )
+        })
         .collect();
 
     let scratch = MoeScratch::new_public(&metal, top_k, hidden, inter);
@@ -387,8 +392,8 @@ fn run_experts_preselected_truncates_to_scratch_top_k() {
 fn decode_token_q4k_moe_with_real_moe_layer_drives_gpu_dispatch() {
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k};
     use larql_compute::{
-        Activation, DecodeBackend, FfnType, FullPipelineLayer, MoeLayerWeights,
-        MoeRoutingPolicy, MoeWeightLayout, NormType, QuantFormat, QuantWeight,
+        Activation, DecodeBackend, FfnType, FullPipelineLayer, MoeLayerWeights, MoeRoutingPolicy,
+        MoeWeightLayout, NormType, QuantFormat, QuantWeight,
     };
     let metal = get_metal();
     let hidden = 256;
@@ -441,13 +446,41 @@ fn decode_token_q4k_moe_with_real_moe_layer_drives_gpu_dispatch() {
     };
 
     let layer = FullPipelineLayer {
-        wq: QuantWeight { data: &wq, scales: None, format: QuantFormat::Q4_K },
-        wk: QuantWeight { data: &wk, scales: None, format: QuantFormat::Q4_K },
-        wv: QuantWeight { data: &wv, scales: None, format: QuantFormat::Q4_K },
-        wo: QuantWeight { data: &wo, scales: None, format: QuantFormat::Q4_K },
-        gate: QuantWeight { data: &gate, scales: None, format: QuantFormat::Q4_0 },
-        up: QuantWeight { data: &up, scales: None, format: QuantFormat::Q4_0 },
-        down: QuantWeight { data: &down, scales: None, format: QuantFormat::Q4_0 },
+        wq: QuantWeight {
+            data: &wq,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wk: QuantWeight {
+            data: &wk,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wv: QuantWeight {
+            data: &wv,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        wo: QuantWeight {
+            data: &wo,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        },
+        gate: QuantWeight {
+            data: &gate,
+            scales: None,
+            format: QuantFormat::Q4_0,
+        },
+        up: QuantWeight {
+            data: &up,
+            scales: None,
+            format: QuantFormat::Q4_0,
+        },
+        down: QuantWeight {
+            data: &down,
+            scales: None,
+            format: QuantFormat::Q4_0,
+        },
         input_norm: &norm_w,
         post_attn_norm: &norm_w,
         pre_ffn_norm: None,

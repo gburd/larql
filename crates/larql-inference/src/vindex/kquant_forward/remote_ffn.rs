@@ -21,13 +21,13 @@ pub fn predict_q4k_with_ffn(
     index: &VectorIndex,
     ffn_backend: &dyn crate::ffn::FfnBackend,
 ) -> PredictResult {
-    let h = predict_q4k_hidden_with_ffn(weights, token_ids, index, ffn_backend);
+    let h = predict_kquant_hidden_with_ffn(weights, token_ids, index, ffn_backend);
     crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 
 /// End-to-end hidden-state forward on a Q4_K vindex with the FFN served by an
 /// external [`crate::ffn::FfnBackend`].
-pub fn predict_q4k_hidden_with_ffn(
+pub fn predict_kquant_hidden_with_ffn(
     weights: &mut ModelWeights,
     token_ids: &[u32],
     index: &VectorIndex,

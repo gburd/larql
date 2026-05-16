@@ -15,8 +15,8 @@
 //! ## Layout
 //!
 //! - `dispatch`: orchestrator (`dispatch_full_pipeline`) + the
-//!   `LayerWeights` legacy struct + the public `encode_rms_norm` /
-//!   `encode_residual_add` helpers used by `prefill.rs`.
+//!   public `encode_rms_norm` / `encode_residual_add` helpers used
+//!   by `prefill.rs`.
 //! - `buffers`: [`LayerBuffers`] — pre-allocates every per-layer
 //!   scratch buffer + caches the per-layer Q4 weight handles.
 //! - `dump`: per-layer file dumps activated by
@@ -33,6 +33,5 @@ mod stages;
 // (`prefill.rs` uses the encode helpers, callers reach for
 // `dispatch_full_pipeline` directly).
 pub use dispatch::{
-    dispatch_full_pipeline, encode_residual_add, encode_rms_norm, LayerWeights,
-    PipelineIntervention,
+    dispatch_full_pipeline, encode_residual_add, encode_rms_norm, PipelineIntervention,
 };

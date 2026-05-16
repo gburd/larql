@@ -3561,7 +3561,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
             "hidden_size_per_layer_input": ple_dim,
             "vocab_size": vocab,
             // Gemma 4 ships with a final-logit tanh softcap of 30.0. This
-            // must survive extract → load; without it predict_q4k peaks
+            // must survive extract → load; without it predict_kquant peaks
             // on the wrong token on E2B.
             "final_logit_softcapping": 30.0,
         }
@@ -3852,7 +3852,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
     );
 
     // final_logit_softcapping must survive the round-trip. Missing it
-    // lets predict_q4k peak the softmax on the wrong token.
+    // lets predict_kquant peak the softmax on the wrong token.
     let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
     assert_eq!(
         cfg.model_config
@@ -3874,7 +3874,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
 // ─── Variable per-layer intermediate size (Gemma 4 E2B double-wide MLP) ──
 //
 // E2B's `use_double_wide_mlp=True` gives half the layers a 2× intermediate
-// dimension (6144 → 12288 on the real model). `predict_q4k` previously
+// dimension (6144 → 12288 on the real model). `predict_kquant` previously
 // hardcoded `weights.intermediate_size` for every layer's FFN dequant,
 // so the wide layers' weights were read at half-size and the forward
 // pass computed garbage. Fix: read per-layer feature count from the
@@ -4053,7 +4053,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
         );
     }
 
-    // ── VectorIndex::num_features(layer) — the accessor predict_q4k calls ──
+    // ── VectorIndex::num_features(layer) — the accessor predict_kquant calls ──
     let mut lcb = larql_vindex::SilentLoadCallbacks;
     let index = larql_vindex::VectorIndex::load_vindex(&output_dir, &mut lcb).unwrap();
     for (layer, &inter) in intermediates.iter().enumerate().take(num_layers) {
@@ -4065,7 +4065,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
     }
 
     // ── FFN manifest shape — the raw Q4K bytes must match the per-layer
-    //     intermediate, NOT the model-wide max. Earlier predict_q4k bug:
+    //     intermediate, NOT the model-wide max. Earlier predict_kquant bug:
     //     dequantising with the wrong width silently produced half-width
     //     weights on wide layers, so this assertion is the invariant. ──
     let ff_manifest_json =

@@ -523,7 +523,7 @@ fn run_predict_q4k(
     // and is wired to `--metal`; that path is KV-cached and much faster.
     if args.max_tokens > 1 && !args.metal {
         // CPU Q4K autoregressive: per-step, dequantise layer weights
-        // just-in-time (`predict_q4k` does this internally) and loop.
+        // just-in-time (`predict_kquant` does this internally) and loop.
         // Not token-cached, so O(N²) but correct. For speed use --metal.
         return run_q4k_generate_cpu(weights, tokenizer, &token_ids, args, &q4_index);
     }
@@ -587,7 +587,7 @@ fn run_predict_q4k(
         )
     } else {
         vlog!(verbose, "Backend: CPU (Accelerate + dequantise-per-layer)");
-        larql_inference::vindex::predict_q4k(
+        larql_inference::vindex::predict_kquant(
             weights,
             tokenizer,
             &token_ids,
@@ -680,7 +680,7 @@ fn run_predict_q4k_remote(
 }
 
 /// CPU Q4K autoregressive generation. Per-step: dequantise the layer's
-/// Q/K/V/O + gate/up/down weights (via `predict_q4k` internals), run
+/// Q/K/V/O + gate/up/down weights (via `predict_kquant` internals), run
 /// the forward pass, take argmax, append, repeat. Streams tokens.
 fn run_q4k_generate_cpu(
     weights: &mut ModelWeights,
@@ -696,7 +696,7 @@ fn run_q4k_generate_cpu(
     let start = Instant::now();
 
     for _step in 0..args.max_tokens {
-        let result = larql_inference::vindex::predict_q4k(weights, tokenizer, &ids, 1, q4_index);
+        let result = larql_inference::vindex::predict_kquant(weights, tokenizer, &ids, 1, q4_index);
         let next_id = match result.token_ids.first() {
             Some(&id) => id,
             None => break,

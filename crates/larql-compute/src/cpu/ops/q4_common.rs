@@ -1605,7 +1605,7 @@ mod tests {
     fn q4_k_round_trip_matches_larql_models_decoder() {
         // Cross-check against the authoritative decoder in larql-models.
         // Guards against silent drift between the quantizer here and the
-        // dequantizer every caller actually uses (q4k_forward.rs, vindex
+        // dequantizer every caller actually uses (kquant_forward.rs, vindex
         // weight load, etc.). 3 super-blocks, a mix of positive/negative.
         let data: Vec<f32> = (0..256 * 3)
             .map(|i| ((i as f32 - 383.0) / 127.0).sin())
