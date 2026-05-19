@@ -31,6 +31,34 @@ async fn post_completions(body: serde_json::Value) -> axum::http::Response<Body>
     resp
 }
 
+/// DIAGNOSTIC (temp 2026-05-20): consume the response body and dump
+/// status + body to stderr. Used to investigate the Ubuntu CI vs macOS
+/// completions.rs coverage divergence (CI 70.34% vs local 86.85% with
+/// identical test outcomes — the success-path lines aren't being hit
+/// on CI for reasons we can't see from `assert!(OK || is_server_error)`).
+/// Revert once the divergence is identified.
+async fn diag_capture(
+    label: &str,
+    resp: axum::http::Response<Body>,
+) -> (StatusCode, String) {
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+    eprintln!(
+        "[DIAG completions/{label}] status={} body_len={} body={}",
+        status,
+        body_str.len(),
+        if body_str.len() > 800 {
+            format!("{}…[truncated]", &body_str[..800])
+        } else {
+            body_str.clone()
+        },
+    );
+    (status, body_str)
+}
+
 #[tokio::test]
 async fn completions_non_streaming_single_prompt_returns_200() {
     let resp = post_completions(serde_json::json!({
@@ -39,9 +67,16 @@ async fn completions_non_streaming_single_prompt_returns_200() {
         "max_tokens": 4,
     }))
     .await;
-    // Either 200 (generation succeeded) or 500 (synthetic weights
-    // produced NaN) — both exercise the non-streaming compose path.
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20): strict 200 + body dump. CI Ubuntu shows
+    // completions.rs at 70.34% line coverage vs 86.85% on macOS / Linux
+    // Docker (Rosetta) with identical test outcomes — make this assert
+    // strict so a failure surfaces the actual response body in CI logs.
+    let (status, body) = diag_capture("non_streaming_single_prompt", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from non-streaming completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -97,7 +132,13 @@ async fn completions_echo_in_non_stream_runs_echo_branch() {
         "echo": true,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20): see completions_non_streaming_single_prompt.
+    let (status, body) = diag_capture("echo_non_stream", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from echo non-stream completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -108,7 +149,13 @@ async fn completions_batched_non_stream_runs_loop_branch() {
         "max_tokens": 2,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20).
+    let (status, body) = diag_capture("batched_non_stream", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from batched non-stream completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -180,7 +227,13 @@ async fn completions_with_sampling_params_runs_sampler_branches() {
         "presence_penalty": 0.1,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20).
+    let (status, body) = diag_capture("with_sampling_params", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from sampling-params completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -196,7 +249,13 @@ async fn completions_with_stop_strings_runs_stop_check_branch() {
         "stop": ["x", " "],
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20).
+    let (status, body) = diag_capture("with_stop_strings", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from stop-strings completions; got {status}, body={body}"
+    );
 }
 
 #[tokio::test]
@@ -208,5 +267,11 @@ async fn completions_with_logprobs_runs_logprobs_branch() {
         "logprobs": 3,
     }))
     .await;
-    assert!(resp.status() == StatusCode::OK || resp.status().is_server_error());
+    // DIAGNOSTIC (2026-05-20).
+    let (status, body) = diag_capture("with_logprobs", resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected 200 OK from logprobs completions; got {status}, body={body}"
+    );
 }
