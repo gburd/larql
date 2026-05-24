@@ -1,6 +1,19 @@
 # Roadmap — larql-inference
 
-## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 904 lib tests | 65.67% line cov (64 of 127 files at ≥90% line cov)
+## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 1113 lib tests
+
+### Multi-modal engine seam (landed 2026-05-24, ADR-0023)
+
+`KvEngine` gains `supports_multimodal()` + `prefill_from_hidden()`.
+`AnyEngine` enum forwards both. Dispatch helpers in
+`kv_dispatch/helpers.rs` hoist the embed step out of
+`kv_prefill_via_dispatch` (sync + async) into a new
+`kv_prefill_from_hidden_via_dispatch` peer — both paths use the same
+layer-forward loop. `StandardEngine` is the only MM-capable engine
+today; other engines inherit default-false. The embed-step shim in
+`forward/embed.rs` routes through `embed_plan` (the multi-modal-aware
+entry point from Phase 0), preserving bit-identity on text-only
+inputs via a fast path.
 
 ## Recommended next (priority order, 2026-05-10)
 

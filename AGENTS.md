@@ -15,17 +15,23 @@ Cargo workspace at repo root with a strict dependency chain — respect this whe
 ```
 # LARQL-specific (depend on vindex, LQL, etc.)
 larql-models      model config, architecture traits, weight loading, quant/dequant,
-                  shared test_fixtures (behind `test-utils` feature)
+                  multi-modal trait surface (ModalEncoder, Connector,
+                  MultiModalProtocol, EmbeddingPlan types), vision tower
+                  config+weights+loader (encoders/vision_tower.rs), projector
+                  weights+loader (connectors/projector.rs), shared
+                  test_fixtures (behind `test-utils` feature)
     ↓
 larql-compute     CPU substrate: BLAS kernels, residual norms, attention spine
                   (rope/gqa/block/decode/gpu), forward-pass primitives (embed,
-                  ops, hooks, ple, layer, predict/raw), kquant_forward Q4_K/Q6_K
-                  decode helpers, FfnBackend trait + dense WeightFfn impl,
-                  KvDispatch + AsyncComputeBackend traits + CpuBackend impls,
-                  KvIndex trait (abstracts VectorIndex for substrate callers),
-                  forward_overrides env-var registry, PerLayerDecodeState.
-                  ADR-0022 moved all of this down from larql-inference; the
-                  substrate is now self-contained.
+                  embed_plan, EmbeddingPlan, ops, hooks, ple, layer, predict/raw),
+                  kquant_forward Q4_K/Q6_K decode helpers, FfnBackend trait +
+                  dense WeightFfn impl, KvDispatch + AsyncComputeBackend traits +
+                  CpuBackend impls, KvIndex trait (abstracts VectorIndex for
+                  substrate callers), forward_overrides env-var registry,
+                  PerLayerDecodeState, vision encoder CPU forward
+                  (encoders/vision_tower.rs), projector CPU forward
+                  (connectors/projector.rs). ADR-0022 moved substrate down from
+                  larql-inference; the substrate is now self-contained.
     ↓
 larql-compute-metal  Metal GPU backend (first-class peer, NOT a thin layer).
                      Implements ComputeBackend / KvDispatch / AsyncComputeBackend
@@ -38,17 +44,21 @@ larql-vindex      vindex lifecycle: extract, load, query, mutate, patch, save,
 larql-core        graph algorithms (merge, diff, BFS, pagerank, shortest-path)
 larql-inference   engines (Standard, MarkovResidual, Apollo, etc.), chat,
                   sessions, tokenizer, FFN routing impls (Graph/Remote/MoE),
-                  layer_executor, layer_graph orchestration. Substrate moves
-                  to larql-compute; this crate is the inference-shaped layer
-                  that composes substrate primitives + engine state. Re-export
-                  shims preserve `crate::{residual, forward, attention,
-                  kv_dispatch, async_compute_backend, kquant_forward,
-                  forward_overrides}::*` paths for back-compat.
+                  layer_executor, layer_graph orchestration. KvEngine trait
+                  (with supports_multimodal + prefill_from_hidden per
+                  ADR-0023), AnyEngine dispatch enum (KvEngine | RetrievalEngine).
+                  Substrate moves to larql-compute; this crate is the
+                  inference-shaped layer that composes substrate primitives +
+                  engine state.
     ↓
 larql-lql         lexer/parser/executor/REPL + USE REMOTE client
     ↓
 larql-server      HTTP + gRPC server serving vindexes
-larql-cli         top-level `larql` binary (every subcommand lives in commands/)
+larql-cli         top-level `larql` binary (every subcommand lives in commands/).
+                  Multi-modal: `--image` + `--mm-weights` flags on `larql run`,
+                  image decode/resize (image_input.rs), plan assembly
+                  (run_cmd_image.rs). 3-image regression test in
+                  tests/multimodal_e2e.rs (#[ignore], NOT FOR CI).
 larql-python      PyO3 bindings (maturin-built, module name `larql._native`)
 
 # Portable (no LARQL deps; extract to sibling repo later, name stable)

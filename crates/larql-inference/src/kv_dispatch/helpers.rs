@@ -47,9 +47,35 @@ pub fn kv_prefill_via_dispatch(
     if prompt_ids.is_empty() {
         return None;
     }
+    let h = embed_tokens_pub(weights, prompt_ids);
+    kv_prefill_from_hidden_via_dispatch(backend, weights, ffn, &h, window, index)
+}
+
+/// Multi-modal-aware peer of [`kv_prefill_via_dispatch`]. Takes
+/// pre-built initial hidden state (e.g. from
+/// `larql_compute::forward::embed_plan` on an `EmbeddingPlan` that mixes
+/// `Tokens` and `Precomputed` chunks) and drives the rest of prefill
+/// unchanged.
+///
+/// The text-only call `kv_prefill_via_dispatch(prompt_ids)` and
+/// `kv_prefill_from_hidden_via_dispatch(embed_tokens_pub(prompt_ids))`
+/// produce bit-identical output by construction — the former is a
+/// two-line wrapper around the latter. Pinned by tests at the bottom
+/// of this module.
+pub fn kv_prefill_from_hidden_via_dispatch(
+    backend: &dyn EngineBackend,
+    weights: &ModelWeights,
+    ffn: &dyn FfnBackend,
+    initial_hidden: &Array2<f32>,
+    window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
+) -> Option<(Array2<f32>, Vec<KvHandle>)> {
+    if initial_hidden.nrows() == 0 {
+        return None;
+    }
     let num_layers = weights.num_layers;
     let mut handles: Vec<KvHandle> = Vec::with_capacity(num_layers);
-    let mut h = embed_tokens_pub(weights, prompt_ids);
+    let mut h = initial_hidden.clone();
 
     for layer in 0..num_layers {
         let (h_post_attn, mut handle) = backend.attention_prefill(
@@ -149,9 +175,32 @@ pub fn kv_prefill_via_dispatch_async(
     if prompt_ids.is_empty() {
         return None;
     }
+    let h = embed_tokens_pub(weights, prompt_ids);
+    kv_prefill_from_hidden_via_dispatch_async(backend, weights, ffn, &h, window, index)
+}
+
+/// Async multi-modal-aware peer of [`kv_prefill_via_dispatch_async`].
+/// Same shape as [`kv_prefill_from_hidden_via_dispatch`] but routes
+/// per-layer attention through `AsyncComputeBackend` and reads each
+/// hidden via `read_hidden` before FFN. Flushes once at the end.
+///
+/// Bit-identity contract: same as the sync peer. Pinned by the parity
+/// test at the bottom of this module — sync vs async must agree on
+/// CPU paths, MM vs text must agree when text is the input.
+pub fn kv_prefill_from_hidden_via_dispatch_async(
+    backend: &dyn AsyncComputeBackend,
+    weights: &ModelWeights,
+    ffn: &dyn FfnBackend,
+    initial_hidden: &Array2<f32>,
+    window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
+) -> Option<(Array2<f32>, Vec<KvHandle>)> {
+    if initial_hidden.nrows() == 0 {
+        return None;
+    }
     let num_layers = weights.num_layers;
     let mut handles: Vec<KvHandle> = Vec::with_capacity(num_layers);
-    let mut h = embed_tokens_pub(weights, prompt_ids);
+    let mut h = initial_hidden.clone();
 
     for layer in 0..num_layers {
         let (h_post_attn_handle, mut handle) = backend.attention_prefill_async(
@@ -420,5 +469,106 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let result = kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &[], None, None);
         assert!(result.is_none());
+    }
+
+    // ─── Phase 1d.3a: embed-hoist bit-identity (sync + async) ───────────────
+    //
+    // These pin the refactor that landed `kv_prefill_from_hidden_via_dispatch`
+    // as the new MM-aware entry point. The old `kv_prefill_via_dispatch` is
+    // now a two-line wrapper that runs `embed_tokens_pub` then delegates.
+    // Bit-identity of the wrapper-vs-direct path is the contract that makes
+    // the engine seam (per ADR-0023) safe to land — and we have to verify
+    // sync and async separately because they diverge on real (non-CPU)
+    // backends, and on CPU the async path additionally calls flush() (a
+    // no-op on CpuBackend but a real ordering primitive elsewhere).
+
+    #[test]
+    fn prefill_via_dispatch_bit_identical_to_from_hidden_sync() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = WeightFfn { weights: &weights };
+        let tokens = vec![0u32, 1, 2, 3];
+
+        let (h_text, handles_text) =
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &tokens, None, None).unwrap();
+
+        let initial_hidden = embed_tokens_pub(&weights, &tokens);
+        let (h_hidden, handles_hidden) = kv_prefill_from_hidden_via_dispatch(
+            &backend,
+            &weights,
+            &ffn,
+            &initial_hidden,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            h_text, h_hidden,
+            "text and from-hidden paths must produce bit-identical last-row hidden"
+        );
+        assert_eq!(
+            handles_text.len(),
+            handles_hidden.len(),
+            "handle count (= num_layers) must match across paths"
+        );
+    }
+
+    #[test]
+    fn prefill_via_dispatch_bit_identical_to_from_hidden_async() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = WeightFfn { weights: &weights };
+        let tokens = vec![0u32, 1, 2, 3];
+
+        let (h_text, handles_text) =
+            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &tokens, None, None).unwrap();
+
+        let initial_hidden = embed_tokens_pub(&weights, &tokens);
+        let (h_hidden, handles_hidden) = kv_prefill_from_hidden_via_dispatch_async(
+            &backend,
+            &weights,
+            &ffn,
+            &initial_hidden,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            h_text, h_hidden,
+            "async text and from-hidden paths must produce bit-identical last-row hidden"
+        );
+        assert_eq!(handles_text.len(), handles_hidden.len());
+    }
+
+    #[test]
+    fn prefill_from_hidden_returns_none_on_empty_input() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = WeightFfn { weights: &weights };
+        let empty_hidden = Array2::<f32>::zeros((0, weights.hidden_size));
+        let result = kv_prefill_from_hidden_via_dispatch(
+            &backend,
+            &weights,
+            &ffn,
+            &empty_hidden,
+            None,
+            None,
+        );
+        assert!(result.is_none(), "zero-row hidden should yield None");
+
+        let result_async = kv_prefill_from_hidden_via_dispatch_async(
+            &backend,
+            &weights,
+            &ffn,
+            &empty_hidden,
+            None,
+            None,
+        );
+        assert!(
+            result_async.is_none(),
+            "async zero-row hidden should yield None"
+        );
     }
 }

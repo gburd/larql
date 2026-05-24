@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod formatting;
+mod image_input;
 mod utils;
 
 use commands::dev::*;
@@ -317,6 +318,11 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             moe_predispatch_iters: 1,
             ffn_dispatch: "streaming".to_string(),
             ffn_predispatch_iters: 1,
+            // Chat doesn't accept images today; default to empty for the
+            // shim. When chat-with-images becomes a thing (Phase 2+), the
+            // ChatArgs struct will grow its own --image flag.
+            image: Vec::new(),
+            mm_weights: None,
         }
     }
 }

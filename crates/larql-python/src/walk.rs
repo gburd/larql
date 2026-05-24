@@ -16,11 +16,10 @@ use larql_inference::forward::{
     capture_donor_state_with_ffn, embedding_neighbors as li_embedding_neighbors,
     embedding_row as li_embedding_row, embedding_row_scaled as li_embedding_row_scaled,
     logit_lens_topk, patch_and_trace_with_ffn,
-    project_through_unembed as li_project_through_unembed, trace_forward_full_hooked,
-    track_race as li_track_race, track_token as li_track_token,
-    trace_forward_attn_only_capture_pre_o, trace_forward_attn_only_with_head_zero,
-    unembedding_row as li_unembedding_row, AttnZeroHook, FFNZeroHook, RecordHook, SteerHook,
-    ZeroAblateHook,
+    project_through_unembed as li_project_through_unembed, trace_forward_attn_only_capture_pre_o,
+    trace_forward_attn_only_with_head_zero, trace_forward_full_hooked, track_race as li_track_race,
+    track_token as li_track_token, unembedding_row as li_unembedding_row, AttnZeroHook,
+    FFNZeroHook, RecordHook, SteerHook, ZeroAblateHook,
 };
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
 use larql_kv::generation::generate_cached_hooked;
@@ -735,8 +734,12 @@ impl PyWalkModel {
     ) -> PyResult<Bound<'py, PyDict>> {
         let token_ids = self.encode(prompt)?;
         let head_zero_map: HashMap<usize, Vec<usize>> = head_zeros.into_iter().collect();
-        let captures =
-            trace_forward_attn_only_with_head_zero(&self.weights, &token_ids, &layers, &head_zero_map);
+        let captures = trace_forward_attn_only_with_head_zero(
+            &self.weights,
+            &token_ids,
+            &layers,
+            &head_zero_map,
+        );
         let out = PyDict::new(py);
         for (layer, mat) in captures.iter() {
             out.set_item(*layer, mat.clone().into_pyarray(py))?;

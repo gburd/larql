@@ -692,7 +692,9 @@ pub(crate) fn normalize_key(key: &str, prefixes: &[&str]) -> String {
     key.to_string()
 }
 
-fn tensor_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>, ModelError> {
+pub(crate) fn tensor_to_f32(
+    view: &safetensors::tensor::TensorView<'_>,
+) -> Result<Vec<f32>, ModelError> {
     use crate::quant::half;
     match view.dtype() {
         safetensors::Dtype::F32 => {

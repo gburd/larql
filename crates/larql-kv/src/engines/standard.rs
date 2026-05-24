@@ -18,8 +18,9 @@ use crate::{EngineInfo, KvEngine};
 use larql_inference::async_compute_backend::AsyncComputeBackend;
 use larql_inference::ffn::FfnBackend;
 use larql_inference::kv_dispatch::helpers::{
-    kv_decode_step_via_dispatch, kv_decode_step_via_dispatch_async, kv_prefill_via_dispatch,
-    kv_prefill_via_dispatch_async,
+    kv_decode_step_via_dispatch, kv_decode_step_via_dispatch_async,
+    kv_prefill_from_hidden_via_dispatch, kv_prefill_from_hidden_via_dispatch_async,
+    kv_prefill_via_dispatch, kv_prefill_via_dispatch_async,
 };
 use larql_inference::kv_engine::EngineError;
 use larql_inference::model::ModelWeights;
@@ -146,6 +147,47 @@ impl StandardEngine {
         Ok(hidden)
     }
 
+    /// Multi-modal prefill: accept pre-built initial hidden state from
+    /// the host (built via `embed_plan` on an `EmbeddingPlan` that may
+    /// contain `Precomputed` vision/audio chunks). Same body as
+    /// `do_prefill` minus the embed call; `abs_position` advances by
+    /// `initial_hidden.nrows()` instead of by token count. See
+    /// ADR-0023 for the seam decision.
+    fn do_prefill_from_hidden(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        initial_hidden: &Array2<f32>,
+    ) -> Option<Array2<f32>> {
+        let (hidden, handles) = match &self.backend {
+            BackendSlot::Sync(b) => kv_prefill_from_hidden_via_dispatch(
+                b.as_ref(),
+                weights,
+                ffn,
+                initial_hidden,
+                self.window_size,
+                None,
+            )?,
+            BackendSlot::Async(b) => kv_prefill_from_hidden_via_dispatch_async(
+                b.as_ref(),
+                weights,
+                ffn,
+                initial_hidden,
+                self.window_size,
+                None,
+            )?,
+        };
+        self.handles = Some(handles);
+        // Critical: position pointer must be derived from the hidden
+        // row count, NOT from any token count — the input may contain
+        // vision rows that aren't tokens. Decode-loop correctness
+        // depends on this; off-by-one here garbles the entire
+        // continuation. Pinned by the StandardEngine entry-point
+        // agreement test in this file's tests module.
+        self.abs_position = initial_hidden.nrows();
+        Some(hidden)
+    }
+
     /// Shared decode-step body — both `decode_step` (index=None) and
     /// `decode_step_quant` (index=Some) route through here.
     fn do_decode_step(
@@ -226,6 +268,31 @@ impl KvEngine for StandardEngine {
             return Err(EngineError::EmptyPrompt);
         }
         self.do_prefill(weights, ffn, token_ids, None)
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        // StandardEngine is the first (Phase 1d) engine to implement
+        // `prefill_from_hidden`. Six other engines inherit the default
+        // `false` per ADR-0023 §"Default-false debt". When each of them
+        // gains real MM support (or the eventual `prefill →
+        // embed_tokens_pub + prefill_from_hidden` collapse lands across
+        // the board), the override here becomes redundant and the
+        // trait method itself can be removed.
+        true
+    }
+
+    fn prefill_from_hidden(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        initial_hidden: &Array2<f32>,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.do_prefill_from_hidden(weights, ffn, initial_hidden)
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "do_prefill_from_hidden returned None (empty hidden input or \
+                          backend dispatch failure)"
+                    .into(),
+            })
     }
 
     fn decode_step(
@@ -378,6 +445,102 @@ mod tests {
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > 0, "cache should be populated");
         assert!(engine.window_tokens() >= 3);
+    }
+
+    // ─── Phase 1d.3a: StandardEngine entry-point agreement ───────────────
+    //
+    // Verifies that `prefill(tokens)` and
+    // `prefill_from_hidden(embed_tokens_pub(tokens))` agree on BOTH:
+    //   (a) the returned hidden state (catches dispatch-level drift),
+    //   (b) the post-prefill `abs_position` (catches the off-by-one
+    //       that would silently garble decode-loop continuation).
+    //
+    // The `abs_position` check is the load-bearing one — the new line
+    // in `do_prefill_from_hidden` (`self.abs_position = initial_hidden.nrows()`)
+    // is the only genuinely new logic in this PR. If it's wrong, the
+    // first decoded token after MM prefill gets the wrong RoPE position
+    // and the entire continuation is garbled, but the prefill itself
+    // looks fine. This test pins that one line.
+
+    #[test]
+    fn standard_supports_multimodal() {
+        let engine = StandardEngine::new(None);
+        assert!(
+            engine.supports_multimodal(),
+            "StandardEngine is the Phase 1d MM-capable engine"
+        );
+    }
+
+    #[test]
+    fn prefill_and_prefill_from_hidden_agree_on_hidden_and_abs_position() {
+        use larql_inference::forward::embed_tokens_pub;
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let tokens = [0u32, 1, 2, 3];
+
+        let mut engine_text = StandardEngine::new(None);
+        let h_text = engine_text
+            .prefill(&weights, &ffn, &tokens)
+            .expect("prefill text");
+        let abs_text = engine_text.abs_position;
+
+        let mut engine_hidden = StandardEngine::new(None);
+        let initial_hidden = embed_tokens_pub(&weights, &tokens);
+        let h_hidden = engine_hidden
+            .prefill_from_hidden(&weights, &ffn, &initial_hidden)
+            .expect("prefill_from_hidden");
+        let abs_hidden = engine_hidden.abs_position;
+
+        // (a) hidden state must match bit-identically — same dispatch
+        // path, just with the embed hoisted out of the engine.
+        assert_eq!(
+            h_text, h_hidden,
+            "prefill(tokens) and prefill_from_hidden(embed_tokens_pub(tokens)) \
+             must produce identical hidden state"
+        );
+        // (b) `abs_position` must be set from the hidden's row count.
+        // For a text-only input where hidden.nrows() == tokens.len(),
+        // both paths land on the same value. Phase 1d MM (where vision
+        // rows expand the hidden) WILL diverge from token count —
+        // that's the whole point of deriving it from `initial_hidden.nrows()`.
+        assert_eq!(
+            abs_text, abs_hidden,
+            "abs_position must agree between text and from-hidden paths \
+             (text=tokens.len(), hidden=nrows; for text-only input they coincide)"
+        );
+        assert_eq!(
+            abs_hidden,
+            tokens.len(),
+            "abs_position after from-hidden prefill must equal input row count"
+        );
+    }
+
+    #[test]
+    fn prefill_from_hidden_abs_position_derives_from_nrows_not_tokens() {
+        // Specifically pin the contract that `abs_position` is set from
+        // the hidden's row count. For MM, the host's hidden will have
+        // more rows than the text token count (image marker + 256 vision
+        // rows + text). Synthesize that shape and verify the engine
+        // records the full row count.
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+
+        // 7 rows that are NOT pure tokens — emulate "text + 3 vision +
+        // text". Just any Array2 with finite values that the layer
+        // graph can run through.
+        let mm_rows = 7usize;
+        let mut hidden = Array2::<f32>::zeros((mm_rows, weights.hidden_size));
+        for r in 0..mm_rows {
+            for c in 0..weights.hidden_size {
+                hidden[[r, c]] = ((r * 13 + c * 7) % 17) as f32 * 0.01 - 0.08;
+            }
+        }
+        let mut engine = StandardEngine::new(None);
+        let _ = engine.prefill_from_hidden(&weights, &ffn, &hidden);
+        assert_eq!(
+            engine.abs_position, mm_rows,
+            "abs_position must = initial_hidden.nrows(), not any token count"
+        );
     }
 
     #[test]

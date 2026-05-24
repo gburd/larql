@@ -35,6 +35,8 @@ Every invention in the codebase serves this aim:
 | Shannon arc (1 bit/char on Frankenstein) | Theoretical compression ceiling — how far this can go |
 | Mech-interp surface (M1–M8) | Discover *which* weights actually do the work; rest stays on disk |
 | Cross-arch coverage | The technique stack must generalise |
+| Multi-modal (vision / audio) | Accept images + audio alongside text; same sparse-retrieval story applies to the LM portion of multimodal models |
+| KV engine trait split (KvEngine / RetrievalEngine / AnyEngine) | Uniform dispatch across production KV-cache engines + retrieval-only engines (Apollo) via typed enum |
 
 Combined effect (rough math, conservative): hash routing 5× × FP4 2× × KV
 compression 10× = **100× effective bandwidth reduction** on the right

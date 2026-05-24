@@ -9,7 +9,12 @@ Primary verbs: `run`, `chat`, `pull`, `model`, `link`, `list`, `show`, `slice`,
 `compile`, `convert`, `verify`, `hf`, plus diagnostic verbs `diag` and `parity`.
 Legacy research commands gated under `larql dev <subcmd>` for backwards-compat.
 Dual cache (HuggingFace hub + `~/.cache/larql/local/`) with shorthand resolution
-(`larql run gemma3-4b-it-vindex`).
+(`larql run gemma3-4b-it-vindex`). Multi-modal: `--image` + `--mm-weights`
+flags on `larql run` for prefix-only vision captioning (Phase 1, Gemma 3 +
+SigLIP). Image decode/resize in `image_input.rs`, plan assembly in
+`run_cmd_image.rs`. Engine capability check (`supports_multimodal()`) fires
+before the encoder runs. Q4K vindex dispatch supported. 3-image regression
+test in `tests/multimodal_e2e.rs` (`#[ignore]`, NOT FOR CI).
 
 The `shannon` family was extended in 2026-05-16 with **`larql shannon
 verify`** — a cross-engine bits/char correctness check that orchestrates

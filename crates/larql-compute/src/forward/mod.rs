@@ -10,6 +10,7 @@
 
 pub mod dump_config;
 pub mod embed;
+pub mod embedding_plan;
 pub mod hooks;
 pub mod layer;
 pub mod lens;
@@ -18,7 +19,8 @@ pub mod ple;
 pub mod predict;
 pub mod vocab_proj;
 
-pub use embed::embed_tokens_pub;
+pub use embed::{embed_plan, embed_tokens_pub};
+pub use embedding_plan::{EmbeddingChunk, EmbeddingPlan, MropeAxes, PositionScheme};
 pub use hooks::{
     AttnZeroHook, CompositeHook, FFNZeroHook, LayerHook, NoopHook, RecordHook, SteerHook,
     ZeroAblateHook,

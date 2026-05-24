@@ -283,6 +283,95 @@ where
     generated
 }
 
+/// Multi-modal-capable peer of [`generate_with_engine`]. Same shape;
+/// the only difference is the prefill input: pre-built initial hidden
+/// state (e.g. from `larql_compute::forward::embed_plan` on an
+/// `EmbeddingPlan` mixing `Tokens` and `Precomputed` chunks) instead of
+/// a token-id slice.
+///
+/// **Contract: caller MUST verify `engine.supports_multimodal()` returns
+/// true BEFORE calling this function** (see ADR-0023). The default
+/// `prefill_from_hidden` impl panics on engines that don't support
+/// MM; the capability check is the contract and the panic is
+/// defense-in-depth. For text-only inputs on any engine, use
+/// `generate_with_engine` instead.
+///
+/// `max_new_tokens` accounting is independent of `initial_hidden.nrows()`
+/// — the budget counts only newly *decoded* tokens, never prefill rows
+/// (which may include vision/audio embeddings that aren't tokens at all).
+/// Pinned by the `max_tokens_independent_of_hidden_rows` test below.
+///
+/// Bit-identity contract: feeding the single-Tokens-chunk plan
+/// `EmbeddingPlan::from_tokens(prompt_ids)` through `embed_plan` then
+/// this function produces the same token stream as
+/// `generate_with_engine(engine, ..., prompt_ids, max_new_tokens, on_token)`
+/// — same sampling, same EOS, same callback shape. Pinned by the
+/// `wrapper_text_only_plan_matches_generate_with_engine` test below.
+pub fn generate_with_engine_from_hidden<F>(
+    engine: &mut crate::AnyEngine,
+    weights: &ModelWeights,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+    ffn: &dyn FfnBackend,
+    initial_hidden: &Array2<f32>,
+    max_new_tokens: usize,
+    mut on_token: F,
+) -> Vec<u32>
+where
+    F: FnMut(u32, &str),
+{
+    if max_new_tokens == 0 || initial_hidden.nrows() == 0 {
+        return Vec::new();
+    }
+
+    // ── Phase 1: prefill from pre-built hidden state ──
+    // Panics if engine doesn't support MM; capability check is upstream
+    // per ADR-0023. An Err return (e.g. BackendFailure on dispatch) is
+    // mapped to an empty stream, matching `generate_with_engine`'s
+    // post-refactor behaviour.
+    let last_hidden = match engine.prefill_from_hidden(weights, ffn, initial_hidden) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+
+    // ── Sample first new token (identical to generate_with_engine) ──
+    let first = match argmax_next_token(weights, tokenizer, &last_hidden) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    on_token(first.0, &first.1);
+
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    generated.push(first.0);
+    if is_stop_token_str(&first.1) {
+        return generated;
+    }
+    if max_new_tokens == 1 {
+        return generated;
+    }
+
+    // ── Phase 2: decode loop (verbatim from generate_with_engine; ADR-0023
+    // scoped-out: decode-loop embedding stays text-token-based) ──
+    let mut current_id = first.0;
+    for _step in 1..max_new_tokens {
+        let h_step = match engine.decode_step(weights, ffn, current_id) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let (id, tok_str) = match argmax_next_token(weights, tokenizer, &h_step) {
+            Some(t) => t,
+            None => break,
+        };
+        on_token(id, &tok_str);
+        generated.push(id);
+        if is_stop_token_str(&tok_str) {
+            break;
+        }
+        current_id = id;
+    }
+
+    generated
+}
+
 /// Prefill phase as a reusable building block: runs a full forward over
 /// `prompt_ids`, populates a fresh [`KvCache`] (bounded if `window` is
 /// `Some`), and returns `(last_hidden_1xD, populated_cache)`.
@@ -1050,5 +1139,133 @@ mod tests {
             );
         }
         assert_eq!(cache.next_position, prompt.len() + 3);
+    }
+
+    // ─── Phase 1d.3b: generate_with_engine_from_hidden contracts ─────────
+    //
+    // Two pins:
+    //   1. Bit-identity: a single-Tokens-chunk plan run through
+    //      embed_plan → generate_with_engine_from_hidden produces the
+    //      same token stream as generate_with_engine(tokens). This is
+    //      the analog of the dispatch-level bit-identity test, applied
+    //      one layer up. If they diverge, something in the wrapper
+    //      silently dropped a flag/callback/state vs the original.
+    //   2. max_tokens accounting independent of initial_hidden.nrows().
+    //      The contract is "max_new_tokens counts decoded tokens only,
+    //      never prefill rows" — this catches the off-by-one risk that
+    //      would manifest as captions being one token short, or vision
+    //      tokens being counted against the user's --max-tokens budget.
+
+    #[test]
+    fn wrapper_text_only_plan_matches_generate_with_engine() {
+        use crate::engines::standard::StandardEngine;
+        use crate::AnyEngine;
+        use larql_compute::forward::{embed_plan, EmbeddingPlan};
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let tokens = [0u32, 1, 2, 3];
+        let max_new = 4usize;
+
+        // Path A: text path. Post kv-engine-retrieval-trait-split,
+        // engines are wrapped in AnyEngine for uniform dispatch.
+        let mut engine_a = AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let mut emitted_a: Vec<(u32, String)> = Vec::new();
+        let ids_a = generate_with_engine(
+            &mut engine_a,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &tokens,
+            max_new,
+            |id, s| emitted_a.push((id, s.to_string())),
+        );
+
+        // Path B: single-Tokens-chunk plan → embed_plan → wrapper.
+        let mut engine_b = AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let plan = EmbeddingPlan::from_tokens(&tokens);
+        let initial_hidden = embed_plan(&weights, &plan);
+        let mut emitted_b: Vec<(u32, String)> = Vec::new();
+        let ids_b = generate_with_engine_from_hidden(
+            &mut engine_b,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &initial_hidden,
+            max_new,
+            |id, s| emitted_b.push((id, s.to_string())),
+        );
+
+        assert_eq!(
+            ids_a, ids_b,
+            "text path and from-hidden wrapper must produce identical token streams \
+             on a single-Tokens-chunk plan"
+        );
+        assert_eq!(
+            emitted_a, emitted_b,
+            "streaming callback must fire identically across paths \
+             (same id + same decoded text per token)"
+        );
+    }
+
+    #[test]
+    fn wrapper_max_tokens_independent_of_hidden_rows() {
+        // Build a hidden state with MORE rows than max_new_tokens to
+        // confirm the budget isn't accidentally tangled with prefill
+        // length. If it were, generation would terminate early (or not
+        // at all) depending on the off-by-one's direction.
+        use crate::engines::standard::StandardEngine;
+        use larql_compute::forward::{embed_plan, EmbeddingPlan};
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+
+        let prefill_rows = 7usize;
+        let max_new = 3usize;
+        let tokens: Vec<u32> = (0u32..prefill_rows as u32).collect();
+        let plan = EmbeddingPlan::from_tokens(&tokens);
+        let initial_hidden = embed_plan(&weights, &plan);
+        assert_eq!(initial_hidden.nrows(), prefill_rows);
+
+        let mut engine = crate::AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let ids = generate_with_engine_from_hidden(
+            &mut engine,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &initial_hidden,
+            max_new,
+            |_, _| {},
+        );
+
+        // Wrapper may terminate early on EOS (stop-token in the
+        // synthetic stream), but must NEVER exceed max_new even though
+        // initial_hidden has more rows than max_new.
+        assert!(
+            ids.len() <= max_new,
+            "wrapper decoded {} tokens but max_new_tokens={max_new}; \
+             prefill rows ({prefill_rows}) leaked into the token budget",
+            ids.len(),
+        );
+    }
+
+    #[test]
+    fn wrapper_zero_hidden_rows_returns_empty() {
+        use crate::engines::standard::StandardEngine;
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let ffn = WeightFfn { weights: &weights };
+        let empty = Array2::<f32>::zeros((0, weights.hidden_size));
+        let mut engine = crate::AnyEngine::Kv(Box::new(StandardEngine::new(None)));
+        let ids = generate_with_engine_from_hidden(
+            &mut engine,
+            &weights,
+            &tokenizer,
+            &ffn,
+            &empty,
+            5,
+            |_, _| {},
+        );
+        assert!(ids.is_empty(), "zero-row hidden should yield empty stream");
     }
 }

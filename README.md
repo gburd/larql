@@ -42,6 +42,11 @@ larql list
 larql run gemma-3-4b-it-vindex "The capital of France is"
 larql run gemma-3-4b-it-vindex          # drops into chat mode
 
+# Multi-modal — describe an image (Gemma 3 + SigLIP, prefix-only)
+larql run gemma3-4b-v2 --image photo.jpg \
+    --mm-weights ~/.cache/huggingface/hub/models--google--gemma-3-4b-it/snapshots/<hash> \
+    "Describe this image in one sentence."
+
 # Or extract locally — inference-ready at f16 by default
 larql extract google/gemma-3-4b-it -o gemma3-4b.vindex
 larql run gemma3-4b.vindex "Einstein is known for"

@@ -1,6 +1,22 @@
 # Roadmap — larql-models
 
-## Current: 12 architectures, 337 tests (227 src + 82 + 28 integration), safetensors + GGUF loading, config-driven `rope_scaling` / `norm_eps` / GPT-2 legacy aliases
+## Current: 12 architectures, 309 tests, safetensors + GGUF loading, config-driven `rope_scaling` / `norm_eps` / GPT-2 legacy aliases, multi-modal trait surface + vision tower + projector weights/loaders
+
+### Multi-modal (landed 2026-05-24)
+
+- **multimodal.rs**: `ModalEncoder`, `Connector`, `MultiModalProtocol`,
+  `PlaceholderProtocol`, `TokenBudget` (Fixed / PerTile / Dynamic),
+  `PrecomputedScaling`, `Modality`, `ModalInput`. `ModelArchitecture`
+  gains `multimodal()` default None; Gemma3Arch overrides with verified
+  token IDs.
+- **encoders/vision_tower.rs**: `VisionConfig` (generic, parsed from
+  `vision_config` in config.json), `VisionWeights`, `VisionLayerWeights`,
+  `ProjWithBias`, `LayerNormWeights`, `load_vision_tower_from_safetensors`.
+  Arch-agnostic: same struct works for SigLIP, SigLIP2, ViT.
+- **connectors/projector.rs**: `ProjectorWeights`,
+  `load_projector_from_safetensors`. Loads `multi_modal_projector.*`
+  tensors (projection matrix + optional norm weight).
+- Design doc: `docs/multi-modal.md`. ADR: `docs/adr/0023-multimodal-engine-seam.md`.
 
 ## Config-loading correctness pass 2026-05-16
 

@@ -784,6 +784,20 @@ were implementation).
 
 ## Closed (recent)
 
+- **2026-05-24 — Multi-modal engine seam (ADR-0023).** `KvEngine` gains
+  `supports_multimodal()` (default false) + `prefill_from_hidden(weights,
+  ffn, initial_hidden: &Array2<f32>) -> Result<Array2<f32>, EngineError>`.
+  `StandardEngine` is the first (and currently only) MM-capable engine.
+  Other engines inherit the default-false convention — they remain
+  text-only until each individually implements the new method.
+  `AnyEngine` forwards both methods. `generate_with_engine_from_hidden`
+  wrapper shares the decode loop with `generate_with_engine`. Dispatch
+  helpers `kv_prefill_from_hidden_via_dispatch` (sync + async) hoist the
+  embed step out of the prefill loop so both text-only and MM inputs
+  follow the same layer-forward path. The eventual end state: every
+  engine implements `prefill_from_hidden` and `prefill(token_ids)` becomes
+  a thin wrapper. No timeline on the seven-engine migration.
+
 - **2026-05-24 — Sibling trait extraction LANDED.** `KvEngine`
   `Option<T>` returns are gone; the typed `EngineError` enum lives in
   `larql-inference::kv_engine` alongside the new `RetrievalEngine`

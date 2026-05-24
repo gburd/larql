@@ -221,6 +221,22 @@ mod tests {
     }
 
     #[test]
+    fn no_cache_does_not_support_multimodal() {
+        // Default-false debt convention from ADR-0023. NoCacheEngine
+        // inherits `supports_multimodal = false` because it has no
+        // `prefill_from_hidden` impl yet. The CLI's `--image` capability
+        // check must hit this branch and fail with a clear error before
+        // the encoder runs. If NoCache ever grows real MM support, the
+        // override here must accompany the `prefill_from_hidden` impl —
+        // never bump capability without an implementation.
+        let engine = NoCacheEngine::new();
+        assert!(
+            !engine.supports_multimodal(),
+            "NoCacheEngine inherits the default-false convention"
+        );
+    }
+
+    #[test]
     fn decode_step_appends_and_returns_hidden() {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };

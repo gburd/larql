@@ -276,6 +276,53 @@ pub trait KvEngine: Send {
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError>;
 
+    /// Static capability: does this engine accept pre-built hidden
+    /// state via [`prefill_from_hidden`]? Default `false`.
+    ///
+    /// The CLI MUST check this **before** running a (potentially
+    /// minutes-long) modal encoder, so the user gets a fast, clear
+    /// error if they paired `--image` with an engine that doesn't
+    /// support multi-modal input. See ADR-0023.
+    ///
+    /// The default-false return is deliberate debt — six of seven
+    /// engines inherit it for Phase 1d. The end state collapses
+    /// `prefill(token_ids)` into a thin wrapper over
+    /// `embed_tokens_pub` then `prefill_from_hidden` on every engine,
+    /// at which point this method becomes universally `true` and is
+    /// removed. Tracked in ADR-0023 (Default-false debt).
+    fn supports_multimodal(&self) -> bool {
+        false
+    }
+
+    /// Prefill from a pre-built initial hidden state. Caller built it
+    /// via `larql_compute::forward::embed_plan` from an `EmbeddingPlan`
+    /// that may include `Precomputed` rows (vision / audio embeddings).
+    ///
+    /// Same contract as [`prefill`]: runs forward through every layer,
+    /// populates the engine's KV cache, returns the final-token hidden
+    /// state. Returns the same `Result<_, EngineError>` shape as
+    /// `prefill` for uniform call-site error handling. The engine's
+    /// internal absolute position pointer must be set from
+    /// `initial_hidden.nrows()`, NOT from any token count — the input
+    /// may contain non-token positions.
+    ///
+    /// Default impl panics (not an `Err` return) on engines that don't
+    /// override it. Callers MUST check [`supports_multimodal`] first;
+    /// the panic is defense-in-depth against bypass, not a substitute
+    /// for the capability check.
+    fn prefill_from_hidden(
+        &mut self,
+        _weights: &ModelWeights,
+        _ffn: &dyn FfnBackend,
+        _initial_hidden: &Array2<f32>,
+    ) -> Result<Array2<f32>, EngineError> {
+        panic!(
+            "engine {:?} does not support multi-modal input; \
+             check supports_multimodal() before calling prefill_from_hidden",
+            self.name()
+        );
+    }
+
     /// Bytes of persistent engine state (excludes model weights).
     fn memory_bytes(&self) -> usize;
 
@@ -600,6 +647,34 @@ impl AnyEngine {
         match self {
             Self::Kv(e) => e.decode_step(weights, ffn, token_id),
             Self::Retrieval(e) => e.decode_step(weights, token_id),
+        }
+    }
+
+    /// Capability forwarder for multi-modal input — see ADR-0023.
+    /// `Retrieval` variants are text-only by construction and always
+    /// return `false`; `Kv` variants delegate to the trait method.
+    pub fn supports_multimodal(&self) -> bool {
+        match self {
+            Self::Kv(e) => e.supports_multimodal(),
+            Self::Retrieval(_) => false,
+        }
+    }
+
+    /// MM prefill forwarder. Only `Kv` variants can implement this;
+    /// `Retrieval` variants panic when called (callers MUST check
+    /// `supports_multimodal()` first, per ADR-0023).
+    pub fn prefill_from_hidden(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        initial_hidden: &Array2<f32>,
+    ) -> Result<Array2<f32>, EngineError> {
+        match self {
+            Self::Kv(e) => e.prefill_from_hidden(weights, ffn, initial_hidden),
+            Self::Retrieval(_) => panic!(
+                "AnyEngine::Retrieval does not support prefill_from_hidden — \
+                 check supports_multimodal() before calling"
+            ),
         }
     }
 

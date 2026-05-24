@@ -563,7 +563,10 @@ mod tests {
         assert_eq!(score_mark(ScoreOutcome::Served, Some(false)), "✗");
         assert_eq!(score_mark(ScoreOutcome::Served, None), "✗");
         assert_eq!(score_mark(ScoreOutcome::SkippedEmptyPrompt, None), "·");
-        assert_eq!(score_mark(ScoreOutcome::SkippedInternalError, None), "·");
+        // ScoreOutcome::SkippedInternalError → SkippedBackendFailure post
+        // kv-engine-retrieval-trait-split refactor; "internal error" generalised
+        // into the typed BackendFailure / InvariantViolation split.
+        assert_eq!(score_mark(ScoreOutcome::SkippedBackendFailure, None), "·");
     }
 
     #[test]

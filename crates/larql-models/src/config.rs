@@ -861,6 +861,21 @@ pub trait ModelArchitecture: Send + Sync {
     fn llama3_rope_scaling(&self) -> Option<Llama3RopeScaling> {
         None
     }
+
+    /// Multi-modal contract for this architecture, if any.
+    ///
+    /// Returns `None` for text-only models (the default). Architectures
+    /// that accept images / audio override to return a stable reference
+    /// to a `MultiModalProtocol` impl describing their placeholder
+    /// convention, expected encoder family, token budget, and scaling
+    /// rules.
+    ///
+    /// Phase 0: every existing impl uses the default `None`. Adding
+    /// `Some(...)` returns is a Phase 1+ concern, gated on the
+    /// `EmbeddingPlan` consumer landing in `larql-compute`.
+    fn multimodal(&self) -> Option<&dyn crate::multimodal::MultiModalProtocol> {
+        None
+    }
 }
 
 /// `llama3` rope scaling parameters. Lives in larql-models so both the

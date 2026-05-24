@@ -1,5 +1,22 @@
 # Roadmap — larql-compute
 
+## Multi-modal substrate (landed 2026-05-24)
+
+- **forward/embedding_plan.rs**: `EmbeddingChunk` (Tokens / Precomputed),
+  `EmbeddingPlan`, `PositionScheme` (Sequential / Mrope). Phase 0 types
+  that let the forward pass accept mixed text + vision/audio embeddings.
+- **forward/embed.rs**: `embed_plan(weights, &plan)` alongside existing
+  `embed_tokens_pub`. Text-only fast path is bit-identical to
+  `embed_tokens_pub` (pinned by 8 tests). Mixed-modality path
+  concatenates chunks with `PrecomputedScaling` dispatch.
+- **encoders/vision_tower.rs**: `VisionEncoder` (impl `ModalEncoder`).
+  CPU forward pass: patchify → position embed → N transformer blocks
+  (bidirectional attention, GELU MLP, LayerNorm) → post-norm. Generic
+  across vision-transformer families (SigLIP, SigLIP2, ViT).
+- **connectors/projector.rs**: `VisionProjector` (impl `MmConnector`).
+  CPU forward: AvgPool2d spatial → RMSNorm → linear projection. Generic
+  over pool type and norm offset (parameterised at construction).
+
 ## Open: compute modularity and model-agnostic cleanup
 
 **Status**: Started 2026-05-08.

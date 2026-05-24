@@ -11,10 +11,66 @@
 //! so norm_weight_offset is 0.0 (the saved weight IS the final multiplier).
 
 use crate::config::{Activation, ModelArchitecture, ModelConfig};
+use crate::multimodal::{MultiModalProtocol, PlaceholderProtocol, PrecomputedScaling, TokenBudget};
 
 /// Gemma 3 sliding window pattern: every 6th layer (0-indexed: 5, 11, 17, ...)
 /// uses full attention, the rest use sliding window.
 const GEMMA3_SLIDING_WINDOW_PATTERN: usize = 6;
+
+/// Multi-modal contract for Gemma 3.
+///
+/// Verified token IDs against `google/gemma-3-4b-pt/tokenizer.json`
+/// (snapshot cc012e0a, multimodal-capable). The protocol describes
+/// what the *LM* expects; whether the encoder weights are present in
+/// any given checkpoint is a separate concern handled at encoder-load
+/// time (Phase 1b+).
+///
+/// **Phase 1a scope**: protocol declaration only. `multimodal()` on
+/// `Gemma3Arch` returns `Some(&GEMMA3_MULTIMODAL)`, but no encoder is
+/// loaded and no embedding-path behaviour changes. Text-only forward
+/// passes remain bit-identical to pre-Phase-1a because `embed_plan`'s
+/// text-only fast path bypasses any multimodal-protocol consultation.
+pub struct Gemma3MultiModal;
+
+/// Singleton protocol — Gemma 3's multimodal contract is fixed across
+/// model sizes (4B / 12B / 27B), so a single static instance suffices.
+pub const GEMMA3_MULTIMODAL: Gemma3MultiModal = Gemma3MultiModal;
+
+impl MultiModalProtocol for Gemma3MultiModal {
+    fn vision_encoder(&self) -> Option<&str> {
+        Some("siglip")
+    }
+
+    fn image_placeholder(&self) -> Option<PlaceholderProtocol> {
+        // IDs read from tokenizer.json of google/gemma-3-4b-pt — verified
+        // 2026-05-24. The model emits a fixed sandwich:
+        //   <start_of_image> + 256 × <image_soft_token> + <end_of_image>
+        // Host splices 256 rows of vision-projected embeddings at the
+        // <image_soft_token> positions.
+        Some(PlaceholderProtocol {
+            start: Some(255_999),
+            fill: 262_144,
+            end: Some(256_000),
+        })
+    }
+
+    fn image_token_budget(&self) -> TokenBudget {
+        // Fixed per-image budget — Gemma 3 always expands one image to
+        // exactly 256 soft tokens regardless of input resolution.
+        TokenBudget::Fixed(256)
+    }
+
+    fn precomputed_scaling(&self) -> PrecomputedScaling {
+        // Phase 1a default. The PaliGemma reference impl in
+        // HuggingFace transformers does NOT apply embed_scale to vision
+        // embeddings — only to text token embeddings. Vision goes in
+        // post-projection, already scaled by the multi-modal projector.
+        // Re-verify at Phase 1d (CLI integration) against caption output;
+        // if Gemma 3 captions come out systematically scaled-wrong vs
+        // PaliGemma, this is the first thing to flip.
+        PrecomputedScaling::None
+    }
+}
 
 pub struct Gemma3Arch {
     config: ModelConfig,
@@ -117,6 +173,17 @@ impl ModelArchitecture for Gemma3Arch {
             rs.factor
         }
     }
+
+    fn multimodal(&self) -> Option<&dyn MultiModalProtocol> {
+        // Always-on for Gemma 3 — the *protocol* is part of the family
+        // contract. Whether a given checkpoint actually ships SigLIP
+        // weights is decided at encoder-load time (Phase 1b). Text-only
+        // Gemma 3 1B variants will simply never construct an encoder;
+        // the protocol's presence does not perturb their forward pass
+        // because `embed_plan` only consults `multimodal()` for the
+        // mixed-modality path.
+        Some(&GEMMA3_MULTIMODAL)
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +278,69 @@ mod tests {
         // Layers 5, 11, 17, ... are full attention; everyone else sliding.
         assert_eq!(arch.rope_position_divisor_for_layer(5), 8.0);
         assert_eq!(arch.rope_position_divisor_for_layer(4), 1.0);
+    }
+
+    // ─── Phase 1a: MultiModalProtocol contract ────────────────────────────
+
+    #[test]
+    fn multimodal_protocol_is_present_on_gemma3() {
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        let mm = arch
+            .multimodal()
+            .expect("Gemma 3 must declare a multimodal protocol");
+        assert_eq!(mm.vision_encoder(), Some("siglip"));
+        assert_eq!(mm.audio_encoder(), None);
+    }
+
+    #[test]
+    fn image_placeholder_ids_match_gemma3_tokenizer() {
+        // IDs verified against google/gemma-3-4b-pt/tokenizer.json
+        // (snapshot cc012e0a) — must not drift without re-verifying
+        // against the upstream tokenizer.
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        let ph = arch
+            .multimodal()
+            .unwrap()
+            .image_placeholder()
+            .expect("Gemma 3 declares an image placeholder protocol");
+        assert_eq!(ph.start, Some(255_999), "<start_of_image>");
+        assert_eq!(ph.fill, 262_144, "<image_soft_token>");
+        assert_eq!(ph.end, Some(256_000), "<end_of_image>");
+    }
+
+    #[test]
+    fn image_token_budget_is_fixed_256() {
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        match arch.multimodal().unwrap().image_token_budget() {
+            TokenBudget::Fixed(n) => assert_eq!(n, 256),
+            other => panic!("expected Fixed(256), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precomputed_scaling_defaults_to_none() {
+        // Phase 1a default — vision rows go in post-connector with no
+        // additional embed_scale applied. Phase 1d verifies against
+        // PaliGemma; if wrong, flip to SameAsTokens here.
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        assert_eq!(
+            arch.multimodal().unwrap().precomputed_scaling(),
+            PrecomputedScaling::None
+        );
+    }
+
+    #[test]
+    fn no_audio_placeholder_in_gemma3() {
+        // Audio is a Gemma 4 (Phase 5) concern, not Gemma 3.
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        assert!(arch.multimodal().unwrap().audio_placeholder().is_none());
+    }
+
+    #[test]
+    fn valid_tile_counts_empty_on_fixed_budget_model() {
+        // Gemma 3 uses TokenBudget::Fixed, not PerTile, so no AnyRes
+        // tile-count enumeration is required.
+        let arch = Gemma3Arch::from_config(synth_config(None));
+        assert!(arch.multimodal().unwrap().valid_tile_counts().is_empty());
     }
 }

@@ -1,8 +1,11 @@
 pub mod architectures;
 pub mod config;
+pub mod connectors;
 pub mod defaults;
 pub mod detect;
+pub mod encoders;
 pub mod loading;
+pub mod multimodal;
 pub mod quant;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_fixtures;
@@ -17,6 +20,10 @@ pub use config::{
 pub use detect::{
     detect_architecture, detect_architecture_validated, detect_from_json,
     detect_from_json_validated, ModelError,
+};
+pub use multimodal::{
+    Connector as MmConnector, ModalEncoder, ModalInput, Modality, MultiModalProtocol,
+    PlaceholderProtocol, PrecomputedScaling, TokenBudget,
 };
 pub use validation::{ConfigValidationError, ConfigValidationResult};
 

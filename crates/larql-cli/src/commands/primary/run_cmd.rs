@@ -253,6 +253,34 @@ pub struct RunArgs {
     /// re-routing, at the cost of one extra remote round-trip per token.
     #[arg(long, default_value = "1", value_name = "N")]
     pub moe_predispatch_iters: usize,
+
+    /// Path to one or more image files to splice into the prompt prefix
+    /// (multi-modal Phase 1d, prefix-only). Repeat the flag to pass
+    /// multiple images:
+    ///
+    ///   larql run gemma-3-4b-it --image cat.jpg --image stop_sign.jpg "describe both"
+    ///
+    /// Currently supported on Gemma 3 multimodal checkpoints only.
+    /// Requires `--engine standard` (other engines lack
+    /// `prefill_from_hidden`; the CLI will fail fast with a clear
+    /// message if `--image` is combined with an MM-incapable engine —
+    /// see ADR-0023). Also requires `--mm-weights` to point at the
+    /// directory containing the SigLIP vision_tower and
+    /// multi_modal_projector safetensors shards (typically the HF
+    /// snapshot dir, e.g.
+    /// `~/.cache/huggingface/hub/models--google--gemma-3-4b-it/snapshots/<hash>`).
+    #[arg(long, value_name = "PATH", num_args = 0..)]
+    pub image: Vec<PathBuf>,
+
+    /// Directory containing the SigLIP and multi_modal_projector
+    /// safetensors shards. Required when `--image` is set. The vindex
+    /// itself only carries LM weights (FFN + attention + embeddings);
+    /// the vision tower and projector live in the original HF snapshot
+    /// alongside `config.json`. Both Phase 1b and Phase 1c loaders
+    /// scan this directory for `*.safetensors` files filtered by tensor
+    /// key prefix.
+    #[arg(long, value_name = "DIR")]
+    pub mm_weights: Option<PathBuf>,
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -307,6 +335,30 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             &args.moe_dispatch,
             args.moe_predispatch_iters,
         );
+    }
+
+    if !args.image.is_empty() {
+        // Multi-modal Phase 1d, prefix-only. Mutually exclusive with
+        // the experts / ffn / moe-shards paths above (they're
+        // tokenizer-deep and don't compose with hidden-state prefill).
+        if args.ffn.is_some() {
+            return Err("--image is incompatible with --ffn (Phase 1d scope)".into());
+        }
+        if args.moe_shards.is_some() || args.moe_units_manifest.is_some() {
+            return Err(
+                "--image is incompatible with --moe-shards / --moe-units-manifest \
+                 (Phase 1d scope)"
+                    .into(),
+            );
+        }
+        if args.experts {
+            return Err("--image is incompatible with --experts (Phase 1d scope)".into());
+        }
+        let prompt = args
+            .prompt
+            .as_deref()
+            .ok_or("--image requires a prompt argument (chat mode with images is Phase 2+ work)")?;
+        return super::run_cmd_image::run_with_images(&vindex_path, prompt, &args);
     }
 
     if let Some(prompt) = args.prompt.as_deref() {
