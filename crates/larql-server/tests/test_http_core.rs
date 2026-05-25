@@ -356,6 +356,7 @@ async fn http_warmup_no_model_returns_404() {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
+        infer_timeout: std::time::Duration::from_secs(60),
     });
     let app = single_model_router(st);
     let resp = post_json(app, "/v1/warmup", serde_json::json!({})).await;

@@ -463,6 +463,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 512)]
     pub memcheck_headroom_mib: u64,
 
+    /// Per-request hard timeout for `/v1/infer` and other inference
+    /// endpoints, in seconds.  When the inference exceeds this, the
+    /// handler responds 504 Gateway Timeout and drops the
+    /// `spawn_blocking` JoinHandle.  The blocking thread runs to
+    /// completion in the background; its result is discarded.
+    /// Set to 0 to disable.  See BUG-infer-deadlock §5.6.
+    #[arg(long, default_value_t = 60)]
+    pub infer_timeout_secs: u64,
+
     /// Run as an FFN-service endpoint for remote `RemoteWalkBackend`
     /// clients. Disables `/v1/infer` (like `--no-infer`) and advertises
     /// `mode: ffn-service` in `/v1/stats`. This is Act 2 of the demo —
@@ -1002,7 +1011,14 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(DEFAULT_SESSION_TTL_SECS),
         describe_cache: DescribeCache::new(cli.cache_ttl),
+        infer_timeout: std::time::Duration::from_secs(cli.infer_timeout_secs),
     });
+
+    if cli.infer_timeout_secs == 0 {
+        info!("Infer timeout: disabled");
+    } else {
+        info!("Infer timeout: {}s", cli.infer_timeout_secs);
+    }
 
     if cli.cache_ttl > 0 {
         info!("DESCRIBE cache: {}s TTL", cli.cache_ttl);
