@@ -353,6 +353,7 @@ pub fn load_single_vindex(
         embed_store,
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -422,6 +423,28 @@ pub struct Cli {
     /// Disable INFER endpoint (browse-only, reduces memory).
     #[arg(long)]
     pub no_infer: bool,
+
+    /// Defer model-weight loading until the first `/v1/infer` (or
+    /// other inference) request, instead of loading at startup.
+    ///
+    /// The eager startup load is the default because:
+    ///
+    /// - Lazy load happens on a request thread under HTTP handler
+    ///   backpressure, and a 5+ GB allocation under cgroup pressure
+    ///   reliably triggers an OOM-kill on memory-constrained hosts
+    ///   (see `BUG-infer-deadlock.md`).  Eager load surfaces the
+    ///   same condition as a clean startup failure that systemd
+    ///   reports loudly, *before* the listener binds.
+    /// - Lazy first-callers double-allocated until the single-flight
+    ///   `weights_init` guard landed; eager load avoids that path
+    ///   entirely on hosts where every inference call is going to
+    ///   trigger the load anyway.
+    ///
+    /// Pass this flag if you want the historical lazy behaviour
+    /// (e.g. for `--ffn-only` boxes that *might* be promoted to
+    /// inference later, or in tests).
+    #[arg(long)]
+    pub lazy_weights: bool,
 
     /// Run as an FFN-service endpoint for remote `RemoteWalkBackend`
     /// clients. Disables `/v1/infer` (like `--no-infer`) and advertises
@@ -867,6 +890,36 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 
     if models.is_empty() {
         return Err("no vindexes loaded".into());
+    }
+
+    // Eager-load model weights at startup so the first /v1/infer
+    // request does not face a multi-GB allocation under HTTP-handler
+    // backpressure.  Failure here is a clean startup error rather
+    // than an OOM-kill during the first request.  See
+    // `BUG-infer-deadlock.md` and `LoadedModel::force_load_weights`.
+    if cli.lazy_weights {
+        info!("Lazy weight load: enabled (--lazy-weights)");
+    } else {
+        for m in &models {
+            if m.infer_disabled {
+                continue;
+            }
+            let load_start = std::time::Instant::now();
+            info!("Pre-loading model weights for '{}' …", m.id);
+            if let Err(e) = m.force_load_weights() {
+                return Err(format!(
+                    "failed to load weights for '{}': {} \
+                     (pass --lazy-weights to defer until first request)",
+                    m.id, e
+                )
+                .into());
+            }
+            info!(
+                "  Pre-loaded weights for '{}' in {:.1}s",
+                m.id,
+                load_start.elapsed().as_secs_f64(),
+            );
+        }
     }
 
     let rate_limiter =
