@@ -446,6 +446,23 @@ pub struct Cli {
     #[arg(long)]
     pub lazy_weights: bool,
 
+    /// Skip the startup cgroup memory pre-flight check (BUG
+    /// `infer-deadlock-oom` §5.5).  By default the server reads
+    /// `/sys/fs/cgroup/<self>/memory.max` and refuses to start when
+    /// the vindex's estimated resident size + a 512 MiB headroom
+    /// reserve exceeds the limit.  Pass `--no-memcheck` to override
+    /// (e.g. for cases where the estimate is wrong, or when running
+    /// in an environment without cgroup v2).
+    #[arg(long)]
+    pub no_memcheck: bool,
+
+    /// Headroom (MiB) to reserve below `memory.max` for the OS,
+    /// allocator overhead, and the request-handling working set.
+    /// Used by the startup pre-flight; ignored when
+    /// `--no-memcheck` is set.
+    #[arg(long, default_value_t = 512)]
+    pub memcheck_headroom_mib: u64,
+
     /// Run as an FFN-service endpoint for remote `RemoteWalkBackend`
     /// clients. Disables `/v1/infer` (like `--no-infer`) and advertises
     /// `mode: ffn-service` in `/v1/stats`. This is Act 2 of the demo —
@@ -890,6 +907,45 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
 
     if models.is_empty() {
         return Err("no vindexes loaded".into());
+    }
+
+    // Cgroup memory pre-flight (BUG-infer-deadlock §5.5).  Refuses to
+    // start when the configured cgroup leaves no room to load weights;
+    // converts a 10-second OOM-kill loop into a one-line startup error.
+    if !cli.no_memcheck && !cli.lazy_weights {
+        let total_estimate: u64 = models
+            .iter()
+            .filter(|m| !m.infer_disabled)
+            .map(|m| m.config.estimate_resident_bytes())
+            .sum();
+        if total_estimate > 0 {
+            let headroom = cli.memcheck_headroom_mib * 1024 * 1024;
+            let outcome = crate::memcheck::check_memory_headroom(total_estimate, headroom);
+            match &outcome {
+                crate::memcheck::MemCheckOutcome::Ok {
+                    cgroup_max_bytes,
+                    estimate_bytes,
+                } => {
+                    info!(
+                        "Memcheck: estimated {:.1} GB resident vs cgroup memory.max {:.1} GB \
+                         (headroom {} MiB, ok)",
+                        (*estimate_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                        (*cgroup_max_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                        cli.memcheck_headroom_mib,
+                    );
+                }
+                crate::memcheck::MemCheckOutcome::Skipped { reason } => {
+                    info!("Memcheck: skipped ({reason})");
+                }
+                crate::memcheck::MemCheckOutcome::Tight { .. } => {
+                    return Err(
+                        crate::memcheck::explain_tight_outcome(&outcome).into(),
+                    );
+                }
+            }
+        }
+    } else if cli.no_memcheck {
+        info!("Memcheck: disabled (--no-memcheck)");
     }
 
     // Eager-load model weights at startup so the first /v1/infer
