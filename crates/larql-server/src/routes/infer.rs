@@ -132,8 +132,20 @@ fn run_infer(
 
     if use_walk {
         let pred = if let Some(sid) = session_id {
-            // Session-scoped: use session's PatchedVindex
-            let sessions = state.sessions.sessions_blocking_write();
+            // Session-scoped walk inference.
+            //
+            // Lock discipline: take a *reader* on the sessions map (not
+            // a writer) so concurrent sessioned `/v1/infer` requests do
+            // not serialize globally, and so an in-flight forward pass
+            // does not deadlock against a concurrent `apply_patch`
+            // arriving on another worker.  The previous implementation
+            // held `sessions.write()` across the multi-second
+            // `run_walk(&session.patched)` call, which on the
+            // multi-thread tokio runtime stalled every other handler
+            // touching `sessions` (including `GET /v1/stats` and
+            // `GET /v1/walk-ffn`).  This mirrors the fix already
+            // applied in `session.rs::apply_patch`.
+            let sessions = state.sessions.sessions_blocking_read();
             if let Some(session) = sessions.get(sid) {
                 run_walk(&session.patched)
             } else {
@@ -286,6 +298,72 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(compare.mode, INFER_MODE_COMPARE);
+    }
+
+    /// Regression: `run_infer`'s sessioned branch must NOT take a
+    /// `sessions_blocking_write` guard — it serialised every
+    /// concurrent /v1/infer call against the entire forward pass
+    /// and (under cgroup memory pressure during weight load) wedged
+    /// the whole HTTP handler.  See `BUG-infer-deadlock.md` §4.3.
+    ///
+    /// We can't run a real forward pass in a unit test, but we can
+    /// drive the same lock pattern against `SessionManager` and
+    /// assert that 8 concurrent readers complete in parallel rather
+    /// than serially — i.e. their wall-time is ~one slow op, not
+    /// ~eight.
+    #[test]
+    fn sessions_reader_does_not_serialize_concurrent_callers() {
+        use crate::session::{SessionManager, SessionState};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let mgr = Arc::new(SessionManager::new(60));
+
+        // Pre-seed a session so the reader path doesn't fall
+        // through to slow-path session creation.
+        {
+            let mut sessions = mgr.sessions_blocking_write();
+            let hidden = 4;
+            let gate = larql_vindex::ndarray::Array2::<f32>::zeros((2, hidden));
+            let index =
+                larql_vindex::VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
+            sessions.insert(
+                "test-sid".to_string(),
+                SessionState::new(index, Instant::now()),
+            );
+        }
+
+        // Eight threads simulating run_infer's sessioned branch:
+        // take the reader, sleep 100 ms (proxy for a forward pass),
+        // drop.  If we mistakenly used a *writer* (the buggy
+        // pre-fix code) the wall time would be 8 * 100 ms = 800 ms.
+        // With reader, it should be ~100 ms.
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(std::thread::spawn(move || {
+                let sessions = mgr.sessions_blocking_read();
+                let _patched = sessions.get("test-sid").map(|s| &s.patched);
+                std::thread::sleep(Duration::from_millis(100));
+                drop(sessions);
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let wall = start.elapsed();
+
+        // Generous bound: real serialization would be 800 ms; even
+        // perfect parallelism plus thread spawn jitter sits well
+        // under 400 ms on any host that runs the test suite.
+        assert!(
+            wall < Duration::from_millis(400),
+            "sessions reader serialized concurrent callers (took {:?}); \
+             expected ~100 ms parallel, observed near 800 ms-style serialisation",
+            wall
+        );
     }
 
     #[test]

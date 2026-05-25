@@ -187,6 +187,20 @@ impl SessionManager {
         self.sessions.blocking_write()
     }
 
+    /// Blocking read access to sessions map (for use in spawn_blocking).
+    ///
+    /// Used by `/v1/infer` and other read-only paths so concurrent
+    /// sessioned inference requests do not serialize behind a single
+    /// writer guard for the duration of the forward pass.  Mutations
+    /// (`apply_patch`, `remove_patch`) still queue behind any
+    /// outstanding readers, which is acceptable: patches are rare and
+    /// single-writer-many-readers is the canonical shape.
+    pub fn sessions_blocking_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, HashMap<String, SessionState>> {
+        self.sessions.blocking_read()
+    }
+
     /// Number of active sessions.
     #[allow(dead_code)]
     pub async fn session_count(&self) -> usize {
