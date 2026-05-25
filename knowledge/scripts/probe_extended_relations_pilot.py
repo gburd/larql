@@ -99,6 +99,8 @@ def parse_args():
                    help="Scan L0..scan_end_layer-1. Default 21 (i.e. L0-L20).")
     p.add_argument("--offline", action="store_true", default=True)
     p.add_argument("--limit-subjects", type=int, default=None)
+    p.add_argument("--output-suffix", type=str, default="",
+                   help="Suffix appended to output filenames (e.g., '_l33_signed')")
     return p.parse_args()
 
 
@@ -219,11 +221,11 @@ def main():
                     continue
                 r = residuals[layer]
                 scores = gates[layer] @ r
-                top_indices = np.argsort(-np.abs(scores))[:args.top_k]
+                top_indices = np.argsort(-scores)[:args.top_k]
 
                 for feat_idx in top_indices:
                     score = float(scores[feat_idx])
-                    if abs(score) < args.min_gate_score:
+                    if score < args.min_gate_score:
                         continue
                     tokens = down_meta.get((layer, int(feat_idx)), [])
                     if not tokens:
@@ -296,17 +298,18 @@ def main():
             stable_count = sum(1 for k, v in stable_labels.items() if v == rel)
             print(f"  {rel:<25s} [{side}] {count:4d}  ({stable_count} stable)")
 
-    pilot_path = Path(vindex_path) / "feature_labels_extended_pilot.json"
+    suffix = getattr(args, 'output_suffix', '')
+    pilot_path = Path(vindex_path) / f"feature_labels_extended_pilot{suffix}.json"
     with open(pilot_path, "w") as f:
         json.dump(pilot_labels, f, indent=2, ensure_ascii=False)
     print(f"\nPilot labels -> {pilot_path}")
 
-    details_path = Path(vindex_path) / "feature_labels_extended_pilot_rich.json"
+    details_path = Path(vindex_path) / f"feature_labels_extended_pilot{suffix}_rich.json"
     with open(details_path, "w") as f:
         json.dump(label_details, f, indent=2, ensure_ascii=False)
     print(f"Pilot details -> {details_path}")
 
-    stable_path = Path(vindex_path) / "feature_labels_extended_pilot_stable.json"
+    stable_path = Path(vindex_path) / f"feature_labels_extended_pilot{suffix}_stable.json"
     with open(stable_path, "w") as f:
         json.dump(stable_labels, f, indent=2, ensure_ascii=False)
     print(f"Pilot stable subset -> {stable_path}")
@@ -422,7 +425,7 @@ def main():
     print(f"Next action:        {next_action}")
     print(f"Depth stratification: {depth_decision}")
 
-    decision_path = Path(vindex_path) / "feature_labels_extended_pilot_decision.json"
+    decision_path = Path(vindex_path) / f"feature_labels_extended_pilot{suffix}_decision.json"
     with open(decision_path, "w") as f:
         json.dump({
             "pilot_status": "PILOT_RESULT - NOT MERGED INTO CANONICAL",

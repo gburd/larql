@@ -50,6 +50,10 @@ def parse_args():
     p.add_argument("--min-gate-score", type=float, default=5.0)
     p.add_argument("--offline", action="store_true", default=True)
     p.add_argument("--limit-subjects", type=int, default=None)
+    p.add_argument("--scan-end-layer", type=int, default=None,
+                   help="Override scan range to L0..scan_end_layer-1.")
+    p.add_argument("--output-suffix", type=str, default="",
+                   help="Suffix appended to output filenames (e.g., '_l20')")
     return p.parse_args()
 
 
@@ -76,7 +80,9 @@ def main():
     num_layers = config["num_layers"]
     print(f"  {num_layers} layers, {config['hidden_size']} hidden, {len(down_meta)} features")
 
-    if "layer_bands" in config and config["layer_bands"]:
+    if args.scan_end_layer is not None:
+        syntax_end = min(args.scan_end_layer, num_layers)
+    elif "layer_bands" in config and config["layer_bands"]:
         bands = config["layer_bands"]
         syntax_end = bands.get("knowledge_start", num_layers * 2 // 5)
     else:
@@ -169,11 +175,11 @@ def main():
                     continue
                 r = residuals[layer]
                 scores = gates[layer] @ r
-                top_indices = np.argsort(-np.abs(scores))[:args.top_k]
+                top_indices = np.argsort(-scores)[:args.top_k]
 
                 for feat_idx in top_indices:
                     score = float(scores[feat_idx])
-                    if abs(score) < args.min_gate_score:
+                    if score < args.min_gate_score:
                         continue
                     tokens = down_meta.get((layer, int(feat_idx)), [])
                     if not tokens:
@@ -230,12 +236,13 @@ def main():
         for rel, count in sorted(relation_totals.items(), key=lambda x: -x[1]):
             print(f"  {rel:<25s} {count:4d}")
 
-    pilot_path = Path(vindex_path) / "feature_labels_subword_pilot.json"
+    suffix = getattr(args, 'output_suffix', '')
+    pilot_path = Path(vindex_path) / f"feature_labels_subword_pilot{suffix}.json"
     with open(pilot_path, "w") as f:
         json.dump(pilot_labels, f, indent=2, ensure_ascii=False)
     print(f"\nPilot labels -> {pilot_path}")
 
-    details_path = Path(vindex_path) / "feature_labels_subword_pilot_rich.json"
+    details_path = Path(vindex_path) / f"feature_labels_subword_pilot{suffix}_rich.json"
     with open(details_path, "w") as f:
         json.dump(label_details, f, indent=2, ensure_ascii=False)
     print(f"Pilot details -> {details_path}")
@@ -305,7 +312,7 @@ def main():
     print(f"Branch fired: {branch}")
     print(f"Next action:  {next_action}")
 
-    decision_path = Path(vindex_path) / "feature_labels_subword_pilot_decision.json"
+    decision_path = Path(vindex_path) / f"feature_labels_subword_pilot{suffix}_decision.json"
     with open(decision_path, "w") as f:
         json.dump({
             "pilot_status": "PILOT_RESULT - NOT MERGED INTO CANONICAL",
