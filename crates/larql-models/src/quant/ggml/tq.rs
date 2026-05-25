@@ -28,7 +28,8 @@
 use crate::ModelError;
 
 use super::{
-    check_block_input, K_QUANT_BLOCK_ELEMS, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
+    check_block_input, I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMS, K_QUANT_BLOCK_ELEMS,
+    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
 };
 
 // ── f16 helpers ────────────────────────────────────────────────────────────────
@@ -359,6 +360,83 @@ pub fn quantize_tq1_0(values: &[f32]) -> Result<Vec<u8>, ModelError> {
     Ok(out)
 }
 
+// I2_S (Microsoft bitnet.cpp fork)
+//
+// Layout: pure 2-bit packing, 4 weights per byte, no per-block scale.
+// Per-channel scale lives in the adjacent `*_sub_norm.weight` F32
+// tensor and is applied at inference time.  We decode the trits at
+// unit scale; the larql extract pipeline keeps the `*_sub_norm`
+// weights as separate F32 tensors and applies them per-row when
+// needed.
+//
+// Bit pattern -> trit:
+//   0b00 -> 0
+//   0b01 -> +1
+//   0b10 -> -1
+//   0b11 -> undefined; we map to 0
+//
+// Iteration: byte b holds elements (b*4 + slot) for slot in 0..4,
+// where slot indexes the 2-bit field at bits (2*slot)..(2*slot+2).
+// Matches the bitnet.cpp encode/decode convention.
+
+/// Decode I2_S bytes to f32 trits at unit scale.
+pub fn dequantize_i2_s(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
+    let n_blocks = check_block_input(
+        "I2_S",
+        data,
+        n_elements,
+        I2_S_BLOCK_ELEMS,
+        I2_S_BLOCK_BYTES,
+    )?;
+
+    let mut out = Vec::with_capacity(n_elements);
+    for block in 0..n_blocks {
+        let b = data[block];
+        for slot in 0..4 {
+            let bits = (b >> (2 * slot)) & 0b11;
+            let v: f32 = match bits {
+                0b00 => 0.0,
+                0b01 => 1.0,
+                0b10 => -1.0,
+                _ => 0.0, // 0b11 reserved
+            };
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode an f32 slice into I2_S bytes.  Used by tests; not on the
+/// hot path.  Quantises each value to its nearest of {-1, 0, +1}
+/// after dividing by the absmax of the slice.
+pub fn quantize_i2_s(values: &[f32]) -> Result<Vec<u8>, ModelError> {
+    if !values.len().is_multiple_of(I2_S_BLOCK_ELEMS) {
+        return Err(ModelError::Parse(format!(
+            "I2_S quantize: input length {} is not a multiple of 4",
+            values.len()
+        )));
+    }
+
+    let scale = values.iter().copied().fold(0.0f32, |a, v| a.max(v.abs()));
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+    let mut out = vec![0u8; values.len() / I2_S_BLOCK_ELEMS];
+    for (i, chunk) in values.chunks_exact(4).enumerate() {
+        let mut byte: u8 = 0;
+        for (slot, &v) in chunk.iter().enumerate() {
+            let t = (v * inv).round().clamp(-1.0, 1.0) as i32;
+            let bits: u8 = match t {
+                1 => 0b01,
+                -1 => 0b10,
+                _ => 0b00,
+            };
+            byte |= bits << (2 * slot);
+        }
+        out[i] = byte;
+    }
+    Ok(out)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -491,6 +569,76 @@ mod tests {
     fn type_name_recognises_ternary() {
         assert_eq!(super::super::type_name(super::super::TYPE_TQ1_0), "TQ1_0");
         assert_eq!(super::super::type_name(super::super::TYPE_TQ2_0), "TQ2_0");
+        assert_eq!(super::super::type_name(super::super::TYPE_I2_S), "I2_S");
+    }
+
+    // I2_S
+
+    #[test]
+    fn i2_s_round_trip_basic() {
+        let input: Vec<f32> = vec![-1.0, 0.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0];
+        let bytes = quantize_i2_s(&input).unwrap();
+        assert_eq!(bytes.len(), 2);
+        let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn i2_s_round_trip_scaled() {
+        let input: Vec<f32> = vec![-0.5, 0.0, 0.5, 0.5, -0.5, 0.0, 0.0, 0.5];
+        let bytes = quantize_i2_s(&input).unwrap();
+        let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
+        assert_eq!(decoded[0], -1.0);
+        assert_eq!(decoded[1], 0.0);
+        assert_eq!(decoded[2], 1.0);
+        assert_eq!(decoded[3], 1.0);
+    }
+
+    #[test]
+    fn i2_s_zero_block_is_zero() {
+        let input = vec![0.0f32; 8];
+        let bytes = quantize_i2_s(&input).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0));
+        let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
+        assert!(decoded.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn i2_s_truncated_input_errors() {
+        assert!(dequantize_i2_s(&[], 4).is_err());
+        assert!(dequantize_i2_s(&[0u8; 3], 16).is_err());
+    }
+
+    #[test]
+    fn i2_s_non_multiple_of_4_errors() {
+        assert!(dequantize_i2_s(&[0u8; 1], 3).is_err());
+        assert!(quantize_i2_s(&[1.0, 0.0, -1.0]).is_err());
+    }
+
+    #[test]
+    fn i2_s_bit_pattern_3_decodes_as_zero() {
+        let decoded = dequantize_i2_s(&[0xFF], 4).unwrap();
+        assert_eq!(decoded, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn i2_s_dispatch_via_dequantize() {
+        let bytes = vec![0b01_10_00_01u8];
+        let result =
+            super::super::dequantize(&bytes, super::super::TYPE_I2_S, 4).unwrap();
+        assert_eq!(result, vec![1.0, 0.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn i2_s_tensor_data_size_matches_bitnet_b158_2b4t() {
+        // blk.0.ffn_down.weight in microsoft/bitnet-b1.58-2B-4T-gguf
+        // is 6912 x 2560 = 17,694,720 weights.  GGUF tensor data
+        // size = ceil(n/4) = 4,423,680 bytes.  Verifying our size
+        // helper agrees with reality.
+        assert_eq!(
+            super::super::tensor_data_size(super::super::TYPE_I2_S, 17_694_720).unwrap(),
+            4_423_680
+        );
     }
 
     #[test]

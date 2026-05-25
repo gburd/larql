@@ -57,6 +57,10 @@ pub const TYPE_BF16: u32 = 30;
 pub const TYPE_TQ1_0: u32 = 34;
 /// BitNet 1.58 ternary, 4-trits-per-byte 2-bit packing (2.0625 bpw).
 pub const TYPE_TQ2_0: u32 = 35;
+/// Microsoft bitnet.cpp's 2-bit signed packing (2 bpw, no per-block
+/// scale).  Used by `microsoft/bitnet-b1.58-2B-4T-gguf`.  Per-channel
+/// scale lives in adjacent `*_sub_norm.weight` F32 tensors.
+pub const TYPE_I2_S: u32 = 36;
 
 // ── Block geometry (canonical GGML wire format) ─────────────────────────
 //
@@ -126,6 +130,13 @@ pub const TQ2_0_BLOCK_BYTES: usize = 66;
 /// Elements per TQ2_0 super-block.
 pub const TQ2_0_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
 
+/// I2_S has no super-block: it is a flat 2-bit-per-weight packing
+/// where every 4 weights occupy one byte.  We treat the unit as 4
+/// elements per "block" so size and dispatch helpers stay symmetric
+/// with the K-quants above.
+pub const I2_S_BLOCK_BYTES: usize = 1;
+pub const I2_S_BLOCK_ELEMS: usize = 4;
+
 /// Validate that `data` holds at least `n_blocks` blocks of
 /// `block_size` bytes for `n_elements` total elements (which must be a
 /// multiple of `block_elems`). Returns the block count.
@@ -179,6 +190,14 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
         TYPE_Q6_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q6_K_BLOCK_BYTES),
         TYPE_TQ1_0 => Ok(n_elements / K_QUANT_BLOCK_ELEMS * TQ1_0_BLOCK_BYTES),
         TYPE_TQ2_0 => Ok(n_elements / K_QUANT_BLOCK_ELEMS * TQ2_0_BLOCK_BYTES),
+        TYPE_I2_S => {
+            if !n_elements.is_multiple_of(I2_S_BLOCK_ELEMS) {
+                return Err(ModelError::Parse(format!(
+                    "I2_S: n_elements {n_elements} not a multiple of 4"
+                )));
+            }
+            Ok(n_elements / I2_S_BLOCK_ELEMS)
+        }
         _ => Err(ModelError::Parse(format!(
             "tensor_data_size: unsupported type id {tensor_type}"
         ))),
@@ -203,6 +222,7 @@ pub fn type_name(tensor_type: u32) -> &'static str {
         TYPE_Q6_K => "Q6_K",
         TYPE_TQ1_0 => "TQ1_0",
         TYPE_TQ2_0 => "TQ2_0",
+        TYPE_I2_S => "I2_S",
         TYPE_BF16 => "BF16",
         _ => "unknown",
     }
@@ -246,6 +266,7 @@ pub fn dequantize(
         TYPE_Q6_K => dequantize_q6_k(data, n_elements),
         TYPE_TQ1_0 => tq::dequantize_tq1_0(data, n_elements),
         TYPE_TQ2_0 => tq::dequantize_tq2_0(data, n_elements),
+        TYPE_I2_S => tq::dequantize_i2_s(data, n_elements),
         other => Err(ModelError::UnsupportedDtype(format!("GGML type {other}"))),
     }
 }
