@@ -1082,13 +1082,12 @@ pub fn decode_step(
 }
 
 /// Generate up to `max_new_tokens` greedily from `prompt`.  Stops
-/// early if `stop_token` is produced.  Returns the decoded text of
-/// the generated tokens (does not include the prompt).
+/// early if `stop_token` is produced.  Returns the raw token-id
+/// stream (caller decodes for surface form).
 ///
-/// For the route-handler use case this is a "one-shot" surface:
-/// pg_infer's /v1/infer wants a single text completion, not a
-/// streaming SSE.  Streaming is a follow-up (the cache is the
-/// load-bearing piece; streaming just hands the caller an iterator).
+/// Backwards-compat shim around [`generate_sampled`] with
+/// [`SamplingConfig::greedy`] — byte-for-byte identical output to
+/// callers built before sampling existed.
 pub fn generate(
     model: &BitnetModel,
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
@@ -1096,14 +1095,42 @@ pub fn generate(
     max_new_tokens: usize,
     stop_token: Option<u32>,
 ) -> Vec<u32> {
+    let _ = tokenizer; // unused on the greedy path; kept for API stability
+    generate_sampled(
+        model,
+        prompt_token_ids,
+        max_new_tokens,
+        crate::layer_graph::generate::SamplingConfig::greedy(),
+        stop_token,
+    )
+}
+
+/// Generate up to `max_new_tokens` from `prompt` using a configurable
+/// sampler (temperature / top-k / top-p / repetition penalties /
+/// seedable RNG).  See [`SamplingConfig`] for the knobs.
+///
+/// `stop_token` halts generation before the token would be emitted
+/// (mirrors [`generate`]).  EOS detection beyond a single token id
+/// (stop strings, multiple EOS ids) belongs in
+/// [`generate_streaming_bitnet`] which threads the full
+/// [`EosConfig`].
+pub fn generate_sampled(
+    model: &BitnetModel,
+    prompt_token_ids: &[u32],
+    max_new_tokens: usize,
+    sampling: crate::layer_graph::generate::SamplingConfig,
+    stop_token: Option<u32>,
+) -> Vec<u32> {
     if prompt_token_ids.is_empty() || max_new_tokens == 0 {
         return Vec::new();
     }
-    let _ = tokenizer; // tokenizer is reserved for stop-string detection; greedy decode here
+    let mut sampler = crate::layer_graph::generate::Sampler::new(sampling);
     let (mut cache, last_logits) = prefill(model, prompt_token_ids);
     let mut generated = Vec::with_capacity(max_new_tokens);
 
-    let mut next = argmax(&last_logits);
+    let Some(mut next) = sampler.sample_with_history(&last_logits, &generated) else {
+        return generated;
+    };
     for _ in 0..max_new_tokens {
         if let Some(stop) = stop_token {
             if next == stop {
@@ -1112,11 +1139,13 @@ pub fn generate(
         }
         generated.push(next);
         let logits = decode_step(model, &mut cache, next);
-        next = argmax(&logits);
+        match sampler.sample_with_history(&logits, &generated) {
+            Some(t) => next = t,
+            None => break,
+        }
     }
     generated
 }
-
 /// Decode-time attention: one Q-row vs the full cached K/V history.
 ///
 /// `q` is `[n_q_heads * head_dim]`, `k` and `v` are `[seq_len,
@@ -1770,4 +1799,296 @@ fn take_norm(
         )));
     }
     Ok(v)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  generate_streaming_bitnet — token-by-token callback with detok + EOS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Streaming generation for BitNet.  Mirrors the callback shape of
+/// `larql_inference::layer_graph::generate_streaming` so HTTP SSE
+/// route handlers can treat dense and ternary models uniformly.
+///
+/// `on_token(id, surface_text, decode_ms)` fires once per generated
+/// token, in order.  `surface_text` is the cumulative-decode delta
+/// (HF leading-space semantics preserved via [`Detokenizer`]) and may
+/// be empty for tokens that don't grow the decoded string (e.g.
+/// reserved/special tokens with skip_special=true).
+///
+/// `eos` and `sampling` are honoured: stop strings are matched against
+/// the *cumulative* decoded text, EOS token ids halt immediately, and
+/// the sampler can carry temperature/top-K/top-p/penalties.
+///
+/// Returns the count of tokens emitted (excluding the prompt).  Errors
+/// from the prefill (empty prompt, etc.) yield `0` with no callback
+/// invocations \u2014 the route handler gets to decide whether to surface
+/// that as 200 OK with an empty stream or a 4xx.
+pub fn generate_streaming_bitnet<F>(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    prompt_token_ids: &[u32],
+    max_new_tokens: usize,
+    sampling: crate::layer_graph::generate::SamplingConfig,
+    eos: &crate::layer_graph::generate::EosConfig,
+    mut on_token: F,
+) -> usize
+where
+    F: FnMut(u32, &str, f64),
+{
+    if prompt_token_ids.is_empty() || max_new_tokens == 0 {
+        return 0;
+    }
+    let mut sampler = crate::layer_graph::generate::Sampler::new(sampling);
+    let mut detok = crate::layer_graph::generate::Detokenizer::new(tokenizer);
+    detok.seed(prompt_token_ids);
+
+    let (mut cache, last_logits) = prefill(model, prompt_token_ids);
+
+    let Some(mut next) = sampler.sample_with_history(&last_logits, &[]) else {
+        return 0;
+    };
+    let mut emitted = 0usize;
+    let mut history: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+    for _ in 0..max_new_tokens {
+        let step_start = std::time::Instant::now();
+
+        // Stop on a *next* token that matches an EOS id before we
+        // even decode it (cheap path; symmetric with the dense
+        // generate_streaming).
+        if eos.eos_token_ids.contains(&next) {
+            break;
+        }
+
+        // Push to detokeniser, get the cumulative-decode delta.
+        let delta = detok.push(next);
+
+        // EOS by surface form: use the tokenizer-aware variant which
+        // re-decodes without skip-special when the cleaned delta is
+        // empty (catches end-of-turn markers etc.).
+        if eos.is_eos_with_tokenizer(next, &delta, tokenizer) {
+            break;
+        }
+
+        let elapsed = step_start.elapsed().as_secs_f64() * 1000.0;
+        on_token(next, &delta, elapsed);
+        emitted += 1;
+        history.push(next);
+
+        // Decode the next-token logits *after* emitting the current
+        // token so the loop terminates cleanly without an extra
+        // forward at the end.
+        let logits = decode_step(model, &mut cache, next);
+        match sampler.sample_with_history(&logits, &history) {
+            Some(t) => next = t,
+            None => break,
+        }
+    }
+    emitted
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::layer_graph::generate::{EosConfig, SamplingConfig};
+    use larql_compute::cpu::ops::ternary_matvec::BitLinearWeight;
+
+    /// Same fixture as kv_cache_tests but inlined here so the streaming
+    /// suite is self-contained.
+    fn tiny_model() -> BitnetModel {
+        let hidden = 4;
+        let inter = 4;
+        let vocab = 8;
+        let n_heads = 1;
+        let head_dim = hidden / n_heads;
+        let mk_w = |rows: usize, cols: usize, scale: f32| {
+            let mut bytes = vec![0u8; rows * cols / 4];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = match i % 4 {
+                    0 => 0b01_10_00_01,
+                    1 => 0b10_01_01_00,
+                    2 => 0b00_01_10_01,
+                    _ => 0b01_00_01_10,
+                };
+            }
+            BitLinearWeight::new(rows, cols, bytes, vec![scale; rows]).unwrap()
+        };
+        let layer = BitnetLayer {
+            attn_norm: vec![1.0; hidden],
+            attn_q: mk_w(hidden, hidden, 0.3),
+            attn_k: mk_w(hidden, hidden, 0.4),
+            attn_v: mk_w(hidden, hidden, 0.5),
+            attn_sub_norm: vec![1.0; hidden],
+            attn_o: mk_w(hidden, hidden, 0.6),
+            ffn: BitNetFfn {
+                gate: mk_w(inter, hidden, 0.2),
+                up: mk_w(inter, hidden, 0.3),
+                down: mk_w(hidden, inter, 0.7),
+                ffn_norm: vec![1.0; hidden],
+                ffn_sub_norm: vec![1.0; inter],
+                eps: 1e-5,
+            },
+        };
+        BitnetModel {
+            layers: vec![layer],
+            embed: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 7 + j * 3) as f32 % 5.0) - 2.0
+            }),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; hidden],
+            lm_head: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 11 + j * 5) as f32 % 4.0) - 1.5
+            }),
+            eps: 1e-5,
+            head_dim,
+            n_q_heads: n_heads,
+            n_kv_heads: n_heads,
+            rope_base: 10000.0,
+        }
+    }
+
+    fn tiny_tokenizer() -> larql_vindex::tokenizers::Tokenizer {
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap()
+    }
+
+    /// Greedy sampling matches the legacy generate() path token-for-token.
+    /// This is the load-bearing backwards-compat test \u2014 if generate()
+    /// drifts from generate_sampled(SamplingConfig::greedy()) we want
+    /// to know.
+    #[test]
+    fn greedy_generate_sampled_matches_legacy_generate() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1, 2];
+        let legacy = generate(&model, &tok, &prompt, 5, None);
+        let sampled = generate_sampled(&model, &prompt, 5, SamplingConfig::greedy(), None);
+        assert_eq!(legacy, sampled);
+    }
+
+
+    /// Seeded temperature sampling is reproducible: same seed +
+    /// same prompt = same token stream.
+    #[test]
+    fn seeded_sampling_is_deterministic() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let cfg = SamplingConfig::temperature(1.0).with_seed(42);
+        let a = generate_sampled(&model, &prompt, 5, cfg, None);
+        let b = generate_sampled(&model, &prompt, 5, cfg, None);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 5);
+    }
+
+    /// Distinct seeds must produce different streams (with overwhelming
+    /// probability for vocab=8 over 5 tokens).  Lock guards against a
+    /// regression where seeding silently no-ops.
+    #[test]
+    fn distinct_seeds_diverge() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let a = generate_sampled(
+            &model,
+            &prompt,
+            5,
+            SamplingConfig::temperature(1.5).with_seed(1),
+            None,
+        );
+        let b = generate_sampled(
+            &model,
+            &prompt,
+            5,
+            SamplingConfig::temperature(1.5).with_seed(99999),
+            None,
+        );
+        // 8^5 = 32768 distinct streams: ~1-in-32768 odds of accidental match.
+        assert_ne!(a, b, "seeds {{1, 99999}} produced identical streams");
+    }
+
+    /// Sampling filters are applied: top_k=1 with high temperature
+    /// produces a single deterministic stream (only one candidate
+    /// survives top_k=1 truncation, so multinomial degenerates).
+    /// Note: top_k=1 routes through the sampling code path, not the
+    /// `is_greedy()` short-circuit, so it can diverge from raw argmax
+    /// when ties exist in the logits — we only assert that successive
+    /// runs with the same seed match.
+    #[test]
+    fn top_k_one_is_deterministic() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let cfg = SamplingConfig::temperature(2.0)
+            .with_top_k(1)
+            .with_seed(7);
+        let a = generate_sampled(&model, &prompt, 4, cfg, None);
+        let b = generate_sampled(&model, &prompt, 4, cfg, None);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+    }
+
+    /// Streaming callback fires once per emitted token with the
+    /// cumulative-decode delta.
+    #[test]
+    fn streaming_callback_fires_per_token() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1];
+        let mut events: Vec<(u32, String)> = Vec::new();
+        let n = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &prompt,
+            4,
+            SamplingConfig::greedy(),
+            &EosConfig::empty(),
+            |id, text, _ms| events.push((id, text.to_string())),
+        );
+        assert_eq!(n, events.len());
+        assert_eq!(n, 4, "no early EOS");
+        for (id, text) in &events {
+            assert!(!text.is_empty(), "empty delta for token {id}");
+        }
+        let concat: String = events.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(!concat.is_empty(), "concatenated stream surface form was empty");
+    }
+
+    /// EOS token id halts the stream before emitting that token.
+    #[test]
+    fn streaming_stops_on_eos_id() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1];
+        let baseline = generate_sampled(&model, &prompt, 1, SamplingConfig::greedy(), None);
+        let first = baseline[0];
+
+        let mut emitted = 0;
+        let _ = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &prompt,
+            10,
+            SamplingConfig::greedy(),
+            &EosConfig::empty().with_eos_id(first),
+            |_, _, _| emitted += 1,
+        );
+        assert_eq!(emitted, 0, "first sampled token = EOS id, no emits");
+    }
+
+    /// Empty prompt: zero tokens emitted, no callback invocations.
+    #[test]
+    fn streaming_empty_prompt_emits_nothing() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let mut count = 0;
+        let n = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &[],
+            5,
+            SamplingConfig::greedy(),
+            &EosConfig::empty(),
+            |_, _, _| count += 1,
+        );
+        assert_eq!(n, 0);
+        assert_eq!(count, 0);
+    }
 }
