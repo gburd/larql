@@ -952,7 +952,7 @@ pub fn prefill(model: &BitnetModel, token_ids: &[u32]) -> (BitnetKvCache, Vec<f3
         let vocab = model.lm_head.shape()[0];
         return (cache, vec![0.0; vocab]);
     }
-    let logits = run_full_forward(model, token_ids, Some(&mut cache));
+    let logits = run_full_forward(model, token_ids, Some(&mut cache), None);
     (cache, logits)
 }
 
@@ -1082,13 +1082,12 @@ pub fn decode_step(
 }
 
 /// Generate up to `max_new_tokens` greedily from `prompt`.  Stops
-/// early if `stop_token` is produced.  Returns the decoded text of
-/// the generated tokens (does not include the prompt).
+/// early if `stop_token` is produced.  Returns the raw token-id
+/// stream (caller decodes for surface form).
 ///
-/// For the route-handler use case this is a "one-shot" surface:
-/// pg_infer's /v1/infer wants a single text completion, not a
-/// streaming SSE.  Streaming is a follow-up (the cache is the
-/// load-bearing piece; streaming just hands the caller an iterator).
+/// Backwards-compat shim around [`generate_sampled`] with
+/// [`SamplingConfig::greedy`] — byte-for-byte identical output to
+/// callers built before sampling existed.
 pub fn generate(
     model: &BitnetModel,
     tokenizer: &larql_vindex::tokenizers::Tokenizer,
@@ -1096,14 +1095,42 @@ pub fn generate(
     max_new_tokens: usize,
     stop_token: Option<u32>,
 ) -> Vec<u32> {
+    let _ = tokenizer; // unused on the greedy path; kept for API stability
+    generate_sampled(
+        model,
+        prompt_token_ids,
+        max_new_tokens,
+        crate::layer_graph::generate::SamplingConfig::greedy(),
+        stop_token,
+    )
+}
+
+/// Generate up to `max_new_tokens` from `prompt` using a configurable
+/// sampler (temperature / top-k / top-p / repetition penalties /
+/// seedable RNG).  See [`SamplingConfig`] for the knobs.
+///
+/// `stop_token` halts generation before the token would be emitted
+/// (mirrors [`generate`]).  EOS detection beyond a single token id
+/// (stop strings, multiple EOS ids) belongs in
+/// [`generate_streaming_bitnet`] which threads the full
+/// [`EosConfig`].
+pub fn generate_sampled(
+    model: &BitnetModel,
+    prompt_token_ids: &[u32],
+    max_new_tokens: usize,
+    sampling: crate::layer_graph::generate::SamplingConfig,
+    stop_token: Option<u32>,
+) -> Vec<u32> {
     if prompt_token_ids.is_empty() || max_new_tokens == 0 {
         return Vec::new();
     }
-    let _ = tokenizer; // tokenizer is reserved for stop-string detection; greedy decode here
+    let mut sampler = crate::layer_graph::generate::Sampler::new(sampling);
     let (mut cache, last_logits) = prefill(model, prompt_token_ids);
     let mut generated = Vec::with_capacity(max_new_tokens);
 
-    let mut next = argmax(&last_logits);
+    let Some(mut next) = sampler.sample_with_history(&last_logits, &generated) else {
+        return generated;
+    };
     for _ in 0..max_new_tokens {
         if let Some(stop) = stop_token {
             if next == stop {
@@ -1112,11 +1139,13 @@ pub fn generate(
         }
         generated.push(next);
         let logits = decode_step(model, &mut cache, next);
-        next = argmax(&logits);
+        match sampler.sample_with_history(&logits, &generated) {
+            Some(t) => next = t,
+            None => break,
+        }
     }
     generated
 }
-
 /// Decode-time attention: one Q-row vs the full cached K/V history.
 ///
 /// `q` is `[n_q_heads * head_dim]`, `k` and `v` are `[seq_len,
@@ -1197,6 +1226,7 @@ fn stack_one_row(prev: &Array2<f32>, new_row: &Array1<f32>) -> Array2<f32> {
     out
 }
 
+#[cfg(test)]
 fn argmax(logits: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best = f32::NEG_INFINITY;
@@ -1219,6 +1249,7 @@ fn run_full_forward(
     model: &BitnetModel,
     token_ids: &[u32],
     mut cache: Option<&mut BitnetKvCache>,
+    mut residuals: Option<&mut Vec<(usize, Vec<f32>)>>,
 ) -> Vec<f32> {
     let seq_len = token_ids.len();
     let hidden = model.embed.shape()[1];
@@ -1339,6 +1370,14 @@ fn run_full_forward(
             for (dst, &src) in h.row_mut(i).iter_mut().zip(ffn_out_row.iter()) {
                 *dst += src;
             }
+        }
+
+        // Capture the last-token residual at this layer for walk
+        // inference's KNN-store override.  Mirrors what the dense
+        // `WalkFfn::take_residuals` produces — same semantic position
+        // (post-FFN-residual at the last prompt token).
+        if let Some(r) = residuals.as_deref_mut() {
+            r.push((layer_idx, h.row(seq_len - 1).to_vec()));
         }
     }
 
@@ -1770,4 +1809,554 @@ fn take_norm(
         )));
     }
     Ok(v)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  generate_streaming_bitnet — token-by-token callback with detok + EOS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Streaming generation for BitNet.  Mirrors the callback shape of
+/// `larql_inference::layer_graph::generate_streaming` so HTTP SSE
+/// route handlers can treat dense and ternary models uniformly.
+///
+/// `on_token(id, surface_text, decode_ms)` fires once per generated
+/// token, in order.  `surface_text` is the cumulative-decode delta
+/// (HF leading-space semantics preserved via [`Detokenizer`]) and may
+/// be empty for tokens that don't grow the decoded string (e.g.
+/// reserved/special tokens with skip_special=true).
+///
+/// `eos` and `sampling` are honoured: stop strings are matched against
+/// the *cumulative* decoded text, EOS token ids halt immediately, and
+/// the sampler can carry temperature/top-K/top-p/penalties.
+///
+/// Returns the count of tokens emitted (excluding the prompt).  Errors
+/// from the prefill (empty prompt, etc.) yield `0` with no callback
+/// invocations \u2014 the route handler gets to decide whether to surface
+/// that as 200 OK with an empty stream or a 4xx.
+pub fn generate_streaming_bitnet<F>(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    prompt_token_ids: &[u32],
+    max_new_tokens: usize,
+    sampling: crate::layer_graph::generate::SamplingConfig,
+    eos: &crate::layer_graph::generate::EosConfig,
+    mut on_token: F,
+) -> usize
+where
+    F: FnMut(u32, &str, f64),
+{
+    if prompt_token_ids.is_empty() || max_new_tokens == 0 {
+        return 0;
+    }
+    let mut sampler = crate::layer_graph::generate::Sampler::new(sampling);
+    let mut detok = crate::layer_graph::generate::Detokenizer::new(tokenizer);
+    detok.seed(prompt_token_ids);
+
+    let (mut cache, last_logits) = prefill(model, prompt_token_ids);
+
+    let Some(mut next) = sampler.sample_with_history(&last_logits, &[]) else {
+        return 0;
+    };
+    let mut emitted = 0usize;
+    let mut history: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+    for _ in 0..max_new_tokens {
+        let step_start = std::time::Instant::now();
+
+        // Stop on a *next* token that matches an EOS id before we
+        // even decode it (cheap path; symmetric with the dense
+        // generate_streaming).
+        if eos.eos_token_ids.contains(&next) {
+            break;
+        }
+
+        // Push to detokeniser, get the cumulative-decode delta.
+        let delta = detok.push(next);
+
+        // EOS by surface form: use the tokenizer-aware variant which
+        // re-decodes without skip-special when the cleaned delta is
+        // empty (catches end-of-turn markers etc.).
+        if eos.is_eos_with_tokenizer(next, &delta, tokenizer) {
+            break;
+        }
+
+        let elapsed = step_start.elapsed().as_secs_f64() * 1000.0;
+        on_token(next, &delta, elapsed);
+        emitted += 1;
+        history.push(next);
+
+        // Decode the next-token logits *after* emitting the current
+        // token so the loop terminates cleanly without an extra
+        // forward at the end.
+        let logits = decode_step(model, &mut cache, next);
+        match sampler.sample_with_history(&logits, &history) {
+            Some(t) => next = t,
+            None => break,
+        }
+    }
+    emitted
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::layer_graph::generate::{EosConfig, SamplingConfig};
+    use larql_compute::cpu::ops::ternary_matvec::BitLinearWeight;
+
+    /// Same fixture as kv_cache_tests but inlined here so the streaming
+    /// suite is self-contained.
+    fn tiny_model() -> BitnetModel {
+        let hidden = 4;
+        let inter = 4;
+        let vocab = 8;
+        let n_heads = 1;
+        let head_dim = hidden / n_heads;
+        let mk_w = |rows: usize, cols: usize, scale: f32| {
+            let mut bytes = vec![0u8; rows * cols / 4];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = match i % 4 {
+                    0 => 0b01_10_00_01,
+                    1 => 0b10_01_01_00,
+                    2 => 0b00_01_10_01,
+                    _ => 0b01_00_01_10,
+                };
+            }
+            BitLinearWeight::new(rows, cols, bytes, vec![scale; rows]).unwrap()
+        };
+        let layer = BitnetLayer {
+            attn_norm: vec![1.0; hidden],
+            attn_q: mk_w(hidden, hidden, 0.3),
+            attn_k: mk_w(hidden, hidden, 0.4),
+            attn_v: mk_w(hidden, hidden, 0.5),
+            attn_sub_norm: vec![1.0; hidden],
+            attn_o: mk_w(hidden, hidden, 0.6),
+            ffn: BitNetFfn {
+                gate: mk_w(inter, hidden, 0.2),
+                up: mk_w(inter, hidden, 0.3),
+                down: mk_w(hidden, inter, 0.7),
+                ffn_norm: vec![1.0; hidden],
+                ffn_sub_norm: vec![1.0; inter],
+                eps: 1e-5,
+            },
+        };
+        BitnetModel {
+            layers: vec![layer],
+            embed: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 7 + j * 3) as f32 % 5.0) - 2.0
+            }),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; hidden],
+            lm_head: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 11 + j * 5) as f32 % 4.0) - 1.5
+            }),
+            eps: 1e-5,
+            head_dim,
+            n_q_heads: n_heads,
+            n_kv_heads: n_heads,
+            rope_base: 10000.0,
+        }
+    }
+
+    fn tiny_tokenizer() -> larql_vindex::tokenizers::Tokenizer {
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap()
+    }
+
+    /// Greedy sampling matches the legacy generate() path token-for-token.
+    /// This is the load-bearing backwards-compat test \u2014 if generate()
+    /// drifts from generate_sampled(SamplingConfig::greedy()) we want
+    /// to know.
+    #[test]
+    fn greedy_generate_sampled_matches_legacy_generate() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1, 2];
+        let legacy = generate(&model, &tok, &prompt, 5, None);
+        let sampled = generate_sampled(&model, &prompt, 5, SamplingConfig::greedy(), None);
+        assert_eq!(legacy, sampled);
+    }
+
+
+    /// Seeded temperature sampling is reproducible: same seed +
+    /// same prompt = same token stream.
+    #[test]
+    fn seeded_sampling_is_deterministic() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let cfg = SamplingConfig::temperature(1.0).with_seed(42);
+        let a = generate_sampled(&model, &prompt, 5, cfg, None);
+        let b = generate_sampled(&model, &prompt, 5, cfg, None);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 5);
+    }
+
+    /// Distinct seeds must produce different streams (with overwhelming
+    /// probability for vocab=8 over 5 tokens).  Lock guards against a
+    /// regression where seeding silently no-ops.
+    #[test]
+    fn distinct_seeds_diverge() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let a = generate_sampled(
+            &model,
+            &prompt,
+            5,
+            SamplingConfig::temperature(1.5).with_seed(1),
+            None,
+        );
+        let b = generate_sampled(
+            &model,
+            &prompt,
+            5,
+            SamplingConfig::temperature(1.5).with_seed(99999),
+            None,
+        );
+        // 8^5 = 32768 distinct streams: ~1-in-32768 odds of accidental match.
+        assert_ne!(a, b, "seeds {{1, 99999}} produced identical streams");
+    }
+
+    /// Sampling filters are applied: top_k=1 with high temperature
+    /// produces a single deterministic stream (only one candidate
+    /// survives top_k=1 truncation, so multinomial degenerates).
+    /// Note: top_k=1 routes through the sampling code path, not the
+    /// `is_greedy()` short-circuit, so it can diverge from raw argmax
+    /// when ties exist in the logits — we only assert that successive
+    /// runs with the same seed match.
+    #[test]
+    fn top_k_one_is_deterministic() {
+        let model = tiny_model();
+        let prompt = vec![0u32, 1];
+        let cfg = SamplingConfig::temperature(2.0)
+            .with_top_k(1)
+            .with_seed(7);
+        let a = generate_sampled(&model, &prompt, 4, cfg, None);
+        let b = generate_sampled(&model, &prompt, 4, cfg, None);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+    }
+
+    /// Streaming callback fires once per emitted token with the
+    /// cumulative-decode delta.
+    #[test]
+    fn streaming_callback_fires_per_token() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1];
+        let mut events: Vec<(u32, String)> = Vec::new();
+        let n = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &prompt,
+            4,
+            SamplingConfig::greedy(),
+            &EosConfig::empty(),
+            |id, text, _ms| events.push((id, text.to_string())),
+        );
+        assert_eq!(n, events.len());
+        assert_eq!(n, 4, "no early EOS");
+        for (id, text) in &events {
+            assert!(!text.is_empty(), "empty delta for token {id}");
+        }
+        let concat: String = events.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(!concat.is_empty(), "concatenated stream surface form was empty");
+    }
+
+    /// EOS token id halts the stream before emitting that token.
+    #[test]
+    fn streaming_stops_on_eos_id() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let prompt = vec![0u32, 1];
+        let baseline = generate_sampled(&model, &prompt, 1, SamplingConfig::greedy(), None);
+        let first = baseline[0];
+
+        let mut emitted = 0;
+        let _ = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &prompt,
+            10,
+            SamplingConfig::greedy(),
+            &EosConfig::empty().with_eos_id(first),
+            |_, _, _| emitted += 1,
+        );
+        assert_eq!(emitted, 0, "first sampled token = EOS id, no emits");
+    }
+
+    /// Empty prompt: zero tokens emitted, no callback invocations.
+    #[test]
+    fn streaming_empty_prompt_emits_nothing() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let mut count = 0;
+        let n = generate_streaming_bitnet(
+            &model,
+            &tok,
+            &[],
+            5,
+            SamplingConfig::greedy(),
+            &EosConfig::empty(),
+            |_, _, _| count += 1,
+        );
+        assert_eq!(n, 0);
+        assert_eq!(count, 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Walk-mode for BitNet: residual capture + KNN-store override
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The dense walk-FFN path (`infer_patched`) replaces the FFN with a
+// gate-index lookup that captures per-layer residuals at the
+// last-token position, then queries an optional `KnnStore` for a
+// retrieval-augmented top-1 swap (cosine > KNN_COSINE_THRESHOLD).
+//
+// On a BitNet 1.58 model the FFN is already ternary and very cheap,
+// so the *compute* benefit of walk-FFN sparse evaluation is dubious.
+// What walk-mode still buys us:
+//
+//   1. Per-layer residual trace, used by LQL `INFER` / `EXPLAIN INFER`
+//      display to show the cosine path through gate features.
+//   2. The KNN-store override for retrieval-augmented top-1 swap.
+//
+// Both are independent of the FFN compute strategy: they only need
+// the residual stream at each layer's exit.  So our BitNet walk
+// implementation runs the standard ternary forward (via
+// `run_full_forward`) with residual capture enabled, then
+// post-processes the same way the dense path does.
+
+/// Run a BitNet forward and return both top-K predictions and
+/// per-layer residuals at the last-token position.  Equivalent to
+/// `predict_bitnet` plus the residual capture from `WalkFfn`.
+///
+/// The residual at layer `i` is `h[seq_len - 1, :]` after that
+/// layer's residual additions (post FFN-residual), matching the
+/// semantic position used by the dense path's
+/// `WalkFfn::take_residuals`.
+pub fn predict_bitnet_with_residuals(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+) -> (Vec<TernaryPrediction>, Vec<(usize, Vec<f32>)>) {
+    if token_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut residuals: Vec<(usize, Vec<f32>)> = Vec::with_capacity(model.layers.len());
+    let logits = run_full_forward(model, token_ids, None, Some(&mut residuals));
+    let preds = softmax_topk(&logits, tokenizer, top_k);
+    (preds, residuals)
+}
+
+/// BitNet walk-mode entry point.  Mirrors the shape of
+/// `larql_inference::infer_patched`: takes a token-id slice + an
+/// optional `KnnStore` and returns the same `InferPatchedResult`
+/// envelope (predictions, model_top1, knn_override, residuals,
+/// walk_ms) so the route handler can dispatch uniformly between
+/// dense and ternary paths.
+///
+/// The "walk" of the name is partial here — we don't replace the
+/// ternary FFN with a gate-index lookup (it's already cheap
+/// enough that the sparse path doesn't pay).  We run the standard
+/// BitNet forward with residual capture enabled, then apply the
+/// same KNN-store override and produce the same output shape.
+/// Future work: a true sparse FFN walk on BitNet would require
+/// per-feature ternary access in `BitLinearWeight` to amortise
+/// the down-projection over selected features only.
+pub fn infer_bitnet_walk(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    knn_store: Option<&larql_vindex::KnnStore>,
+    token_ids: &[u32],
+    top_k: usize,
+) -> crate::forward::InferPatchedResult {
+    let start = std::time::Instant::now();
+    let (preds, residuals) = predict_bitnet_with_residuals(model, tokenizer, token_ids, top_k);
+    let walk_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Convert TernaryPrediction -> (String, f64) for shape parity
+    // with the dense path's InferPatchedResult.
+    let raw: Vec<(String, f64)> = preds
+        .into_iter()
+        .map(|p| (p.token, p.probability))
+        .collect();
+    let model_top1 = raw.first().cloned();
+    let (predictions, knn_override) =
+        crate::forward::apply_knn_override(raw, &residuals, knn_store, top_k);
+
+    crate::forward::InferPatchedResult {
+        predictions,
+        model_top1,
+        knn_override,
+        residuals,
+        walk_ms,
+    }
+}
+
+/// Stable softmax over `logits` followed by top-K selection by
+/// probability.  Pulled out of `predict_bitnet` so
+/// `predict_bitnet_with_residuals` can share the post-processing
+/// without duplicating the loop.
+fn softmax_topk(
+    logits: &[f32],
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    top_k: usize,
+) -> Vec<TernaryPrediction> {
+    if logits.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut probs: Vec<(usize, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, ((v - max_logit) as f64).exp()))
+        .collect();
+    let sum: f64 = probs.iter().map(|(_, p)| p).sum();
+    if sum > 0.0 {
+        for (_, p) in probs.iter_mut() {
+            *p /= sum;
+        }
+    }
+    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    probs
+        .into_iter()
+        .take(top_k)
+        .filter_map(|(token_id, prob)| {
+            tokenizer
+                .id_to_token(token_id as u32)
+                .map(|s| TernaryPrediction {
+                    token: s,
+                    probability: prob,
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use larql_compute::cpu::ops::ternary_matvec::BitLinearWeight;
+
+    fn tiny_model() -> BitnetModel {
+        let hidden = 4;
+        let inter = 4;
+        let vocab = 8;
+        let n_heads = 1;
+        let head_dim = hidden / n_heads;
+        let mk_w = |rows: usize, cols: usize, scale: f32| {
+            let mut bytes = vec![0u8; rows * cols / 4];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = match i % 4 {
+                    0 => 0b01_10_00_01,
+                    1 => 0b10_01_01_00,
+                    2 => 0b00_01_10_01,
+                    _ => 0b01_00_01_10,
+                };
+            }
+            BitLinearWeight::new(rows, cols, bytes, vec![scale; rows]).unwrap()
+        };
+        let mk_layer = || BitnetLayer {
+            attn_norm: vec![1.0; hidden],
+            attn_q: mk_w(hidden, hidden, 0.3),
+            attn_k: mk_w(hidden, hidden, 0.4),
+            attn_v: mk_w(hidden, hidden, 0.5),
+            attn_sub_norm: vec![1.0; hidden],
+            attn_o: mk_w(hidden, hidden, 0.6),
+            ffn: BitNetFfn {
+                gate: mk_w(inter, hidden, 0.2),
+                up: mk_w(inter, hidden, 0.3),
+                down: mk_w(hidden, inter, 0.7),
+                ffn_norm: vec![1.0; hidden],
+                ffn_sub_norm: vec![1.0; inter],
+                eps: 1e-5,
+            },
+        };
+        BitnetModel {
+            layers: vec![mk_layer(), mk_layer()],
+            embed: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 7 + j * 3) as f32 % 5.0) - 2.0
+            }),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; hidden],
+            lm_head: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 11 + j * 5) as f32 % 4.0) - 1.5
+            }),
+            eps: 1e-5,
+            head_dim,
+            n_q_heads: n_heads,
+            n_kv_heads: n_heads,
+            rope_base: 10000.0,
+        }
+    }
+
+    fn tiny_tokenizer() -> larql_vindex::tokenizers::Tokenizer {
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap()
+    }
+
+    /// One residual per layer, captured at the last-token position.
+    /// Width must match `hidden`.
+    #[test]
+    fn predict_bitnet_with_residuals_emits_one_per_layer() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let tokens = vec![0u32, 1, 2];
+        let (preds, residuals) =
+            predict_bitnet_with_residuals(&model, &tok, &tokens, 3);
+        assert_eq!(preds.len(), 3);
+        assert_eq!(residuals.len(), model.layers.len());
+        for (i, (layer_idx, r)) in residuals.iter().enumerate() {
+            assert_eq!(*layer_idx, i, "layer index sequence");
+            assert_eq!(r.len(), model.embed.shape()[1], "hidden width");
+        }
+    }
+
+    /// Top-K from `predict_bitnet_with_residuals` matches the
+    /// legacy `predict_bitnet` (same top-K tokens in the same order).
+    /// Guards against drift in the shared softmax_topk helper.
+    #[test]
+    fn predict_with_residuals_matches_legacy_top_k() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let tokens = vec![0u32, 1, 2, 3];
+        let legacy = predict_bitnet(&model, &tok, &tokens, 5);
+        let (with_res, _) = predict_bitnet_with_residuals(&model, &tok, &tokens, 5);
+        assert_eq!(legacy.len(), with_res.len());
+        for (a, b) in legacy.iter().zip(with_res.iter()) {
+            assert_eq!(a.token, b.token);
+            assert!(
+                (a.probability - b.probability).abs() < 1e-9,
+                "{} vs {}",
+                a.probability,
+                b.probability,
+            );
+        }
+    }
+
+    /// `infer_bitnet_walk` with no KNN store: knn_override is None,
+    /// predictions == raw bitnet predictions, model_top1 = predictions[0].
+    #[test]
+    fn walk_without_knn_store_passes_predictions_through() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let tokens = vec![0u32, 1, 2];
+        let result = infer_bitnet_walk(&model, &tok, None, &tokens, 4);
+        assert!(result.knn_override.is_none());
+        assert_eq!(result.predictions.len(), 4);
+        let raw = predict_bitnet(&model, &tok, &tokens, 4);
+        assert_eq!(result.predictions.len(), raw.len());
+        assert_eq!(result.model_top1.as_ref().unwrap().0, raw[0].token);
+    }
+
+    /// Empty tokens: walk returns empty everything, doesn't panic.
+    #[test]
+    fn walk_empty_tokens_returns_empty() {
+        let model = tiny_model();
+        let tok = tiny_tokenizer();
+        let result = infer_bitnet_walk(&model, &tok, None, &[], 5);
+        assert!(result.predictions.is_empty());
+        assert!(result.residuals.is_empty());
+        assert!(result.model_top1.is_none());
+    }
 }

@@ -452,6 +452,103 @@ fn stream_chat_completion(
     let chat_id = format!("chatcmpl-{}", new_id_suffix());
 
     tokio::task::spawn_blocking(move || {
+        // BitNet (--keep-quant) vindexes take the native-ternary
+        // streaming path.  Constrained generation (json schema /
+        // tools) is not yet wired on this path — it would need a
+        // ternary-aware logit-mask hook in the decode loop — so we
+        // surface a clean error chunk in that case rather than
+        // silently producing wrong output.
+        if model.is_bitnet() {
+            if tools_active || constrained_schema.is_some() {
+                let _ = tx.blocking_send(error_chunk(
+                    "tools / constrained generation not supported on BitNet \
+                     (--keep-quant) models yet",
+                ));
+                return;
+            }
+            let bitnet_guard = match model.get_or_load_bitnet() {
+                Ok(g) => g,
+                Err(e) => {
+                    let _ = tx.blocking_send(error_chunk(&e));
+                    return;
+                }
+            };
+            let bitnet: &larql_inference::ternary::BitnetModel = &bitnet_guard;
+            // Apply chat template against an empty ModelWeights
+            // — the template lookup falls back to the tokenizer
+            // chat_template field when weights aren't supplied.
+            let template = pick_template(&model, None);
+            let prompt = render(template, &messages);
+            let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx.blocking_send(error_chunk(&format!("tokenize: {e}")));
+                    return;
+                }
+            };
+            let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+            if prompt_ids.is_empty() {
+                let _ = tx.blocking_send(error_chunk(
+                    "rendered prompt tokenises to empty",
+                ));
+                return;
+            }
+
+            // Initial role=assistant chunk — OpenAI contract.
+            let first = build_chat_chunk(
+                &chat_id, &model_id, Some(ASSISTANT_ROLE), None, None,
+            );
+            if tx.blocking_send(first).is_err() {
+                return;
+            }
+
+            let (sampling, eos) =
+                super::util::build_sampling_eos(sampling_params, &stop_strings);
+            let chat_id_cb = chat_id.clone();
+            let model_id_cb = model_id.clone();
+            let tx_cb = tx.clone();
+            let stop_strings_cb = stop_strings.clone();
+            let mut early_stop = false;
+            let mut emitted = 0usize;
+            let mut buffered = String::new();
+            let _ = larql_inference::ternary::generate_streaming_bitnet(
+                bitnet,
+                &model.tokenizer,
+                &prompt_ids,
+                max_tokens,
+                sampling,
+                &eos,
+                |_id, text, _ms| {
+                    if early_stop {
+                        return;
+                    }
+                    let chunk = build_chat_chunk(
+                        &chat_id_cb, &model_id_cb, None, Some(text), None,
+                    );
+                    if tx_cb.blocking_send(chunk).is_err() {
+                        early_stop = true;
+                        return;
+                    }
+                    buffered.push_str(text);
+                    emitted += 1;
+                    if !stop_strings_cb.is_empty()
+                        && contains_any(&buffered, &stop_strings_cb)
+                    {
+                        early_stop = true;
+                    }
+                },
+            );
+            let finish_reason: &'static str = if early_stop || emitted < max_tokens {
+                "stop"
+            } else {
+                "length"
+            };
+            let final_chunk =
+                build_chat_chunk(&chat_id, &model_id, None, None, Some(finish_reason));
+            let _ = tx.blocking_send(final_chunk);
+            return;
+        }
+
         let mut weights_guard = match model.lock_weights_for_gen() {
             Ok(w) => w,
             Err(e) => {
