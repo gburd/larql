@@ -536,18 +536,45 @@ fn run_gguf_to_vindex(
     // BitNet --keep-quant: write the I2_S bytes + per-channel scales
     // and stamp `bitnet_layout` into index.json.
     if do_keep_quant {
-        let rms_eps = gguf
-            .metadata
-            .get("bitnet-b1.58.attention.layer_norm_rms_epsilon")
-            .and_then(|v| v.as_f64())
-            .map(|f| f as f32)
-            .unwrap_or(1e-5);
+        // Pull the architecture dims out of the GGUF metadata so the
+        // BitnetLayout in index.json carries everything the runtime
+        // loader needs.  Defaults match BitNet b1.58 2 B 4 T; we
+        // override per-key when the metadata supplies a value.
+        let arch_get_u32 = |k: &str| {
+            gguf.metadata
+                .get(k)
+                .and_then(|v| v.as_u32())
+                .map(|n| n as usize)
+        };
+        let arch_get_f32 = |k: &str| gguf.metadata.get(k).and_then(|v| v.as_f64());
+        let mut arch = larql_vindex::extract::bitnet_writer::BitnetArchMeta::default();
+        if let Some(eps) = arch_get_f32("bitnet-b1.58.attention.layer_norm_rms_epsilon") {
+            arch.rms_eps = eps as f32;
+        }
+        if let Some(d) = arch_get_u32("bitnet-b1.58.rope.dimension_count") {
+            arch.head_dim = d;
+        }
+        if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count") {
+            arch.n_q_heads = n;
+        }
+        if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count_kv") {
+            arch.n_kv_heads = n;
+        }
+        if let Some(r) = arch_get_f32("bitnet-b1.58.rope.freq_base") {
+            arch.rope_base = r;
+        }
         let layout =
-            larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(output, &weights, rms_eps)?;
+            larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(output, &weights, arch)?;
         eprintln!(
-            "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries",
+            "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries \
+             (heads={}q/{}kv, head_dim={}, eps={:.0e}, rope_base={})",
             layout.tensors.len(),
             layout.total_scale_count,
+            arch.n_q_heads,
+            arch.n_kv_heads,
+            arch.head_dim,
+            arch.rms_eps,
+            arch.rope_base,
         );
         // Patch index.json with bitnet_layout = layout.
         patch_index_json_with_bitnet_layout(output, &layout)?;

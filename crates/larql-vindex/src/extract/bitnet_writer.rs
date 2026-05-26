@@ -54,6 +54,29 @@ const BITLINEAR_KEY_SUFFIXES: &[&str] = &[
     ".ffn_down.weight",
 ];
 
+/// Architecture metadata captured from the source GGUF at convert
+/// time so the loader doesn't have to re-parse it.
+#[derive(Debug, Clone, Copy)]
+pub struct BitnetArchMeta {
+    pub rms_eps: f32,
+    pub head_dim: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub rope_base: f64,
+}
+
+impl Default for BitnetArchMeta {
+    fn default() -> Self {
+        Self {
+            rms_eps: 1e-5,
+            head_dim: 128,
+            n_q_heads: 20,
+            n_kv_heads: 5,
+            rope_base: 10000.0,
+        }
+    }
+}
+
 /// Write the BitNet `bitnet/` subdirectory + layout JSON.
 ///
 /// `weights` must contain the *raw I2_S bytes* in `raw_bytes` for
@@ -70,7 +93,7 @@ const BITLINEAR_KEY_SUFFIXES: &[&str] = &[
 pub fn write_bitnet_artifacts(
     out_dir: &Path,
     weights: &ModelWeights,
-    rms_eps: f32,
+    arch: BitnetArchMeta,
 ) -> Result<BitnetLayout, VindexError> {
     let bitnet_dir = out_dir.join(BITNET_DIR);
     std::fs::create_dir_all(&bitnet_dir)?;
@@ -179,7 +202,11 @@ pub fn write_bitnet_artifacts(
     let layout = BitnetLayout {
         tensors: entries,
         total_scale_count: all_scales.len(),
-        rms_eps,
+        rms_eps: arch.rms_eps,
+        head_dim: arch.head_dim,
+        n_q_heads: arch.n_q_heads,
+        n_kv_heads: arch.n_kv_heads,
+        rope_base: arch.rope_base,
     };
 
     // Sidecar layout JSON (the same content also lands in index.json,

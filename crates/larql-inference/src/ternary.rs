@@ -881,3 +881,893 @@ mod predict_tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KV-cached decode
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Closes the "single-shot prefill, no KV cache" gap from the
+// v0.3.0-bitnet release notes.  Three-piece API:
+//
+//   prefill(model, tokens) -> (BitnetKvCache, last_logits)
+//      Run prefill over the full prompt, accumulating per-layer K/V
+//      across all positions.  Returns the cache + the next-token
+//      logits at the last prompt position.
+//
+//   decode_step(model, cache, new_token) -> next_logits
+//      Append one token: project Q/K/V for it, append K/V to the
+//      cache, run causal-masked attention against the entire cached
+//      history (not against the new K/V alone — that would lose
+//      context), apply the rest of the layer stack, return logits.
+//
+//   generate(model, tokenizer, prompt, max_new_tokens, sampler) -> String
+//      Convenience wrapper that runs prefill then decodes step by
+//      step until either (a) max_new_tokens reached or (b) the
+//      sampler returns a stop signal.
+//
+// The cache is opaque to callers — they hold it across decode_step
+// calls but never mutate it directly.  Per-layer storage is
+// `Vec<Array2<f32>>` (one [past_len, n_kv_heads * head_dim] tensor
+// per layer for K and V respectively); the cache grows by one row
+// per decode_step.
+
+/// Per-layer K/V projections accumulated across all positions seen
+/// so far.  Held by the caller across decode steps.
+#[derive(Clone)]
+pub struct BitnetKvCache {
+    /// `k[layer]` is `[past_len, n_kv_heads * head_dim]` f32.
+    /// Always RoPE-applied at the position the row represents.
+    pub k: Vec<Array2<f32>>,
+    /// `v[layer]` is `[past_len, n_kv_heads * head_dim]` f32.
+    pub v: Vec<Array2<f32>>,
+    /// Number of positions accumulated so far.  Equal to
+    /// `k[0].shape()[0]` for every layer; tracked separately so we
+    /// can construct an empty cache without choosing a layer count.
+    pub seq_len: usize,
+}
+
+impl BitnetKvCache {
+    /// Empty cache sized for `n_layers`.  Each per-layer `k`/`v`
+    /// starts with zero rows; rows are appended one-at-a-time as
+    /// decode_step or prefill runs.
+    pub fn new(n_layers: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        let kv_width = n_kv_heads * head_dim;
+        Self {
+            k: (0..n_layers).map(|_| Array2::zeros((0, kv_width))).collect(),
+            v: (0..n_layers).map(|_| Array2::zeros((0, kv_width))).collect(),
+            seq_len: 0,
+        }
+    }
+}
+
+/// Run the full prompt through every layer, accumulating K/V into a
+/// fresh cache.  Returns the cache + raw logits at the last position
+/// (caller decides sampling / softmax / top-K).
+///
+/// Equivalent to `predict_bitnet` minus the top-K extraction.
+pub fn prefill(model: &BitnetModel, token_ids: &[u32]) -> (BitnetKvCache, Vec<f32>) {
+    let n_layers = model.layers.len();
+    let mut cache = BitnetKvCache::new(n_layers, model.n_kv_heads, model.head_dim);
+    if token_ids.is_empty() {
+        let vocab = model.lm_head.shape()[0];
+        return (cache, vec![0.0; vocab]);
+    }
+    let logits = run_full_forward(model, token_ids, Some(&mut cache));
+    (cache, logits)
+}
+
+/// Append one new token to an existing cache and return the logits
+/// for that position.  Caller picks the sampling strategy.
+///
+/// Internally: position = cache.seq_len; the new token's Q sees
+/// causal-masked attention against the full cached K/V plus its own
+/// row.
+pub fn decode_step(
+    model: &BitnetModel,
+    cache: &mut BitnetKvCache,
+    new_token: u32,
+) -> Vec<f32> {
+    let position = cache.seq_len;
+    let hidden = model.embed.shape()[1];
+    let head_dim = model.head_dim;
+    let n_q_heads = model.n_q_heads;
+    let n_kv_heads = model.n_kv_heads;
+    let kv_width = n_kv_heads * head_dim;
+    let q_width = n_q_heads * head_dim;
+    debug_assert_eq!(q_width, hidden, "hidden = n_q_heads * head_dim");
+
+    // 1. Embed the new token.
+    let mut h = Array1::<f32>::zeros(hidden);
+    let row = model.embed.row(new_token as usize % model.embed.shape()[0]);
+    for (dst, &src) in h.iter_mut().zip(row.iter()) {
+        *dst = src * model.embed_scale;
+    }
+
+    let mut x_norm = vec![0.0f32; hidden];
+    let mut q = vec![0.0f32; q_width];
+    let mut k = vec![0.0f32; kv_width];
+    let mut v = vec![0.0f32; kv_width];
+    let mut attn_pool = vec![0.0f32; hidden];
+    let mut attn_pool_norm = vec![0.0f32; hidden];
+    let mut attn_out = vec![0.0f32; hidden];
+    let mut ffn_x_norm = vec![0.0f32; hidden];
+    let mut ffn_gate = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_up = vec![0.0f32; model.layers[0].ffn.up.rows];
+    let mut ffn_hid = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_out_row = vec![0.0f32; hidden];
+
+    for (layer_idx, layer) in model.layers.iter().enumerate() {
+        // a. attn_norm.
+        rmsnorm_into(h.as_slice().unwrap(), &layer.attn_norm, model.eps, &mut x_norm);
+
+        // b. Q/K/V projections.
+        matvec_i2s_f32_into(&layer.attn_q, &x_norm, &mut q).expect("attn_q shape");
+        matvec_i2s_f32_into(&layer.attn_k, &x_norm, &mut k).expect("attn_k shape");
+        matvec_i2s_f32_into(&layer.attn_v, &x_norm, &mut v).expect("attn_v shape");
+
+        // c. RoPE on the new token's Q + K only.  The cached K
+        //    already carries RoPE for positions 0..position-1.
+        let q_arr = Array2::from_shape_vec((1, q_width), q.clone()).expect("q shape");
+        let k_arr = Array2::from_shape_vec((1, kv_width), k.clone()).expect("k shape");
+        let q_rotated = larql_compute::attention::rope::apply_rope_partial_at(
+            &q_arr,
+            n_q_heads,
+            head_dim,
+            model.rope_base,
+            1.0,
+            position,
+        );
+        let k_rotated = larql_compute::attention::rope::apply_rope_partial_at(
+            &k_arr,
+            n_kv_heads,
+            head_dim,
+            model.rope_base,
+            1.0,
+            position,
+        );
+
+        // d. Append K/V rows to the per-layer cache.  ndarray has no
+        //    cheap append, so we rebuild — cache growth is O(n) total
+        //    across n_layers per decode_step which is fine for our
+        //    workloads (max_new_tokens typically ≤ 256, hidden ≤ 4k).
+        let new_k_row = k_rotated.row(0).to_owned();
+        let new_v_row = Array1::from(v.clone());
+        cache.k[layer_idx] = stack_one_row(&cache.k[layer_idx], &new_k_row);
+        cache.v[layer_idx] = stack_one_row(&cache.v[layer_idx], &new_v_row);
+
+        // e. Causal-masked GQA attention: new Q vs cached K/V (which
+        //    now includes our just-appended row).
+        let q_view = q_rotated.row(0);
+        attention_decode_into(
+            q_view.as_slice().unwrap(),
+            cache.k[layer_idx].view(),
+            cache.v[layer_idx].view(),
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            &mut attn_pool,
+        );
+
+        // f. Sub-norm + O projection.
+        rmsnorm_into(&attn_pool, &layer.attn_sub_norm, model.eps, &mut attn_pool_norm);
+        matvec_i2s_f32_into(&layer.attn_o, &attn_pool_norm, &mut attn_out)
+            .expect("attn_o shape");
+
+        // g. Residual + FFN + residual.
+        for (dst, &src) in h.iter_mut().zip(attn_out.iter()) {
+            *dst += src;
+        }
+        rmsnorm_into(h.as_slice().unwrap(), &layer.ffn.ffn_norm, model.eps, &mut ffn_x_norm);
+        ffn_forward_after_input_norm(
+            &layer.ffn,
+            &ffn_x_norm,
+            model.eps,
+            &mut ffn_gate,
+            &mut ffn_up,
+            &mut ffn_hid,
+            &mut ffn_out_row,
+        );
+        for (dst, &src) in h.iter_mut().zip(ffn_out_row.iter()) {
+            *dst += src;
+        }
+    }
+
+    cache.seq_len += 1;
+
+    // h_final = output_norm(h)
+    let mut h_final = vec![0.0f32; hidden];
+    rmsnorm_into(h.as_slice().unwrap(), &model.output_norm, model.eps, &mut h_final);
+    let h_arr = Array1::from(h_final);
+    model.lm_head.dot(&h_arr).to_vec()
+}
+
+/// Generate up to `max_new_tokens` greedily from `prompt`.  Stops
+/// early if `stop_token` is produced.  Returns the decoded text of
+/// the generated tokens (does not include the prompt).
+///
+/// For the route-handler use case this is a "one-shot" surface:
+/// pg_infer's /v1/infer wants a single text completion, not a
+/// streaming SSE.  Streaming is a follow-up (the cache is the
+/// load-bearing piece; streaming just hands the caller an iterator).
+pub fn generate(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    prompt_token_ids: &[u32],
+    max_new_tokens: usize,
+    stop_token: Option<u32>,
+) -> Vec<u32> {
+    if prompt_token_ids.is_empty() || max_new_tokens == 0 {
+        return Vec::new();
+    }
+    let _ = tokenizer; // tokenizer is reserved for stop-string detection; greedy decode here
+    let (mut cache, last_logits) = prefill(model, prompt_token_ids);
+    let mut generated = Vec::with_capacity(max_new_tokens);
+
+    let mut next = argmax(&last_logits);
+    for _ in 0..max_new_tokens {
+        if let Some(stop) = stop_token {
+            if next == stop {
+                break;
+            }
+        }
+        generated.push(next);
+        let logits = decode_step(model, &mut cache, next);
+        next = argmax(&logits);
+    }
+    generated
+}
+
+/// Decode-time attention: one Q-row vs the full cached K/V history.
+///
+/// `q` is `[n_q_heads * head_dim]`, `k` and `v` are `[seq_len,
+/// n_kv_heads * head_dim]`.  Result is written to `out` (length
+/// `n_q_heads * head_dim`).
+fn attention_decode_into(
+    q: &[f32],
+    k: ArrayView2<f32>,
+    v: ArrayView2<f32>,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    let seq_len = k.shape()[0];
+    debug_assert_eq!(v.shape()[0], seq_len);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let groups = n_q_heads / n_kv_heads.max(1);
+
+    for o in out.iter_mut() {
+        *o = 0.0;
+    }
+
+    for h_q in 0..n_q_heads {
+        let h_kv = h_q / groups.max(1);
+        let q_off = h_q * head_dim;
+        let kv_off = h_kv * head_dim;
+
+        // Scores over the full cached K (no causal mask — position
+        // is at the end, attends to all of 0..seq_len-1 + itself,
+        // which equals the full prefix).
+        let mut scores = vec![0.0f32; seq_len];
+        for (j, score) in scores.iter_mut().enumerate() {
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q[q_off + d] * k[(j, kv_off + d)];
+            }
+            *score = dot * scale;
+        }
+
+        // Stable softmax.
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - max_score).exp();
+            sum += *s;
+        }
+        if sum > 0.0 {
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+        }
+
+        // out[q_head] = Σ_j w[j] * v[j, kv_head]
+        for (j, &w) in scores.iter().enumerate() {
+            if w == 0.0 {
+                continue;
+            }
+            for d in 0..head_dim {
+                out[q_off + d] += w * v[(j, kv_off + d)];
+            }
+        }
+    }
+}
+
+/// Append one row to a 2D ndarray.  ndarray has no built-in append;
+/// we rebuild and copy.
+fn stack_one_row(prev: &Array2<f32>, new_row: &Array1<f32>) -> Array2<f32> {
+    let cols = prev.shape()[1];
+    debug_assert_eq!(new_row.len(), cols);
+    let new_rows = prev.shape()[0] + 1;
+    let mut out = Array2::<f32>::zeros((new_rows, cols));
+    if !prev.is_empty() {
+        out.slice_mut(ndarray::s![..new_rows - 1, ..])
+            .assign(prev);
+    }
+    out.row_mut(new_rows - 1).assign(new_row);
+    out
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best_idx = 0u32;
+    let mut best = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best {
+            best = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
+}
+
+/// Shared-spine forward used by both `prefill` (when `cache=Some`) and
+/// the legacy single-shot `predict_bitnet`.  When `cache` is `Some`,
+/// per-layer K/V are pushed in (after RoPE) so a subsequent
+/// `decode_step` can extend the sequence.
+///
+/// Returns logits at the last position only.
+fn run_full_forward(
+    model: &BitnetModel,
+    token_ids: &[u32],
+    mut cache: Option<&mut BitnetKvCache>,
+) -> Vec<f32> {
+    let seq_len = token_ids.len();
+    let hidden = model.embed.shape()[1];
+    let head_dim = model.head_dim;
+    let n_q_heads = model.n_q_heads;
+    let n_kv_heads = model.n_kv_heads;
+    debug_assert_eq!(n_q_heads * head_dim, hidden);
+
+    let mut h = Array2::<f32>::zeros((seq_len, hidden));
+    for (i, &tok) in token_ids.iter().enumerate() {
+        let row = model.embed.row(tok as usize % model.embed.shape()[0]);
+        let mut h_row = h.row_mut(i);
+        for (dst, &src) in h_row.iter_mut().zip(row.iter()) {
+            *dst = src * model.embed_scale;
+        }
+    }
+
+    let mut x_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut q = Array2::<f32>::zeros((seq_len, n_q_heads * head_dim));
+    let mut k = Array2::<f32>::zeros((seq_len, n_kv_heads * head_dim));
+    let mut v = Array2::<f32>::zeros((seq_len, n_kv_heads * head_dim));
+    let mut attn_pool = Array2::<f32>::zeros((seq_len, hidden));
+    let mut attn_pool_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut attn_out = Array2::<f32>::zeros((seq_len, hidden));
+    let mut ffn_x_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut ffn_gate = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_up = vec![0.0f32; model.layers[0].ffn.up.rows];
+    let mut ffn_hid = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_out_row = vec![0.0f32; hidden];
+
+    for (layer_idx, layer) in model.layers.iter().enumerate() {
+        for i in 0..seq_len {
+            rmsnorm_into(
+                h.row(i).as_slice().unwrap(),
+                &layer.attn_norm,
+                model.eps,
+                x_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+        }
+        for i in 0..seq_len {
+            matvec_i2s_f32_into(
+                &layer.attn_q,
+                x_norm.row(i).as_slice().unwrap(),
+                q.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_q shape");
+            matvec_i2s_f32_into(
+                &layer.attn_k,
+                x_norm.row(i).as_slice().unwrap(),
+                k.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_k shape");
+            matvec_i2s_f32_into(
+                &layer.attn_v,
+                x_norm.row(i).as_slice().unwrap(),
+                v.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_v shape");
+        }
+
+        let q_rot = larql_compute::attention::rope::apply_rope(
+            &q, n_q_heads, head_dim, model.rope_base,
+        );
+        let k_rot = larql_compute::attention::rope::apply_rope(
+            &k, n_kv_heads, head_dim, model.rope_base,
+        );
+
+        attn_pool.fill(0.0);
+        scaled_dot_product_attention_gqa(
+            q_rot.view(),
+            k_rot.view(),
+            v.view(),
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            attn_pool.view_mut(),
+        );
+
+        // If a cache is being built, capture the prefill K/V for
+        // this layer (post-RoPE for K, pre-anything for V).
+        if let Some(c) = cache.as_deref_mut() {
+            c.k[layer_idx] = k_rot.clone();
+            c.v[layer_idx] = v.clone();
+        }
+
+        for i in 0..seq_len {
+            rmsnorm_into(
+                attn_pool.row(i).as_slice().unwrap(),
+                &layer.attn_sub_norm,
+                model.eps,
+                attn_pool_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+            matvec_i2s_f32_into(
+                &layer.attn_o,
+                attn_pool_norm.row(i).as_slice().unwrap(),
+                attn_out.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_o shape");
+        }
+        h += &attn_out;
+
+        for i in 0..seq_len {
+            rmsnorm_into(
+                h.row(i).as_slice().unwrap(),
+                &layer.ffn.ffn_norm,
+                model.eps,
+                ffn_x_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+            ffn_forward_after_input_norm(
+                &layer.ffn,
+                ffn_x_norm.row(i).as_slice().unwrap(),
+                model.eps,
+                &mut ffn_gate,
+                &mut ffn_up,
+                &mut ffn_hid,
+                &mut ffn_out_row,
+            );
+            for (dst, &src) in h.row_mut(i).iter_mut().zip(ffn_out_row.iter()) {
+                *dst += src;
+            }
+        }
+    }
+
+    if let Some(c) = cache {
+        c.seq_len = seq_len;
+    }
+
+    let last_h = h.row(seq_len - 1).to_owned();
+    let mut h_final = vec![0.0f32; hidden];
+    rmsnorm_into(
+        last_h.as_slice().unwrap(),
+        &model.output_norm,
+        model.eps,
+        &mut h_final,
+    );
+    let h_arr = Array1::from(h_final);
+    model.lm_head.dot(&h_arr).to_vec()
+}
+
+#[cfg(test)]
+mod kv_cache_tests {
+    use super::*;
+    use larql_compute::cpu::ops::ternary_matvec::BitLinearWeight;
+
+    /// Reusable tiny model factory: hidden=4, vocab=8, 1 head, 1 layer.
+    fn tiny_model() -> BitnetModel {
+        let hidden = 4;
+        let inter = 4;
+        let vocab = 8;
+        let n_heads = 1;
+        let head_dim = hidden / n_heads;
+        let mk_w = |rows: usize, cols: usize, scale: f32| {
+            // Cycle through ternary patterns so the matvec output
+            // varies meaningfully across rows.
+            let mut bytes = vec![0u8; rows * cols / 4];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = match i % 4 {
+                    0 => 0b01_10_00_01,
+                    1 => 0b10_01_01_00,
+                    2 => 0b00_01_10_01,
+                    _ => 0b01_00_01_10,
+                };
+            }
+            BitLinearWeight::new(rows, cols, bytes, vec![scale; rows]).unwrap()
+        };
+        let layer = BitnetLayer {
+            attn_norm: vec![1.0; hidden],
+            attn_q: mk_w(hidden, hidden, 0.3),
+            attn_k: mk_w(hidden, hidden, 0.4),
+            attn_v: mk_w(hidden, hidden, 0.5),
+            attn_sub_norm: vec![1.0; hidden],
+            attn_o: mk_w(hidden, hidden, 0.6),
+            ffn: BitNetFfn {
+                gate: mk_w(inter, hidden, 0.2),
+                up: mk_w(inter, hidden, 0.3),
+                down: mk_w(hidden, inter, 0.7),
+                ffn_norm: vec![1.0; hidden],
+                ffn_sub_norm: vec![1.0; inter],
+                eps: 1e-5,
+            },
+        };
+        BitnetModel {
+            layers: vec![layer],
+            embed: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 7 + j * 3) as f32 % 5.0) - 2.0
+            }),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; hidden],
+            lm_head: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 11 + j * 5) as f32 % 4.0) - 1.5
+            }),
+            eps: 1e-5,
+            head_dim,
+            n_q_heads: n_heads,
+            n_kv_heads: n_heads,
+            rope_base: 10000.0,
+        }
+    }
+
+    /// `prefill` should produce exactly the same logits as
+    /// `predict_bitnet` produces internally for the last position.
+    /// (predict_bitnet returns top-K after softmax; prefill returns
+    /// raw logits, so we re-derive the softmax here for comparison.)
+    #[test]
+    fn prefill_logits_match_predict_bitnet_top1() {
+        let model = tiny_model();
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+        let tokens = vec![0u32, 1, 2, 3];
+        let preds = predict_bitnet(&model, &tokenizer, &tokens, 1);
+        let (_cache, logits) = prefill(&model, &tokens);
+        let argmax_logit = argmax(&logits);
+        let predicted = tokenizer.id_to_token(argmax_logit).unwrap();
+        assert_eq!(preds[0].token, predicted);
+    }
+
+    /// Prefill cache should hold one row per token in K and V.
+    #[test]
+    fn prefill_populates_cache_rows() {
+        let model = tiny_model();
+        let tokens = vec![0u32, 1, 2, 3, 4];
+        let (cache, _logits) = prefill(&model, &tokens);
+        assert_eq!(cache.seq_len, tokens.len());
+        for (k_layer, v_layer) in cache.k.iter().zip(cache.v.iter()) {
+            assert_eq!(k_layer.shape()[0], tokens.len());
+            assert_eq!(v_layer.shape()[0], tokens.len());
+        }
+    }
+
+    /// A decode_step appends one row to each layer's K and V cache.
+    #[test]
+    fn decode_step_grows_cache_by_one() {
+        let model = tiny_model();
+        let tokens = vec![0u32, 1, 2];
+        let (mut cache, _) = prefill(&model, &tokens);
+        let before = cache.seq_len;
+        let logits = decode_step(&model, &mut cache, 5);
+        assert_eq!(cache.seq_len, before + 1);
+        assert_eq!(cache.k[0].shape()[0], before + 1);
+        assert_eq!(cache.v[0].shape()[0], before + 1);
+        assert_eq!(logits.len(), model.lm_head.shape()[0]);
+    }
+
+    /// Greedy generate on a tiny model returns the requested number
+    /// of tokens (or stops at stop_token).
+    #[test]
+    fn generate_produces_max_new_tokens() {
+        let model = tiny_model();
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        let prompt = vec![0u32, 1];
+        let out = generate(&model, &tokenizer, &prompt, 4, None);
+        assert_eq!(out.len(), 4);
+        for &id in &out {
+            assert!(id < 8, "vocab=8");
+        }
+    }
+
+    /// Decode equivalence: prefilling N tokens then decoding one
+    /// must produce the same logits as prefilling all N+1 tokens
+    /// for the last position.  This is the load-bearing correctness
+    /// test for the cache.
+    #[test]
+    fn decode_step_matches_full_prefill_at_last_position() {
+        let model = tiny_model();
+        let tokens = vec![0u32, 1, 2, 3];
+
+        // Path 1: prefill all then read last_logits.
+        let (_, logits_full) = prefill(&model, &tokens);
+
+        // Path 2: prefill the prefix, decode the last token, read
+        // the resulting logits.
+        let (mut cache, _) = prefill(&model, &tokens[..tokens.len() - 1]);
+        let logits_decoded = decode_step(&model, &mut cache, *tokens.last().unwrap());
+
+        // Equivalence within fp noise.  Tolerance is generous because
+        // the decode path uses apply_rope_partial_at while the
+        // prefill path uses apply_rope, which are subtly different
+        // kernels but produce identical output at integer positions.
+        assert_eq!(logits_full.len(), logits_decoded.len());
+        for (i, (a, b)) in logits_full.iter().zip(logits_decoded.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff < 1e-3,
+                "logit {i}: prefill={a} decoded={b} diff={diff}"
+            );
+        }
+    }
+
+    /// argmax is stable and returns the right index.
+    #[test]
+    fn argmax_picks_max() {
+        assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax(&[5.0, 0.0, -1.0]), 0);
+        // Ties resolve to the first occurrence (consistent with
+        // strict `>` test).
+        assert_eq!(argmax(&[2.0, 2.0, 2.0]), 0);
+    }
+
+    /// Empty prompt for generate: returns no new tokens.
+    #[test]
+    fn generate_empty_prompt_returns_empty() {
+        let model = tiny_model();
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        let out = generate(&model, &tokenizer, &[], 5, None);
+        assert!(out.is_empty());
+    }
+
+    /// Stop token short-circuits generation.
+    #[test]
+    fn generate_stops_on_stop_token() {
+        let model = tiny_model();
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]},"added_tokens":[]}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        let prompt = vec![0u32, 1];
+        // Set stop_token = the next-token argmax for this tiny
+        // model.  We compute it via prefill.
+        let (_, logits) = prefill(&model, &prompt);
+        let first_pred = argmax(&logits);
+        let out = generate(&model, &tokenizer, &prompt, 10, Some(first_pred));
+        // Generate breaks before pushing the stop token.
+        assert!(
+            !out.contains(&first_pred),
+            "stop_token leaked into output: {out:?}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  load_bitnet_model — construct a BitnetModel from a `--keep-quant` vindex
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Errors surfaced by [`load_bitnet_model`].  Distinct from the
+/// underlying VindexError so callers can pattern-match on
+/// "tensor missing" cleanly.
+#[derive(Debug)]
+pub enum BitnetLoadError {
+    Vindex(larql_vindex::VindexError),
+    Model(larql_models::ModelError),
+    NotBitnet(String),
+    MissingTensor(String),
+    Shape(String),
+}
+
+impl std::fmt::Display for BitnetLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BitnetLoadError::Vindex(e) => write!(f, "vindex: {e}"),
+            BitnetLoadError::Model(e) => write!(f, "model: {e}"),
+            BitnetLoadError::NotBitnet(msg) => write!(f, "not a bitnet vindex: {msg}"),
+            BitnetLoadError::MissingTensor(name) => {
+                write!(f, "missing required tensor: {name}")
+            }
+            BitnetLoadError::Shape(msg) => write!(f, "shape mismatch: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for BitnetLoadError {}
+
+impl From<larql_vindex::VindexError> for BitnetLoadError {
+    fn from(e: larql_vindex::VindexError) -> Self {
+        BitnetLoadError::Vindex(e)
+    }
+}
+
+impl From<larql_models::ModelError> for BitnetLoadError {
+    fn from(e: larql_models::ModelError) -> Self {
+        BitnetLoadError::Model(e)
+    }
+}
+
+/// Load a complete `BitnetModel` from a `--keep-quant` vindex
+/// directory.  Reads:
+///
+///   index.json         — config + bitnet_layout
+///   embeddings.bin     — embed table (F16 or F32; auto-detected)
+///   norms.bin (etc.)   — per-layer attn_norm / sub_norm / ffn_norm /
+///                         sub_norm + output_norm (via the standard
+///                         dense loader, with `skip_attn` and
+///                         `skip_ffn` so the BitLinear projections
+///                         aren't dequantised into f32)
+///   bitnet/<...>.i2s   — ternary BitLinear bytes
+///   bitnet/scales.f32  — concatenated per-channel scales
+///
+/// LM head: BitNet b1.58 ties output to `token_embd.weight`
+/// (verified on `microsoft/bitnet-b1.58-2B-4T-gguf`); we use the
+/// same `embed` matrix as `lm_head` when the dense loader didn't
+/// surface a separate `lm_head.weight` (the dense loader's tying
+/// logic already handles this).
+///
+/// # Errors
+/// `BitnetLoadError::NotBitnet` when index.json lacks
+/// `bitnet_layout`.  Other variants surface tensor-shape /
+/// I/O failures from the underlying loaders.
+pub fn load_bitnet_model(vindex_path: &std::path::Path) -> Result<BitnetModel, BitnetLoadError> {
+    let config = larql_vindex::load_vindex_config(vindex_path)?;
+    let layout = config.bitnet_layout.clone().ok_or_else(|| {
+        BitnetLoadError::NotBitnet(format!(
+            "{} has no bitnet_layout in index.json (rebuild with `--keep-quant`)",
+            vindex_path.display()
+        ))
+    })?;
+
+    // 1. Dense parts: embed, lm_head, per-layer norms, output_norm.
+    //
+    //    skip_attn + skip_ffn keeps load_model_weights_with_opts from
+    //    expanding the I2_S BitLinears into f32 (which would defeat
+    //    the entire memory-savings story).  RMSnorm vectors don't
+    //    match either pattern so they survive.
+    let opts = larql_vindex::LoadWeightsOptions {
+        skip_attn: true,
+        skip_ffn: true,
+        skip_lm_head: false,
+        skip_embed: false,
+    };
+    let mut callbacks = larql_vindex::SilentLoadCallbacks;
+    let dense = larql_vindex::load_model_weights_with_opts(vindex_path, &mut callbacks, opts)?;
+
+    // 2. Ternary BitLinears.
+    let bitnet = larql_vindex::extract::bitnet_loader::load_bitnet_weights(vindex_path)?;
+
+    // 3. Embed scale (vocabulary-aware) — the dense loader already
+    //    yields `dense.embed` with `embed_scale` applied if relevant;
+    //    keep ours at 1.0 because BitNet b1.58 doesn't scale embeddings.
+    let embed_scale = 1.0;
+    let embed = dense.embed.to_owned();
+    let lm_head = dense.lm_head.to_owned();
+    let hidden = config.hidden_size;
+    let n_layers = config.num_layers;
+
+    // 4. Per-layer norms.  The keys in dense.vectors are the
+    //    GGUF-canonical names (already prefix-stripped by the loader).
+    let mut layers = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        let attn_norm = take_norm(&dense, &format!("blk.{i}.attn_norm.weight"), hidden)?;
+        let attn_sub_norm =
+            take_norm(&dense, &format!("blk.{i}.attn_sub_norm.weight"), hidden)?;
+        let ffn_norm = take_norm(&dense, &format!("blk.{i}.ffn_norm.weight"), hidden)?;
+        let inter = config.intermediate_size;
+        let ffn_sub_norm = take_norm(&dense, &format!("blk.{i}.ffn_sub_norm.weight"), inter)?;
+
+        let attn_q = bitnet
+            .tensors
+            .get(&format!("blk.{i}.attn_q.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_q.weight")))?;
+        let attn_k = bitnet
+            .tensors
+            .get(&format!("blk.{i}.attn_k.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_k.weight")))?;
+        let attn_v = bitnet
+            .tensors
+            .get(&format!("blk.{i}.attn_v.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_v.weight")))?;
+        let attn_o = bitnet
+            .tensors
+            .get(&format!("blk.{i}.attn_output.weight"))
+            .cloned()
+            .ok_or_else(|| {
+                BitnetLoadError::MissingTensor(format!("blk.{i}.attn_output.weight"))
+            })?;
+        let ffn_gate = bitnet
+            .tensors
+            .get(&format!("blk.{i}.ffn_gate.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_gate.weight")))?;
+        let ffn_up = bitnet
+            .tensors
+            .get(&format!("blk.{i}.ffn_up.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_up.weight")))?;
+        let ffn_down = bitnet
+            .tensors
+            .get(&format!("blk.{i}.ffn_down.weight"))
+            .cloned()
+            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_down.weight")))?;
+
+        let ffn = BitNetFfn {
+            gate: ffn_gate,
+            up: ffn_up,
+            down: ffn_down,
+            ffn_norm,
+            ffn_sub_norm,
+            eps: layout.rms_eps,
+        };
+
+        layers.push(BitnetLayer {
+            attn_norm,
+            attn_q,
+            attn_k,
+            attn_v,
+            attn_sub_norm,
+            attn_o,
+            ffn,
+        });
+    }
+
+    // 5. output_norm.
+    let output_norm = dense
+        .vectors
+        .get("output_norm.weight")
+        .cloned()
+        .ok_or_else(|| BitnetLoadError::MissingTensor("output_norm.weight".into()))?;
+
+    Ok(BitnetModel {
+        layers,
+        embed,
+        embed_scale,
+        output_norm,
+        lm_head,
+        eps: layout.rms_eps,
+        head_dim: layout.head_dim.max(1),
+        n_q_heads: layout.n_q_heads.max(1),
+        n_kv_heads: layout.n_kv_heads.max(1),
+        rope_base: if layout.rope_base > 0.0 {
+            layout.rope_base
+        } else {
+            10000.0
+        },
+    })
+}
+
+/// Pluck a 1D norm vector out of `dense.vectors` and validate its
+/// length.
+fn take_norm(
+    dense: &larql_models::ModelWeights,
+    key: &str,
+    expected_len: usize,
+) -> Result<Vec<f32>, BitnetLoadError> {
+    let v = dense
+        .vectors
+        .get(key)
+        .cloned()
+        .ok_or_else(|| BitnetLoadError::MissingTensor(key.to_string()))?;
+    if v.len() != expected_len {
+        return Err(BitnetLoadError::Shape(format!(
+            "{key}: len {} != expected {}",
+            v.len(),
+            expected_len
+        )));
+    }
+    Ok(v)
+}
