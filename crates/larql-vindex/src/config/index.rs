@@ -115,10 +115,29 @@ pub struct BitnetLayout {
     /// not re-parse the source.
     #[serde(default = "default_rms_eps")]
     pub rms_eps: f32,
+    /// Dimension of one attention head.  Read from
+    /// `*.rope.dimension_count` (= `head_dim` for BitNet b1.58).
+    /// Loaders use this + `n_q_heads` to decompose Q/K/V projections
+    /// into per-head subvectors.
+    #[serde(default)]
+    pub head_dim: usize,
+    /// Number of query heads. From `*.attention.head_count`.
+    #[serde(default)]
+    pub n_q_heads: usize,
+    /// Number of key/value heads (GQA).  From `*.attention.head_count_kv`.
+    #[serde(default)]
+    pub n_kv_heads: usize,
+    /// RoPE theta (base).  From `*.rope.freq_base` (or its f32 cousin).
+    #[serde(default = "default_rope_base")]
+    pub rope_base: f64,
 }
 
 fn default_rms_eps() -> f32 {
     1e-5
+}
+
+fn default_rope_base() -> f64 {
+    10000.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
