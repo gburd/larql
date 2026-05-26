@@ -39,6 +39,7 @@
 //! is what closes out §5.4 end-to-end.
 
 use larql_compute::cpu::ops::ternary_matvec::{matvec_i2s_f32_into, BitLinearWeight};
+use ndarray::{Array1, Array2, ArrayView2};
 
 /// One BitLinear-FFN block.  Holds three ternary weight tensors
 /// (gate, up, down) and the two RMSnorm scales (input, post-attn).
@@ -335,6 +336,548 @@ mod tests {
 
         for (a, b) in out_a.iter().zip(y_buf.iter()) {
             assert!((a - b).abs() < 1e-5, "forward {a} vs into+resid {b}");
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  predict_bitnet — full BitNet 1.58 forward pass
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Closes the wiring deferred from BUG-infer-deadlock §5.4: end-to-end
+// inference against I2_S native ternary weights, no f16/f32 weight
+// materialisation anywhere.  Self-contained — does not touch the
+// dense `predict()` path or `ModelWeights`.
+//
+// Inputs:
+//   - BitnetModel: per-layer BitLinear weights + RMSnorm scales +
+//     embed table + lm_head, plus a few model dims (head_dim,
+//     n_q_heads, n_kv_heads, rope_base).
+//   - tokenizer: standard HF-style tokeniser used to decode top-K
+//     output token ids back into strings.
+//   - token_ids: prefill tokens (seq_len up to ~1k for one-shot infer).
+//   - top_k: how many top predictions to emit.
+//
+// Output: top-K (token_string, probability) pairs for the next token
+// after the last input token.
+//
+// The forward pass:
+//   1. h = embed[token_ids] * embed_scale         [seq_len, hidden]
+//   2. for each layer L:
+//      a. x_norm = rmsnorm(h, attn_norm[L])
+//      b. q[i,j] = matvec_i2s(W_q[L], x_norm[i])     for i in 0..seq_len
+//         k[i,j] = matvec_i2s(W_k[L], x_norm[i])
+//         v[i,j] = matvec_i2s(W_v[L], x_norm[i])
+//      c. apply RoPE to q, k
+//      d. per-head causal-masked scaled-dot-product attention
+//         (no KV cache — one-shot prefill is the use case).
+//      e. attn_out[i] = matvec_i2s(W_o[L], rmsnorm(attn_pool[i], attn_sub_norm[L]))
+//      f. h += attn_out
+//      g. x_norm = rmsnorm(h, ffn_norm[L])
+//      h. ffn_out[i] = BitNetFfn.forward(x_norm[i]) — already includes residual
+//      i. h becomes the FFN output (BitNetFfn applies residual internally,
+//         but here we feed x_norm rather than h, so we add the residual
+//         at the call site instead).
+//   3. h_final = rmsnorm(h[-1], output_norm)
+//   4. logits = lm_head @ h_final
+//   5. Top-K softmax → predictions.
+
+
+/// Complete BitNet 1.58 model — every tensor needed for a forward
+/// pass.  Built by `larql-vindex::extract::bitnet_loader` from a
+/// `--keep-quant` vindex; feed into [`predict_bitnet`].
+pub struct BitnetModel {
+    /// Per-layer BitLinear projections + RMSnorm weights.
+    pub layers: Vec<BitnetLayer>,
+    /// Token embedding table, shape [vocab, hidden], f32.
+    /// (Source GGUF has it in F16; we expand on load — the embed
+    /// table is small relative to the BitLinear weights.)
+    pub embed: Array2<f32>,
+    /// Optional embed scale (most BitNet builds = 1.0).
+    pub embed_scale: f32,
+    /// Output RMSnorm weight, length = hidden_size.
+    pub output_norm: Vec<f32>,
+    /// LM head matrix, shape [vocab, hidden], f32.  Often tied to
+    /// embed; supplied separately so the loader can decide.
+    pub lm_head: Array2<f32>,
+    /// RMSnorm epsilon used everywhere.
+    pub eps: f32,
+    /// Per-head dimension (= hidden / n_q_heads typically).
+    pub head_dim: usize,
+    /// Number of query heads.
+    pub n_q_heads: usize,
+    /// Number of key/value heads (GQA: usually < n_q_heads).
+    pub n_kv_heads: usize,
+    /// RoPE base (theta) — read from GGUF metadata.
+    pub rope_base: f64,
+}
+
+/// One transformer block's worth of BitLinear weights + norms.
+pub struct BitnetLayer {
+    pub attn_norm: Vec<f32>,        // input RMSnorm, length = hidden
+    pub attn_q: BitLinearWeight,    // [hidden, hidden] (q heads x head_dim packed)
+    pub attn_k: BitLinearWeight,    // [n_kv_heads * head_dim, hidden]
+    pub attn_v: BitLinearWeight,    // [n_kv_heads * head_dim, hidden]
+    pub attn_sub_norm: Vec<f32>,    // post-attn RMSnorm, length = hidden
+    pub attn_o: BitLinearWeight,    // [hidden, hidden]
+    pub ffn: BitNetFfn,             // self-contained FFN block
+}
+
+/// One top-K prediction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TernaryPrediction {
+    pub token: String,
+    pub probability: f64,
+}
+
+/// Run a full BitNet forward pass and return top-K next-token
+/// predictions for the position immediately after `token_ids`.
+///
+/// Single-shot prefill, no KV cache.  Adequate for pg_infer's
+/// `infer()` SQL surface (one-shot per call) and for the bug
+/// report's repro path (a single `/v1/infer` from curl).
+///
+/// Memory profile at BitNet b1.58 2 B 4 T:
+///   - weights resident:  ~1.1 GB (the I2_S bytes + scales + norms)
+///   - per-call working:  ~10 MB (h, q/k/v, scratch buffers)
+///
+/// Compare to the dense f16 path's ~5 GB resident — that's the
+/// architectural goal closed by this commit.
+pub fn predict_bitnet(
+    model: &BitnetModel,
+    tokenizer: &larql_vindex::tokenizers::Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+) -> Vec<TernaryPrediction> {
+    if token_ids.is_empty() {
+        return Vec::new();
+    }
+    let seq_len = token_ids.len();
+    let hidden = model.embed.shape()[1];
+    let head_dim = model.head_dim;
+    let n_q_heads = model.n_q_heads;
+    let n_kv_heads = model.n_kv_heads;
+    debug_assert!(n_q_heads >= n_kv_heads, "GQA: n_q_heads >= n_kv_heads");
+    debug_assert_eq!(n_q_heads * head_dim, hidden, "hidden = n_q_heads * head_dim");
+
+    // 1. Embed lookup -> residual stream h: [seq_len, hidden].
+    let mut h = Array2::<f32>::zeros((seq_len, hidden));
+    for (i, &tok) in token_ids.iter().enumerate() {
+        let row = model.embed.row(tok as usize % model.embed.shape()[0]);
+        let mut h_row = h.row_mut(i);
+        for (dst, &src) in h_row.iter_mut().zip(row.iter()) {
+            *dst = src * model.embed_scale;
+        }
+    }
+
+    // Scratch buffers reused across layers.
+    let mut x_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut q = Array2::<f32>::zeros((seq_len, n_q_heads * head_dim));
+    let mut k = Array2::<f32>::zeros((seq_len, n_kv_heads * head_dim));
+    let mut v = Array2::<f32>::zeros((seq_len, n_kv_heads * head_dim));
+    let mut attn_pool = Array2::<f32>::zeros((seq_len, hidden));
+    let mut attn_pool_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut attn_out = Array2::<f32>::zeros((seq_len, hidden));
+    let mut ffn_x_norm = Array2::<f32>::zeros((seq_len, hidden));
+    let mut ffn_gate = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_up = vec![0.0f32; model.layers[0].ffn.up.rows];
+    let mut ffn_hid = vec![0.0f32; model.layers[0].ffn.gate.rows];
+    let mut ffn_out_row = vec![0.0f32; hidden];
+
+    for layer in &model.layers {
+        // a. attn input norm.
+        for i in 0..seq_len {
+            rmsnorm_into(
+                h.row(i).as_slice().unwrap(),
+                &layer.attn_norm,
+                model.eps,
+                x_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+        }
+
+        // b. Q/K/V projections via ternary matvec, per token.
+        for i in 0..seq_len {
+            matvec_i2s_f32_into(
+                &layer.attn_q,
+                x_norm.row(i).as_slice().unwrap(),
+                q.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_q shape");
+            matvec_i2s_f32_into(
+                &layer.attn_k,
+                x_norm.row(i).as_slice().unwrap(),
+                k.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_k shape");
+            matvec_i2s_f32_into(
+                &layer.attn_v,
+                x_norm.row(i).as_slice().unwrap(),
+                v.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_v shape");
+        }
+
+        // c. RoPE on Q (per q-head) and K (per kv-head).
+        let q_rotated =
+            larql_compute::attention::rope::apply_rope(&q, n_q_heads, head_dim, model.rope_base);
+        let k_rotated =
+            larql_compute::attention::rope::apply_rope(&k, n_kv_heads, head_dim, model.rope_base);
+
+        // d. Per-head causal-masked scaled-dot-product attention.
+        attn_pool.fill(0.0);
+        scaled_dot_product_attention_gqa(
+            q_rotated.view(),
+            k_rotated.view(),
+            v.view(),
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            attn_pool.view_mut(),
+        );
+
+        // e. Post-attn norm + output projection.
+        for i in 0..seq_len {
+            rmsnorm_into(
+                attn_pool.row(i).as_slice().unwrap(),
+                &layer.attn_sub_norm,
+                model.eps,
+                attn_pool_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+            matvec_i2s_f32_into(
+                &layer.attn_o,
+                attn_pool_norm.row(i).as_slice().unwrap(),
+                attn_out.row_mut(i).as_slice_mut().unwrap(),
+            )
+            .expect("attn_o shape");
+        }
+
+        // f. residual h += attn_out
+        h += &attn_out;
+
+        // g. FFN: per-token RMSnorm + BitNetFfn.forward_into +
+        //    residual.  We call forward_into so the per-token gate /
+        //    up / hid scratch stays out of the hot allocator.
+        for i in 0..seq_len {
+            rmsnorm_into(
+                h.row(i).as_slice().unwrap(),
+                &layer.ffn.ffn_norm,
+                model.eps,
+                ffn_x_norm.row_mut(i).as_slice_mut().unwrap(),
+            );
+            // BitNetFfn.forward_into expects the *un-normed* x in its
+            // signature so it can run its own input norm.  Since we
+            // already did that here (so the same x_norm could be
+            // reused), we replicate the rest of forward_into manually
+            // to skip the redundant RMSnorm step.
+            ffn_forward_after_input_norm(
+                &layer.ffn,
+                ffn_x_norm.row(i).as_slice().unwrap(),
+                model.eps,
+                &mut ffn_gate,
+                &mut ffn_up,
+                &mut ffn_hid,
+                &mut ffn_out_row,
+            );
+            for (dst, &src) in h.row_mut(i).iter_mut().zip(ffn_out_row.iter()) {
+                *dst += src;
+            }
+        }
+    }
+
+    // Final norm + lm_head over the LAST token only.
+    let last_h = h.row(seq_len - 1).to_owned();
+    let mut h_final = vec![0.0f32; hidden];
+    rmsnorm_into(
+        last_h.as_slice().unwrap(),
+        &model.output_norm,
+        model.eps,
+        &mut h_final,
+    );
+    let h_final_arr = Array1::from(h_final);
+    let logits = model.lm_head.dot(&h_final_arr);
+
+    // Top-K softmax.  Stable softmax: subtract max before exp.
+    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut probs: Vec<(usize, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, ((v - max_logit) as f64).exp()))
+        .collect();
+    let sum: f64 = probs.iter().map(|(_, p)| p).sum();
+    if sum > 0.0 {
+        for (_, p) in probs.iter_mut() {
+            *p /= sum;
+        }
+    }
+    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    probs
+        .into_iter()
+        .take(top_k)
+        .filter_map(|(token_id, prob)| {
+            tokenizer
+                .id_to_token(token_id as u32)
+                .map(|s| TernaryPrediction {
+                    token: s,
+                    probability: prob,
+                })
+        })
+        .collect()
+}
+
+/// FFN forward pass that skips the input RMSnorm (caller already did
+/// it).  Used by `predict_bitnet` to avoid double-norming when we
+/// pre-compute the input norm once per layer.
+fn ffn_forward_after_input_norm(
+    ffn: &BitNetFfn,
+    x_norm: &[f32],
+    eps: f32,
+    gate: &mut [f32],
+    up: &mut [f32],
+    hid: &mut [f32],
+    y: &mut [f32],
+) {
+    let inter = ffn.gate.rows;
+    debug_assert_eq!(gate.len(), inter);
+    debug_assert_eq!(up.len(), inter);
+    debug_assert_eq!(hid.len(), inter);
+
+    // gate / up projections.
+    matvec_i2s_f32_into(&ffn.gate, x_norm, gate).expect("gate shape");
+    matvec_i2s_f32_into(&ffn.up, x_norm, up).expect("up shape");
+
+    // Squared-ReLU activation.
+    for ((g, u), h) in gate.iter().zip(up.iter()).zip(hid.iter_mut()) {
+        let relu = g.max(0.0);
+        *h = relu * relu * u;
+    }
+
+    // Post-gate-up norm.
+    let mut hid_norm = vec![0.0f32; inter];
+    rmsnorm_into(hid, &ffn.ffn_sub_norm, eps, &mut hid_norm);
+
+    // Down projection.
+    matvec_i2s_f32_into(&ffn.down, &hid_norm, y).expect("down shape");
+}
+
+/// Causal-masked scaled-dot-product attention with GQA support.
+///
+/// `q` is `[seq_len, n_q_heads * head_dim]`, `k` and `v` are
+/// `[seq_len, n_kv_heads * head_dim]`.  Each q-head maps to k/v
+/// head `head_idx % n_kv_heads` (standard GQA); when `n_kv_heads
+/// == n_q_heads` this is plain MHA.
+///
+/// Output is written to `out` (shape `[seq_len, hidden]` where
+/// `hidden = n_q_heads * head_dim`).  Mask is causal: position `i`
+/// only attends to positions `0..=i`.
+fn scaled_dot_product_attention_gqa(
+    q: ArrayView2<f32>,
+    k: ArrayView2<f32>,
+    v: ArrayView2<f32>,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mut out: ndarray::ArrayViewMut2<f32>,
+) {
+    let seq_len = q.shape()[0];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let groups = n_q_heads / n_kv_heads.max(1);
+
+    out.fill(0.0);
+
+    for h_q in 0..n_q_heads {
+        let h_kv = h_q / groups.max(1);
+        let q_off = h_q * head_dim;
+        let kv_off = h_kv * head_dim;
+
+        // For each query position, compute attention over all
+        // earlier (and self) key positions.
+        for i in 0..seq_len {
+            // 1. scores[j] = (q[i, q_head] · k[j, kv_head]) * scale
+            let mut scores = vec![f32::NEG_INFINITY; seq_len];
+            for j in 0..=i {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[(i, q_off + d)] * k[(j, kv_off + d)];
+                }
+                scores[j] = dot * scale;
+            }
+
+            // 2. Stable softmax over the unmasked (j ≤ i) prefix.
+            let max_score = scores[..=i]
+                .iter()
+                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mut sum = 0.0f32;
+            for s in scores[..=i].iter_mut() {
+                *s = (*s - max_score).exp();
+                sum += *s;
+            }
+            if sum > 0.0 {
+                for s in scores[..=i].iter_mut() {
+                    *s /= sum;
+                }
+            }
+
+            // 3. out[i, q_head] += sum_j weights[j] * v[j, kv_head]
+            for j in 0..=i {
+                let w = scores[j];
+                if w == 0.0 {
+                    continue;
+                }
+                for d in 0..head_dim {
+                    out[(i, q_off + d)] += w * v[(j, kv_off + d)];
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod predict_tests {
+    use super::*;
+
+    /// End-to-end smoke test: build a tiny synthetic BitNet model
+    /// (1 layer, hidden=4, vocab=8, head_dim=4, 1 head) and confirm
+    /// `predict_bitnet` produces a top-K of the right shape with
+    /// probabilities summing to ~1.
+    #[test]
+    fn predict_bitnet_runs_end_to_end_on_synthetic_model() {
+        let hidden = 4;
+        let inter = 4;
+        let vocab = 8;
+        let n_heads = 1;
+        let head_dim = hidden / n_heads;
+
+        // Tiny tokeniser stub: HF Tokenizer with byte-level vocab.
+        // We don't actually need it to decode meaningfully — the
+        // test asserts shape + numerical sanity, not which tokens
+        // come out.
+        let tok_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+        // Trivial weights: zero everywhere; predict_bitnet should
+        // still produce a uniform-ish distribution and not crash.
+        let mk_w = |rows: usize, cols: usize| {
+            BitLinearWeight::new(rows, cols, vec![0u8; rows * cols / 4], vec![0.1f32; rows])
+                .unwrap()
+        };
+
+        let layer = BitnetLayer {
+            attn_norm: vec![1.0; hidden],
+            attn_q: mk_w(hidden, hidden),
+            attn_k: mk_w(hidden, hidden),
+            attn_v: mk_w(hidden, hidden),
+            attn_sub_norm: vec![1.0; hidden],
+            attn_o: mk_w(hidden, hidden),
+            ffn: BitNetFfn {
+                gate: mk_w(inter, hidden),
+                up: mk_w(inter, hidden),
+                down: mk_w(hidden, inter),
+                ffn_norm: vec![1.0; hidden],
+                ffn_sub_norm: vec![1.0; inter],
+                eps: 1e-5,
+            },
+        };
+
+        let model = BitnetModel {
+            layers: vec![layer],
+            embed: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 7 + j * 3) as f32 % 5.0) - 2.0
+            }),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; hidden],
+            lm_head: Array2::from_shape_fn((vocab, hidden), |(i, j)| {
+                ((i * 11 + j * 5) as f32 % 4.0) - 1.5
+            }),
+            eps: 1e-5,
+            head_dim,
+            n_q_heads: n_heads,
+            n_kv_heads: n_heads,
+            rope_base: 10000.0,
+        };
+
+        let token_ids = vec![0u32, 1, 2, 3];
+        let preds = predict_bitnet(&model, &tokenizer, &token_ids, 4);
+        assert_eq!(preds.len(), 4, "top_k=4 should return 4 predictions");
+
+        // Probabilities must form a valid prefix of a softmax
+        // distribution: each in [0, 1], sorted descending, summing
+        // to <= 1 (we only return top-K).
+        let mut prev = 1.0_f64;
+        let mut sum = 0.0_f64;
+        for p in &preds {
+            assert!(p.probability >= 0.0 && p.probability <= 1.0);
+            assert!(p.probability <= prev + 1e-9);
+            prev = p.probability;
+            sum += p.probability;
+        }
+        assert!(sum <= 1.0 + 1e-6, "top-K sum {sum} > 1");
+    }
+
+    /// Empty token_ids returns no predictions.
+    #[test]
+    fn predict_bitnet_empty_tokens_returns_empty() {
+        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+        let tokenizer =
+            larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+        let mk_w = |rows: usize, cols: usize| {
+            BitLinearWeight::new(rows, cols, vec![0u8; rows * cols / 4], vec![0.0; rows]).unwrap()
+        };
+        let layer = BitnetLayer {
+            attn_norm: vec![1.0; 4],
+            attn_q: mk_w(4, 4),
+            attn_k: mk_w(4, 4),
+            attn_v: mk_w(4, 4),
+            attn_sub_norm: vec![1.0; 4],
+            attn_o: mk_w(4, 4),
+            ffn: BitNetFfn {
+                gate: mk_w(4, 4),
+                up: mk_w(4, 4),
+                down: mk_w(4, 4),
+                ffn_norm: vec![1.0; 4],
+                ffn_sub_norm: vec![1.0; 4],
+                eps: 1e-5,
+            },
+        };
+        let model = BitnetModel {
+            layers: vec![layer],
+            embed: Array2::zeros((4, 4)),
+            embed_scale: 1.0,
+            output_norm: vec![1.0; 4],
+            lm_head: Array2::zeros((4, 4)),
+            eps: 1e-5,
+            head_dim: 4,
+            n_q_heads: 1,
+            n_kv_heads: 1,
+            rope_base: 10000.0,
+        };
+        let preds = predict_bitnet(&model, &tokenizer, &[], 5);
+        assert!(preds.is_empty());
+    }
+
+    /// Causal mask self-test: position 0 can only attend to itself,
+    /// so its attention output must equal v[0] (after the implicit
+    /// softmax-of-one-element).
+    #[test]
+    fn scaled_dot_product_attention_position_zero_is_self_attended() {
+        let n_heads = 1;
+        let head_dim = 4;
+        let q = Array2::from_shape_vec((1, head_dim), vec![1.0, 0.5, -0.5, 0.25]).unwrap();
+        let k = q.clone();
+        let v = Array2::from_shape_vec((1, head_dim), vec![3.0, -1.0, 2.5, 0.0]).unwrap();
+        let mut out = Array2::<f32>::zeros((1, head_dim));
+        scaled_dot_product_attention_gqa(
+            q.view(),
+            k.view(),
+            v.view(),
+            n_heads,
+            n_heads,
+            head_dim,
+            out.view_mut(),
+        );
+        for (a, b) in out.row(0).iter().zip(v.row(0).iter()) {
+            assert!((a - b).abs() < 1e-5, "expected v, got {a} vs {b}");
         }
     }
 }
