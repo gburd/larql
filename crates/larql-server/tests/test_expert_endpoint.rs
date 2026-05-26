@@ -199,6 +199,7 @@ fn make_loaded_model(
 
     let config = VindexConfig {
         version: 2,
+        bitnet_layout: None,
         model: "test-moe".to_string(),
         family: "test".to_string(),
         source: None,
@@ -279,6 +280,9 @@ fn make_loaded_model(
         embed_store: None,
         release_mmap_after_request: false,
         weights: lock,
+        weights_init: std::sync::Mutex::new(()),
+        bitnet_model: std::sync::OnceLock::new(),
+        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

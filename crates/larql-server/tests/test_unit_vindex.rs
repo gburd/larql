@@ -83,6 +83,7 @@ fn test_embeddings() -> Array2<f32> {
 fn test_config() -> VindexConfig {
     VindexConfig {
         version: 2,
+        bitnet_layout: None,
         model: "test/model-4".to_string(),
         family: "test".to_string(),
         source: None,

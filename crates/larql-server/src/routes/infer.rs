@@ -87,6 +87,50 @@ fn run_infer(
         ));
     }
 
+    // BitNet 1.58 (--keep-quant) vindex: take the native-ternary
+    // forward path.  Skips dense weight loading entirely (~5 GB
+    // saved on a 2 B BitNet) and runs predict_bitnet against the
+    // pre-loaded BitnetModel.  Walk-mode is not yet supported on
+    // the ternary path — the patched-vindex KNN store would need
+    // ternary-aware embeddings; for now BitNet always answers in
+    // dense-mode shape.
+    if model.is_bitnet() {
+        let _ = session_id; // sessions not wired into bitnet path yet
+        let bitnet_guard = model
+            .get_or_load_bitnet()
+            .map_err(ServerError::InferenceUnavailable)?;
+        let bitnet: &larql_inference::ternary::BitnetModel = &bitnet_guard;
+
+        let encoding = model
+            .tokenizer
+            .encode(req.prompt.as_str(), true)
+            .map_err(|e| ServerError::Internal(format!("tokenize error: {e}")))?;
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        if token_ids.is_empty() {
+            return Err(ServerError::BadRequest("empty prompt".into()));
+        }
+
+        let start = std::time::Instant::now();
+        let pred =
+            larql_inference::ternary::predict_bitnet(bitnet, &model.tokenizer, &token_ids, req.top);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+        let pred_pairs: Vec<(String, f64)> = pred
+            .into_iter()
+            .map(|p| (p.token, p.probability))
+            .collect();
+        let predictions = format_predictions(&pred_pairs);
+        let mut result = serde_json::Map::new();
+        result.insert("prompt".into(), serde_json::json!(req.prompt));
+        result.insert("predictions".into(), serde_json::json!(predictions));
+        result.insert("mode".into(), serde_json::json!("bitnet"));
+        result.insert(
+            "latency_ms".into(),
+            serde_json::json!((elapsed * 10.0).round() / 10.0),
+        );
+        return Ok(serde_json::Value::Object(result));
+    }
+
     if !model.config.has_model_weights
         && model.config.extract_level != larql_vindex::ExtractLevel::Inference
         && model.config.extract_level != larql_vindex::ExtractLevel::All
