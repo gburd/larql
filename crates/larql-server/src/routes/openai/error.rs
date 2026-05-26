@@ -100,6 +100,16 @@ impl OpenAIError {
             code: None,
         }
     }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: message.into(),
+            error_type: "timeout_error",
+            param: None,
+            code: None,
+        }
+    }
 }
 
 impl From<ServerError> for OpenAIError {
@@ -109,6 +119,7 @@ impl From<ServerError> for OpenAIError {
             ServerError::NotFound(m) => OpenAIError::not_found(m),
             ServerError::InferenceUnavailable(m) => OpenAIError::service_unavailable(m),
             ServerError::Internal(m) => OpenAIError::server_error(m),
+            ServerError::Timeout(m) => OpenAIError::timeout(m),
         }
     }
 }

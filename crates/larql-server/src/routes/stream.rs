@@ -722,6 +722,7 @@ mod tests {
             api_key: None,
             sessions: SessionManager::new(3600),
             describe_cache: DescribeCache::new(0),
+            infer_timeout: std::time::Duration::from_secs(60),
         })
     }
 

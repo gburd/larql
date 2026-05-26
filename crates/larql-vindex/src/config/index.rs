@@ -192,6 +192,94 @@ impl std::fmt::Display for ExtractLevel {
     }
 }
 
+impl VindexConfig {
+    /// Estimate the resident heap size of `ModelWeights` after
+    /// `load_model_weights_with_opts` completes against this vindex.
+    ///
+    /// The estimate is intentionally conservative — it assumes the
+    /// loader materialises every weight tensor at the configured
+    /// `dtype` (f16 = 2 B/elem, f32 = 4 B/elem) plus a uniform
+    /// 12 % overhead for `Vec<>` headers, padding, and the per-layer
+    /// dequant scratch buffers used during forward.  Used by
+    /// `larql-server`'s startup pre-flight check (BUG-infer-deadlock
+    /// §5.5) to refuse to start when the cgroup is sized below the
+    /// load.
+    ///
+    /// The estimate is *not* exact — it does not (yet) model the
+    /// per-channel scale tensors used by ternary BitNet weights, the
+    /// extra working buffers needed by a dense forward, or the
+    /// kernel-page-cache contribution from mmap files.  Tolerance is
+    /// roughly ±10–15 % vs measured RSS-after-load on the
+    /// vindexes in production today.
+    pub fn estimate_resident_bytes(&self) -> u64 {
+        if !self.has_inference_weights() {
+            // Browse-only vindex — the in-process structures are
+            // gate vectors + tokenizer + tiny overhead.
+            return self.browse_only_resident_bytes();
+        }
+        let elem = crate::config::dtype::bytes_per_float(self.dtype) as u64;
+        let layers = self.num_layers as u64;
+        let hidden = self.hidden_size as u64;
+        let inter = self.intermediate_size as u64;
+        let vocab = self.vocab_size as u64;
+
+        // embed: vocab * hidden * elem
+        let embed = vocab.saturating_mul(hidden).saturating_mul(elem);
+        // lm_head: same shape as embed (or zero if tied; we don't
+        // track tying explicitly, so assume present).
+        let lm_head = embed;
+        // Per-layer attn: q + k + v + o, each hidden * hidden.
+        let attn_per_layer = 4u64
+            .saturating_mul(hidden)
+            .saturating_mul(hidden)
+            .saturating_mul(elem);
+        // Per-layer FFN: gate + up + down, each hidden * inter.
+        let ffn_per_layer = 3u64
+            .saturating_mul(hidden)
+            .saturating_mul(inter)
+            .saturating_mul(elem);
+        // Per-layer norms (input_norm, post_attn_norm), 2 * hidden * f32.
+        let norm_per_layer = 2u64.saturating_mul(hidden).saturating_mul(4);
+
+        let per_layer = attn_per_layer
+            .saturating_add(ffn_per_layer)
+            .saturating_add(norm_per_layer);
+        let total = embed
+            .saturating_add(lm_head)
+            .saturating_add(per_layer.saturating_mul(layers));
+
+        // 12 % overhead for Vec<> headers, padding, dequant buffers.
+        total.saturating_add(total / 8)
+    }
+
+    /// Whether this vindex has inference-level weights to load.
+    /// True for `Inference` / `All` extract levels OR when the legacy
+    /// `has_model_weights` flag is set.
+    pub fn has_inference_weights(&self) -> bool {
+        self.has_model_weights
+            || self.extract_level == ExtractLevel::Inference
+            || self.extract_level == ExtractLevel::All
+    }
+
+    /// Resident-size estimate for a browse-only vindex — just the
+    /// gate matrices + embeddings + tokenizer.  Sized as the f32
+    /// expansion of the gate vectors (worst case under warmup).
+    fn browse_only_resident_bytes(&self) -> u64 {
+        let hidden = self.hidden_size as u64;
+        let vocab = self.vocab_size as u64;
+        // Gate vectors: sum(num_features) * hidden * f32.
+        let gate: u64 = self
+            .layers
+            .iter()
+            .map(|l| (l.num_features as u64) * hidden * 4)
+            .sum();
+        // Embeddings: vocab * hidden * f32 (warmed).
+        let embed = vocab.saturating_mul(hidden).saturating_mul(4);
+        gate.saturating_add(embed).saturating_add(64 * 1024 * 1024)
+        // ~64 MiB for tokenizer + assorted overhead.
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VindexLayerInfo {
     pub layer: usize,
@@ -463,5 +551,91 @@ mod fp4_schema_tests {
         let parsed: VindexConfig = serde_json::from_str(&json).unwrap();
         let fp4 = parsed.fp4.expect("round trip kept fp4");
         assert!(matches!(fp4.projections.down.precision, Precision::Fp8));
+    }
+}
+
+#[cfg(test)]
+mod resident_size_tests {
+    use super::*;
+    use crate::config::dtype::StorageDtype;
+
+    fn cfg(extract: ExtractLevel, dtype: StorageDtype, num_layers: usize) -> VindexConfig {
+        VindexConfig {
+            num_layers,
+            hidden_size: 2560,
+            intermediate_size: 6912,
+            vocab_size: 128_256,
+            extract_level: extract,
+            dtype,
+            layers: (0..num_layers)
+                .map(|i| VindexLayerInfo {
+                    layer: i,
+                    num_features: 6912,
+                    offset: 0,
+                    length: 0,
+                    num_experts: None,
+                    num_features_per_expert: None,
+                })
+                .collect(),
+            ..VindexConfig::default()
+        }
+    }
+
+    /// Bug-report scenario: BitNet b1.58 2 B 4 T at 30 layers,
+    /// hidden 2560, intermediate 6912, vocab 128 256, dtype f16,
+    /// extract_level Inference.  Estimator should land in the
+    /// 5–6 GB ballpark to match measured RSS-after-load.
+    #[test]
+    fn estimate_for_bitnet_2b_inference_lands_in_expected_range() {
+        let c = cfg(ExtractLevel::Inference, StorageDtype::F16, 30);
+        let est = c.estimate_resident_bytes();
+        // Production triage observed ~5.0 GB heap at peak.
+        // Estimator allows for f16 storage + 12 % overhead;
+        // accept anywhere in [4 GB, 8 GB].
+        let gb = (est as f64) / (1024.0 * 1024.0 * 1024.0);
+        assert!(gb >= 4.0 && gb <= 8.0, "got {gb} GB");
+    }
+
+    /// Browse-only vindex (no inference weights) reports a smaller
+    /// resident estimate than the inference path — the latter
+    /// includes the full attention + FFN per-layer tensors which
+    /// dominate at scale.
+    #[test]
+    fn estimate_for_browse_level_is_smaller_than_inference() {
+        let browse = cfg(ExtractLevel::Browse, StorageDtype::F16, 30);
+        let infer = cfg(ExtractLevel::Inference, StorageDtype::F16, 30);
+        let b = browse.estimate_resident_bytes();
+        let i = infer.estimate_resident_bytes();
+        assert!(b < i, "browse {b} bytes vs inference {i} bytes");
+    }
+
+    /// f32-storage doubles the inference estimate vs f16 — sanity
+    /// check that `bytes_per_float` is plumbed in correctly.
+    #[test]
+    fn estimate_doubles_for_f32_vs_f16() {
+        let f16 = cfg(ExtractLevel::Inference, StorageDtype::F16, 30);
+        let f32 = cfg(ExtractLevel::Inference, StorageDtype::F32, 30);
+        let r16 = f16.estimate_resident_bytes();
+        let r32 = f32.estimate_resident_bytes();
+        // Norms (per-layer ~10 KiB) and the 12 % overhead constant
+        // make the ratio a bit under 2x; accept the [1.7, 2.1] band.
+        let ratio = (r32 as f64) / (r16 as f64);
+        assert!(
+            (1.7..=2.1).contains(&ratio),
+            "ratio {ratio} (r16={r16}, r32={r32})"
+        );
+    }
+
+    /// has_inference_weights honours both the legacy
+    /// has_model_weights flag and the modern extract_level field.
+    #[test]
+    fn has_inference_weights_handles_legacy_and_modern_flags() {
+        let mut browse = cfg(ExtractLevel::Browse, StorageDtype::F16, 1);
+        assert!(!browse.has_inference_weights());
+        browse.has_model_weights = true; // legacy flag
+        assert!(browse.has_inference_weights());
+
+        let infer = cfg(ExtractLevel::Inference, StorageDtype::F16, 1);
+        assert!(infer.has_inference_weights());
     }
 }

@@ -279,6 +279,14 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
+    /// Server-side hard timeout for `/v1/infer` and friends.  When
+    /// the wall-time of the spawn_blocking future exceeds this, the
+    /// handler responds 504 and drops the JoinHandle.  The blocking
+    /// thread is *not* killed (we don't have cooperative cancel on
+    /// the inference path) — it runs to completion in the
+    /// background and its result is discarded.  Default: 60s; set
+    /// to 0 to disable.  See BUG-infer-deadlock §5.6.
+    pub infer_timeout: std::time::Duration,
 }
 
 impl AppState {
