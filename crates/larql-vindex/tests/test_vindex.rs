@@ -402,6 +402,7 @@ fn save_and_load_down_meta_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -501,6 +502,7 @@ fn save_config_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -801,6 +803,7 @@ fn v2_config_full_round_trip() {
         }),
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -895,6 +898,7 @@ fn v2_config_with_moe() {
         }),
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1031,6 +1035,7 @@ fn moe_layer_info_round_trip() {
         }),
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1080,6 +1085,7 @@ fn layer_bands_config_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1243,6 +1249,7 @@ fn source_provenance_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1512,6 +1519,7 @@ fn weight_manifest_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -1553,6 +1561,7 @@ fn dtype_config_f16_round_trip() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1806,6 +1815,7 @@ fn full_lifecycle_build_query_mutate_save_reload() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -2423,6 +2433,7 @@ fn vindexfile_parse_and_build() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     index.save_vindex(&base_dir, &mut config).unwrap();
 

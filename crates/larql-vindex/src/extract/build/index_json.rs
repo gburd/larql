@@ -81,6 +81,7 @@ impl<'a> BuildContext<'a> {
             },
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         };
 
         // Preliminary write — `write_model_weights` reads the index.

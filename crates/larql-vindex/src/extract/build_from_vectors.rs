@@ -351,6 +351,7 @@ pub fn build_vindex_from_vectors(
         model_config: architecture.model_config,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     let config_json =

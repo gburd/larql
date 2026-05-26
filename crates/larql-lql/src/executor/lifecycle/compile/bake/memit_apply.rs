@@ -141,6 +141,7 @@ mod tests {
             model_config: None,
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         }
     }
 

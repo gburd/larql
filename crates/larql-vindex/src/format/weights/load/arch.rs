@@ -181,6 +181,7 @@ mod tests {
             model_config: Some(model_cfg),
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         }
     }
 
