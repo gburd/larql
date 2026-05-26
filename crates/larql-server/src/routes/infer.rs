@@ -90,12 +90,11 @@ fn run_infer(
     // BitNet 1.58 (--keep-quant) vindex: take the native-ternary
     // forward path.  Skips dense weight loading entirely (~5 GB
     // saved on a 2 B BitNet) and runs predict_bitnet against the
-    // pre-loaded BitnetModel.  Walk-mode is not yet supported on
-    // the ternary path — the patched-vindex KNN store would need
-    // ternary-aware embeddings; for now BitNet always answers in
-    // dense-mode shape.
+    // pre-loaded BitnetModel.  Walk-mode is supported via
+    // residual capture + KNN-store override (no sparse FFN — see
+    // larql_inference::ternary::infer_bitnet_walk for the
+    // architecture note).
     if model.is_bitnet() {
-        let _ = session_id; // sessions not wired into bitnet path yet
         let bitnet_guard = model
             .get_or_load_bitnet()
             .map_err(ServerError::InferenceUnavailable)?;
@@ -111,23 +110,93 @@ fn run_infer(
         }
 
         let start = std::time::Instant::now();
-        let pred =
-            larql_inference::ternary::predict_bitnet(bitnet, &model.tokenizer, &token_ids, req.top);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-
-        let pred_pairs: Vec<(String, f64)> = pred
-            .into_iter()
-            .map(|p| (p.token, p.probability))
-            .collect();
-        let predictions = format_predictions(&pred_pairs);
+        let (is_compare, use_walk, use_dense) = infer_mode_flags(&req.mode);
         let mut result = serde_json::Map::new();
         result.insert("prompt".into(), serde_json::json!(req.prompt));
-        result.insert("predictions".into(), serde_json::json!(predictions));
-        result.insert("mode".into(), serde_json::json!("bitnet"));
-        result.insert(
-            "latency_ms".into(),
-            serde_json::json!((elapsed * 10.0).round() / 10.0),
-        );
+
+        if use_walk {
+            // Resolve the patched-vindex source: per-session if a
+            // session id was supplied and the session exists,
+            // otherwise the model's default patched vindex.
+            let walk_pred = if let Some(sid) = session_id {
+                let sessions = state.sessions.sessions_blocking_read();
+                if let Some(session) = sessions.get(sid) {
+                    larql_inference::ternary::infer_bitnet_walk(
+                        bitnet,
+                        &model.tokenizer,
+                        Some(&session.patched.knn_store),
+                        &token_ids,
+                        req.top,
+                    )
+                } else {
+                    drop(sessions);
+                    let patched = model.patched.blocking_read();
+                    larql_inference::ternary::infer_bitnet_walk(
+                        bitnet,
+                        &model.tokenizer,
+                        Some(&patched.knn_store),
+                        &token_ids,
+                        req.top,
+                    )
+                }
+            } else {
+                let patched = model.patched.blocking_read();
+                larql_inference::ternary::infer_bitnet_walk(
+                    bitnet,
+                    &model.tokenizer,
+                    Some(&patched.knn_store),
+                    &token_ids,
+                    req.top,
+                )
+            };
+
+            let predictions = format_predictions(&walk_pred.predictions);
+            if let Some(ovr) = &walk_pred.knn_override {
+                result.insert(
+                    "knn_override".into(),
+                    format_knn_override(ovr, walk_pred.model_top1.as_ref()),
+                );
+            }
+            if is_compare {
+                result.insert(INFER_MODE_WALK.into(), serde_json::json!(predictions));
+                result.insert(
+                    "walk_ms".into(),
+                    serde_json::json!((walk_pred.walk_ms * 10.0).round() / 10.0),
+                );
+            } else {
+                result.insert("predictions".into(), serde_json::json!(predictions));
+                result.insert("mode".into(), serde_json::json!(INFER_MODE_WALK));
+            }
+        }
+
+        if use_dense {
+            let dense_start = std::time::Instant::now();
+            let pred = larql_inference::ternary::predict_bitnet(
+                bitnet,
+                &model.tokenizer,
+                &token_ids,
+                req.top,
+            );
+            let dense_ms = dense_start.elapsed().as_secs_f64() * 1000.0;
+
+            let pred_pairs: Vec<(String, f64)> = pred
+                .into_iter()
+                .map(|p| (p.token, p.probability))
+                .collect();
+            let predictions = format_predictions(&pred_pairs);
+            if is_compare {
+                result.insert(INFER_MODE_DENSE.into(), serde_json::json!(predictions));
+                result.insert(
+                    "dense_ms".into(),
+                    serde_json::json!((dense_ms * 10.0).round() / 10.0),
+                );
+            } else {
+                result.insert("predictions".into(), serde_json::json!(predictions));
+                result.insert("mode".into(), serde_json::json!("bitnet"));
+            }
+        }
+
+        result.insert("latency_ms".into(), serde_json::json!(elapsed_ms(start)));
         return Ok(serde_json::Value::Object(result));
     }
 
