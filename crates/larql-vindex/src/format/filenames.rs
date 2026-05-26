@@ -241,6 +241,38 @@ pub const GATE_VECTORS_FP4_BIN: &str = "gate_vectors_fp4.bin";
 pub const UP_FEATURES_FP4_BIN: &str = "up_features_fp4.bin";
 pub const DOWN_FEATURES_FP8_BIN: &str = "down_features_fp8.bin";
 
+// ── BitNet 1.58 native ternary weights (BUG-infer-deadlock §5.4) ─────────
+//
+// When a vindex is built from a BitNet GGUF with `--keep-quant`, the
+// I2_S-packed BitLinear weights are written under `bitnet/` instead of
+// being dequantized to f16/f32.  One file per logical tensor, plus a
+// `bitnet_layout.json` that records dims and per-channel scale
+// references.
+//
+// Layout:
+//   bitnet/blk.0.attn_q.weight.i2s
+//   bitnet/blk.0.attn_k.weight.i2s
+//   bitnet/blk.0.attn_v.weight.i2s
+//   bitnet/blk.0.attn_o.weight.i2s
+//   bitnet/blk.0.ffn_gate.weight.i2s
+//   bitnet/blk.0.ffn_up.weight.i2s
+//   bitnet/blk.0.ffn_down.weight.i2s
+//   bitnet/scales.f32  (concat of all per-channel f32 scales)
+//   bitnet_layout.json (top-level)
+//
+// Per-channel scales come from the adjacent `*_sub_norm.weight` and
+// `*_norm.weight` F32 tensors in the GGUF — we don't synthesise them.
+pub const BITNET_DIR: &str = "bitnet";
+pub const BITNET_LAYOUT_JSON: &str = "bitnet_layout.json";
+pub const BITNET_SCALES_BIN: &str = "bitnet/scales.f32";
+
+/// Filename inside `bitnet/` for one ternary tensor.  `tensor_name`
+/// uses the same canonical form as GGUF tensor names
+/// (e.g. `blk.0.attn_q.weight`).
+pub fn bitnet_tensor_filename(tensor_name: &str) -> String {
+    format!("{BITNET_DIR}/{tensor_name}.i2s")
+}
+
 // ── HuggingFace upload manifest order ──────────────────────────────────
 //
 // Order matches what `format/huggingface.rs` uploads. Adding or

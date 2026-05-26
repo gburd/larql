@@ -134,6 +134,107 @@ impl GgufFile {
         Ok((tensors, vectors))
     }
 
+    /// As [`Self::load_tensors_filtered`] but also returns the raw
+    /// pre-dequant bytes for tensors whose ggml type matches
+    /// `keep_raw_for_types`.  Used by the `--keep-quant` convert
+    /// path so I2_S BitLinear tensors can be written verbatim to
+    /// the vindex (see `larql_vindex::extract::bitnet_writer`).
+    ///
+    /// The returned tensors map still contains the dequantised
+    /// f32 view (for shape inspection downstream); the raw bytes
+    /// are an additional sidecar.
+    #[allow(clippy::type_complexity)]
+    pub fn load_tensors_filtered_keep_quant(
+        &self,
+        skip_key: &dyn Fn(&str) -> bool,
+        keep_raw_for_types: &[u32],
+    ) -> Result<
+        (
+            HashMap<String, crate::WeightArray>,
+            HashMap<String, Vec<f32>>,
+            HashMap<String, Vec<u8>>,
+        ),
+        ModelError,
+    > {
+        let mut shard_mmaps: Vec<Option<memmap2::Mmap>> =
+            (0..self.shards.len()).map(|_| None).collect();
+
+        let mut tensors = HashMap::new();
+        let mut vectors = HashMap::new();
+        let mut raw_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+
+        for info in &self.tensor_infos {
+            let key = normalize_gguf_key(&info.name);
+            if skip_key(&key) {
+                continue;
+            }
+
+            let shard = &self.shards[info.shard_idx];
+            if shard_mmaps[info.shard_idx].is_none() {
+                let f = std::fs::File::open(&shard.path)?;
+                let m = unsafe { memmap2::Mmap::map(&f)? };
+                shard_mmaps[info.shard_idx] = Some(m);
+            }
+            let mmap = shard_mmaps[info.shard_idx]
+                .as_ref()
+                .expect("mmap initialised above");
+
+            let abs_offset = shard.data_offset.checked_add(info.offset).ok_or_else(|| {
+                ModelError::Parse(format!(
+                    "tensor {}: data_offset {} + tensor offset {} overflows u64",
+                    info.name, shard.data_offset, info.offset,
+                ))
+            })?;
+            let n_elements: u64 = info.dims.iter().product();
+
+            let data_size = tensor_data_size(info.tensor_type, n_elements as usize)?;
+            let abs_offset_usize = usize::try_from(abs_offset).map_err(|_| {
+                ModelError::Parse(format!(
+                    "tensor {}: absolute offset {} exceeds usize on this platform",
+                    info.name, abs_offset,
+                ))
+            })?;
+            let end = abs_offset_usize.checked_add(data_size).ok_or_else(|| {
+                ModelError::Parse(format!(
+                    "tensor {}: offset {} + size {} overflows usize",
+                    info.name, abs_offset_usize, data_size,
+                ))
+            })?;
+            if end > mmap.len() {
+                return Err(ModelError::Parse(format!(
+                    "tensor {} data out of bounds (offset {} + size {} > shard {} file {})",
+                    info.name,
+                    abs_offset,
+                    data_size,
+                    info.shard_idx,
+                    mmap.len()
+                )));
+            }
+
+            let raw = &mmap[abs_offset_usize..end];
+            if keep_raw_for_types.contains(&info.tensor_type) {
+                raw_bytes.insert(key.clone(), raw.to_vec());
+            }
+            let floats = dequantize(raw, info.tensor_type, n_elements as usize)?;
+
+            match info.n_dims {
+                2 => {
+                    let ne0 = info.dims[0] as usize;
+                    let ne1 = info.dims[1] as usize;
+                    let arr = Array2::from_shape_vec((ne1, ne0), floats)
+                        .map_err(|e| ModelError::Parse(format!("tensor {}: {}", info.name, e)))?;
+                    tensors.insert(key, arr.into_shared());
+                }
+                1 => {
+                    vectors.insert(key, floats);
+                }
+                _ => {}
+            }
+        }
+
+        Ok((tensors, vectors, raw_bytes))
+    }
+
     /// Build a config.json-equivalent from GGUF metadata for architecture detection.
     pub fn to_config_json(&self) -> serde_json::Value {
         let get_str = |k: &str| {
@@ -288,17 +389,129 @@ pub fn load_gguf(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered(path, &|_| false)
 }
 
+/// Load a GGUF file into ModelWeights, retaining the original
+/// pre-dequant bytes for tensors of the listed types.
+///
+/// Used by `larql convert gguf-to-vindex --keep-quant` so the
+/// BitNet 1.58 I2_S BitLinear bytes survive into
+/// `ModelWeights::raw_bytes` (rather than being dropped after
+/// dequantization).  See BUG-infer-deadlock §5.4.
+///
+/// `keep_types` should be the list of GGML type IDs whose bytes
+/// you want preserved.  For BitNet pass `&[36]` (TYPE_I2_S); for
+/// future TQ1_0/TQ2_0 native paths pass `&[34, 35]`.
+pub fn load_gguf_keep_quant(
+    path: &Path,
+    keep_types: &[u32],
+) -> Result<ModelWeights, ModelError> {
+    load_gguf_keep_quant_filtered(path, &|_| false, keep_types)
+}
+
+pub(crate) fn load_gguf_keep_quant_filtered(
+    path: &Path,
+    skip_key: &dyn Fn(&str) -> bool,
+    keep_types: &[u32],
+) -> Result<ModelWeights, ModelError> {
+    load_gguf_filtered_with_validation_and_keep(path, skip_key, false, keep_types)
+}
+
 /// Load and validate a GGUF file into ModelWeights (dequantized to f32).
 pub fn load_gguf_validated(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered_with_validation(path, &|_| false, true)
 }
 
-/// Load a GGUF file into ModelWeights, skipping normalized keys before dequantization.
+/// Load a GGUF file into ModelWeights with optional architecture validation.
 pub(crate) fn load_gguf_filtered(
     path: &Path,
     skip_key: &dyn Fn(&str) -> bool,
 ) -> Result<ModelWeights, ModelError> {
-    load_gguf_filtered_with_validation(path, skip_key, false)
+    load_gguf_filtered_with_validation_and_keep(path, skip_key, false, &[])
+}
+
+/// Same as [`load_gguf_filtered_with_validation`] but also retains
+/// raw pre-dequant bytes for tensors whose GGML type appears in
+/// `keep_types`.
+pub(crate) fn load_gguf_filtered_with_validation_and_keep(
+    path: &Path,
+    skip_key: &dyn Fn(&str) -> bool,
+    validate_config: bool,
+    keep_types: &[u32],
+) -> Result<ModelWeights, ModelError> {
+    let gguf = GgufFile::open(path)?;
+
+    let config_json = gguf.to_config_json();
+    let arch = if validate_config {
+        detect_from_json_validated(&config_json)?
+    } else {
+        crate::detect_from_json(&config_json)
+    };
+    let prefixes = arch.key_prefixes_to_strip();
+
+    let (mut tensors, mut vectors, mut raw_keep) =
+        gguf.load_tensors_filtered_keep_quant(skip_key, keep_types)?;
+
+    let mut normalized_tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+    for (k, v) in tensors.drain() {
+        let key = crate::loading::safetensors::normalize_key(&k, prefixes);
+        normalized_tensors.insert(key, v);
+    }
+    // Re-key the raw_bytes map through the same normalisation so
+    // downstream consumers can look up by the canonical name.
+    let mut normalized_raw: HashMap<String, Vec<u8>> = HashMap::new();
+    for (k, v) in raw_keep.drain() {
+        let key = crate::loading::safetensors::normalize_key(&k, prefixes);
+        normalized_raw.insert(key, v);
+    }
+
+    orient_ffn_tensors(&mut normalized_tensors, &*arch);
+    orient_attention_tensors(&mut normalized_tensors, &*arch);
+    split_fused_qkv(&mut normalized_tensors, &mut vectors, &*arch);
+
+    let embed_key = arch.embed_key();
+    let embed_raw = normalized_tensors
+        .get(embed_key)
+        .ok_or_else(|| ModelError::MissingTensor(embed_key.into()))?
+        .clone();
+    let cfg = arch.config();
+    let tokenizer_vocab_size = read_tokenizer_vocab_size(path);
+    let configured_vocab_size = cfg.vocab_size.filter(|&v| v > 0);
+    let expected_vocab_size = configured_vocab_size.or(tokenizer_vocab_size);
+    let embed = orient_embedding(embed_raw, cfg.hidden_size, expected_vocab_size);
+
+    let lm_head = normalized_tensors
+        .get("lm_head.weight")
+        .or_else(|| normalized_tensors.get(GGUF_OUTPUT_WEIGHT))
+        .cloned()
+        .unwrap_or_else(|| embed.clone());
+    let position_embed = arch
+        .position_embed_key()
+        .and_then(|key| normalized_tensors.get(key).cloned());
+
+    let vocab_size = expected_vocab_size
+        .or_else(|| (embed.shape()[0] > 0).then_some(embed.shape()[0]))
+        .unwrap_or(DEFAULT_GGUF_VOCAB_SIZE);
+
+    let cfg_clone = cfg.clone();
+    Ok(ModelWeights {
+        tensors: normalized_tensors,
+        vectors,
+        raw_bytes: normalized_raw,
+        skipped_tensors: Vec::new(),
+        packed_mmaps: std::collections::HashMap::new(),
+        packed_byte_ranges: std::collections::HashMap::new(),
+        embed,
+        lm_head,
+        position_embed,
+        num_layers: cfg_clone.num_layers,
+        hidden_size: cfg_clone.hidden_size,
+        intermediate_size: cfg_clone.intermediate_size,
+        vocab_size,
+        head_dim: cfg_clone.head_dim,
+        num_q_heads: cfg_clone.num_q_heads,
+        num_kv_heads: cfg_clone.num_kv_heads,
+        rope_base: cfg_clone.rope_base,
+        arch,
+    })
 }
 
 /// Load a GGUF file into ModelWeights with optional architecture validation.

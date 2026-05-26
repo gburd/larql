@@ -138,6 +138,7 @@ fn test_vindex_config(dtype: larql_vindex::StorageDtype) -> VindexConfig {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     }
 }
 
@@ -351,6 +352,7 @@ fn load_model_weights_rejects_compact_missing_dense_ffn() {
         model_config: Some(compact_model_config()),
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     let gate = vec![0.0f32; COMPACT_NUM_LAYERS * COMPACT_INTERMEDIATE_SIZE * COMPACT_HIDDEN_SIZE];

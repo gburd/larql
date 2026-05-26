@@ -29,7 +29,8 @@ pub mod quantization;
 pub use compliance::{ComplianceGate, LayerBands};
 pub use dtype::StorageDtype;
 pub use index::{
-    DownMetaRecord, DownMetaTopK, ExtractLevel, FfnLayout, VindexConfig, VindexLayerInfo,
+    BitnetLayout, BitnetTensorEntry, DownMetaRecord, DownMetaTopK, ExtractLevel, FfnLayout,
+    VindexConfig, VindexLayerInfo,
     VindexSource,
 };
 pub use model::{MoeConfig, VindexModelConfig};

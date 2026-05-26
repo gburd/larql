@@ -85,6 +85,7 @@ impl<'a> StreamingContext<'a> {
             }),
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         };
 
         // Write preliminary index.json (needed by write_model_weights which reads dtype from it).

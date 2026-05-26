@@ -164,6 +164,7 @@ fn test_config(model_config: Option<VindexModelConfig>) -> VindexConfig {
         model_config,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     }
 }
 

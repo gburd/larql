@@ -27,6 +27,19 @@ enum ConvertCommand {
         /// Store in f16 (half precision).
         #[arg(long)]
         f16: bool,
+
+        /// Retain native ternary (I2_S, GGML type 36) BitLinear
+        /// weights verbatim instead of dequantizing them at
+        /// convert time.  Writes a `bitnet/` subdirectory + a
+        /// `bitnet_layout.json` describing tensor shapes and
+        /// per-channel scale offsets.  Loaders dispatch on
+        /// `index.json`'s `bitnet_layout` field at runtime.
+        ///
+        /// Only meaningful when the source GGUF is BitNet 1.58
+        /// shaped (architecture = `bitnet-b1.58`).  No-op for
+        /// non-BitNet GGUFs.  Closes BUG-infer-deadlock §5.4.
+        #[arg(long)]
+        keep_quant: bool,
     },
 
     /// Convert a safetensors model to a vindex (alias for extract-index).
@@ -181,7 +194,8 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             output,
             level,
             f16,
-        } => run_gguf_to_vindex(&input, &output, &level, f16),
+            keep_quant,
+        } => run_gguf_to_vindex(&input, &output, &level, f16, keep_quant),
         ConvertCommand::SafetensorsToVindex {
             input,
             output,
@@ -426,12 +440,12 @@ fn run_gguf_to_vindex(
     output: &std::path::Path,
     level: &str,
     use_f16: bool,
+    keep_quant: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading GGUF: {}", input.display());
 
     let gguf = larql_models::loading::gguf::GgufFile::open(input)?;
 
-    // Show metadata summary
     if let Some(name) = gguf.metadata.get("general.name") {
         eprintln!("  Model: {:?}", name);
     }
@@ -439,8 +453,33 @@ fn run_gguf_to_vindex(
         eprintln!("  Architecture: {:?}", arch);
     }
 
+    // Detect BitNet so --keep-quant can be a no-op rather than an
+    // error on non-BitNet inputs.  Match by architecture name to
+    // stay forward-compatible with future BitNet variants that ship
+    // additional ggml types.
+    let is_bitnet = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .map(|s| s.starts_with("bitnet"))
+        .unwrap_or(false);
+    let do_keep_quant = keep_quant && is_bitnet;
+    if keep_quant && !is_bitnet {
+        eprintln!(
+            "  --keep-quant: ignored (architecture is not BitNet; no I2_S \
+             tensors to retain)"
+        );
+    }
+
     eprintln!("  Loading and dequantizing tensors...");
-    let weights = larql_models::load_gguf(input)?;
+    let weights = if do_keep_quant {
+        // Retain raw bytes for I2_S BitLinear tensors so the
+        // bitnet_writer can copy them verbatim into bitnet/.
+        const TYPE_I2_S: u32 = 36;
+        larql_models::loading::gguf::load_gguf_keep_quant(input, &[TYPE_I2_S])?
+    } else {
+        larql_models::load_gguf(input)?
+    };
 
     eprintln!(
         "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
@@ -493,6 +532,26 @@ fn run_gguf_to_vindex(
         dtype,
         &mut callbacks,
     )?;
+
+    // BitNet --keep-quant: write the I2_S bytes + per-channel scales
+    // and stamp `bitnet_layout` into index.json.
+    if do_keep_quant {
+        let rms_eps = gguf
+            .metadata
+            .get("bitnet-b1.58.attention.layer_norm_rms_epsilon")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32)
+            .unwrap_or(1e-5);
+        let layout =
+            larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(output, &weights, rms_eps)?;
+        eprintln!(
+            "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries",
+            layout.tensors.len(),
+            layout.total_scale_count,
+        );
+        // Patch index.json with bitnet_layout = layout.
+        patch_index_json_with_bitnet_layout(output, &layout)?;
+    }
     // GGUF conversion: HF metadata (tokenizer_config.json etc.) is not
     // packed in the GGUF itself, but if the user kept the HF files next
     // to the `.gguf`, snapshot them. Missing-file case is a no-op.
@@ -602,3 +661,22 @@ fn run_gguf_info(input: &std::path::Path) -> Result<(), Box<dyn std::error::Erro
 
 struct SilentCallbacks;
 impl larql_vindex::IndexBuildCallbacks for SilentCallbacks {}
+
+/// Re-write `index.json` to include the `bitnet_layout` block.
+///
+/// `build_vindex` writes index.json before we know whether the
+/// `--keep-quant` artifacts will be produced, so we round-trip
+/// the file through serde to add the layout in place.  Stable
+/// across reruns: the load -> patch -> write cycle is idempotent.
+fn patch_index_json_with_bitnet_layout(
+    out_dir: &std::path::Path,
+    layout: &larql_vindex::config::BitnetLayout,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = out_dir.join(INDEX_JSON);
+    let bytes = std::fs::read(&path)?;
+    let mut config: larql_vindex::VindexConfig = serde_json::from_slice(&bytes)?;
+    config.bitnet_layout = Some(layout.clone());
+    let json = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
