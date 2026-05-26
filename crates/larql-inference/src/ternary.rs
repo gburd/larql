@@ -1226,6 +1226,7 @@ fn stack_one_row(prev: &Array2<f32>, new_row: &Array1<f32>) -> Array2<f32> {
     out
 }
 
+#[cfg(test)]
 fn argmax(logits: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best = f32::NEG_INFINITY;
