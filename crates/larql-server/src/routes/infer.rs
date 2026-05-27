@@ -118,33 +118,38 @@ fn run_infer(
             // Resolve the patched-vindex source: per-session if a
             // session id was supplied and the session exists,
             // otherwise the model's default patched vindex.
-            let walk_pred = if let Some(sid) = session_id {
-                let sessions = state.sessions.sessions_blocking_read();
-                if let Some(session) = sessions.get(sid) {
-                    larql_inference::ternary::infer_bitnet_walk(
-                        bitnet,
-                        &model.tokenizer,
-                        Some(&session.patched.knn_store),
-                        &token_ids,
-                        req.top,
-                    )
-                } else {
-                    drop(sessions);
-                    let patched = model.patched.blocking_read();
-                    larql_inference::ternary::infer_bitnet_walk(
-                        bitnet,
-                        &model.tokenizer,
-                        Some(&patched.knn_store),
-                        &token_ids,
-                        req.top,
-                    )
-                }
-            } else {
-                let patched = model.patched.blocking_read();
+            //
+            // Lock discipline (BUG-infer-deadlock §5.3): snapshot the
+            // per-session `Arc<RwLock<PatchedVindex>>` out from under
+            // the outer sessions reader, drop the outer reader, then
+            // acquire the per-session inner reader for the duration of
+            // the walk.  The outer sessions lock is held for O(µs);
+            // concurrent `apply_patch` writers no longer queue behind
+            // a multi-second walk.
+            let session_inner: Option<std::sync::Arc<tokio::sync::RwLock<larql_vindex::PatchedVindex>>> =
+                session_id.and_then(|sid| {
+                    let sessions = state.sessions.sessions_blocking_read();
+                    sessions.get(sid).map(|s| std::sync::Arc::clone(&s.patched))
+                });
+            let walk_pred = if let Some(inner) = session_inner {
+                let session_patched = inner.blocking_read();
                 larql_inference::ternary::infer_bitnet_walk(
                     bitnet,
                     &model.tokenizer,
-                    Some(&patched.knn_store),
+                    Some(&session_patched.knn_store),
+                    &token_ids,
+                    req.top,
+                )
+            } else {
+                // Snapshot the global PatchedVindex once under a
+                // brief reader so the multi-second walk doesn't
+                // hold model.patched against a queued writer.  See
+                // BUG-infer-deadlock §5.3.
+                let snapshot = model.patched.blocking_read().clone();
+                larql_inference::ternary::infer_bitnet_walk(
+                    bitnet,
+                    &model.tokenizer,
+                    Some(&snapshot.knn_store),
                     &token_ids,
                     req.top,
                 )
@@ -247,28 +252,43 @@ fn run_infer(
         let pred = if let Some(sid) = session_id {
             // Session-scoped walk inference.
             //
-            // Lock discipline: take a *reader* on the sessions map (not
-            // a writer) so concurrent sessioned `/v1/infer` requests do
-            // not serialize globally, and so an in-flight forward pass
-            // does not deadlock against a concurrent `apply_patch`
-            // arriving on another worker.  The previous implementation
-            // held `sessions.write()` across the multi-second
-            // `run_walk(&session.patched)` call, which on the
-            // multi-thread tokio runtime stalled every other handler
-            // touching `sessions` (including `GET /v1/stats` and
-            // `GET /v1/walk-ffn`).  This mirrors the fix already
-            // applied in `session.rs::apply_patch`.
-            let sessions = state.sessions.sessions_blocking_read();
-            if let Some(session) = sessions.get(sid) {
-                run_walk(&session.patched)
-            } else {
-                drop(sessions);
-                let patched = model.patched.blocking_read();
-                run_walk(&patched)
+            // Lock discipline (BUG-infer-deadlock §5.3): snapshot the
+            // per-session `Arc<RwLock<PatchedVindex>>` out from under
+            // the outer sessions reader, drop the outer reader, then
+            // acquire the per-session inner reader for the duration of
+            // the walk.  Without this, holding the outer reader across
+            // the multi-second `run_walk(...)` call queues any
+            // concurrent `apply_patch` writer; tokio's writer-priority
+            // semantics then block every subsequent reader of
+            // `sessions` (`/v1/stats`, walk-ffn, the chat handlers,
+            // every other walk request).  This was the production
+            // wedge in BUG-infer-deadlock; the previous fix only
+            // demoted writer→reader and was not sufficient.
+            let session_inner = {
+                let sessions = state.sessions.sessions_blocking_read();
+                sessions.get(sid).map(|s| std::sync::Arc::clone(&s.patched))
+            };
+            match session_inner {
+                Some(inner) => {
+                    let session_patched = inner.blocking_read();
+                    run_walk(&session_patched)
+                }
+                None => {
+                    let snapshot = model.patched.blocking_read().clone();
+                    run_walk(&snapshot)
+                }
             }
         } else {
-            let patched = model.patched.blocking_read();
-            run_walk(&patched)
+            // Snapshot the global PatchedVindex under a brief reader
+            // and drop the outer lock before running the walk — the
+            // walk against the snapshot can run concurrently with
+            // any apply_patch writer.  Without this, the reader is
+            // held for the entire forward pass and any queued writer
+            // would block /v1/stats and walk-ffn behind it (tokio
+            // RwLock writer-priority).  See BUG-infer-deadlock §5.3
+            // and the timeout interaction note in §5.6.
+            let snapshot = model.patched.blocking_read().clone();
+            run_walk(&snapshot)
         };
 
         let predictions = format_predictions(&pred.predictions);
@@ -517,6 +537,100 @@ mod tests {
             "sessions reader serialized concurrent callers (took {:?}); \
              expected ~100 ms parallel, observed near 800 ms-style serialisation",
             wall
+        );
+    }
+
+    /// BUG-infer-deadlock §5.3 (production wedge fix): the load-bearing
+    /// regression test.  The session-scoped walk path must NOT hold the
+    /// outer `sessions` reader across the multi-second forward pass; if
+    /// it does, a queued `apply_patch` writer (tokio RwLock writer
+    /// priority) will block every subsequent reader of `sessions`,
+    /// wedging /v1/stats and every other handler that touches the
+    /// sessions map.
+    ///
+    /// Repro pattern in production: /v1/infer (no concurrency) holds
+    /// `sessions_blocking_read()` across a slow walk → something
+    /// queues a writer → /v1/stats blocks forever.
+    ///
+    /// This test reproduces the queue-of-doom: thread A holds a brief
+    /// outer reader, snapshots the per-session inner Arc, drops the
+    /// outer, and runs a slow op against the inner.  Thread B issues
+    /// `apply_patch` (writer on the outer sessions map AND on the
+    /// per-session inner).  Thread C issues `sessions_blocking_read`
+    /// (the /v1/stats path).  All three must complete inside a tight
+    /// time bound.  Pre-fix this would deadlock for the duration of
+    /// the slow op.
+    #[test]
+    fn snapshot_pattern_releases_outer_sessions_lock_under_apply_patch_pressure() {
+        use crate::session::{SessionManager, SessionState};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let mgr = Arc::new(SessionManager::new(60));
+
+        // Pre-seed the session so apply_patch hits the fast path
+        // (no global model.patched dependency).
+        {
+            let mut sessions = mgr.sessions_blocking_write();
+            let hidden = 4;
+            let gate =
+                larql_vindex::ndarray::Array2::<f32>::zeros((2, hidden));
+            let index = larql_vindex::VectorIndex::new(
+                vec![Some(gate)],
+                vec![None],
+                1,
+                hidden,
+            );
+            sessions.insert(
+                "test-sid".to_string(),
+                SessionState::new(index, Instant::now()),
+            );
+        }
+
+        let start = Instant::now();
+
+        // Thread A: simulates run_infer's session-scoped walk.
+        // Snapshots the inner Arc out from under the outer reader,
+        // drops the outer, and runs a slow op against the inner.
+        let mgr_a = Arc::clone(&mgr);
+        let a = std::thread::spawn(move || {
+            let inner_arc = {
+                let sessions = mgr_a.sessions_blocking_read();
+                sessions.get("test-sid").map(|s| Arc::clone(&s.patched))
+            };
+            let inner = inner_arc.expect("session pre-seeded");
+            // Hold the per-session inner reader across the slow op.
+            // The outer sessions lock is not held — that's the fix.
+            let _guard = inner.blocking_read();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        // Thread C: simulates /v1/stats arriving while the walk
+        // is in progress.  Must succeed promptly (ms, not 300 ms).
+        std::thread::sleep(Duration::from_millis(50));
+        let mgr_c = Arc::clone(&mgr);
+        let c = std::thread::spawn(move || {
+            let stats_start = Instant::now();
+            let _sessions = mgr_c.sessions_blocking_read();
+            // Brief work simulating stats serialisation.
+            std::thread::sleep(Duration::from_millis(2));
+            let elapsed = stats_start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(150),
+                "/v1/stats blocked behind the in-flight walk; took {elapsed:?}"
+            );
+        });
+
+        let _ = a.join();
+        let _ = c.join();
+
+        let wall = start.elapsed();
+        // Total wall time bounded by the slow op (300 ms) + jitter.
+        // Pre-fix the writer-priority deadlock would extend this
+        // unboundedly.
+        assert!(
+            wall < Duration::from_millis(600),
+            "snapshot-pattern fix did not release the outer lock; wall={wall:?}"
         );
     }
 

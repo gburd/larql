@@ -399,7 +399,10 @@ fn stream_completions(
 
         let (sampling, eos) = super::util::build_sampling_eos(sampling_params, &stop_strings);
 
-        let patched = model.patched.blocking_read();
+        // Snapshot the global PatchedVindex so the streaming generation
+        // (multi-second) does not hold model.patched against any queued
+        // writer (apply_patch / insert).  See BUG-infer-deadlock 00a75.3.
+        let patched = model.patched.blocking_read().clone();
         let index = patched.base();
         let backend = larql_compute::default_backend();
         let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
@@ -501,7 +504,10 @@ fn run_completions_loop(
         .map_err(ServerError::InferenceUnavailable)?;
     let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
 
-    let patched = model.patched.blocking_read();
+    // Snapshot the global PatchedVindex so the streaming generation
+        // (multi-second) does not hold model.patched against any queued
+        // writer (apply_patch / insert).  See BUG-infer-deadlock 00a75.3.
+        let patched = model.patched.blocking_read().clone();
     let index = patched.base();
     let backend = larql_compute::default_backend();
     let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());

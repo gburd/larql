@@ -579,7 +579,10 @@ fn stream_chat_completion(
             return;
         }
 
-        let patched = model.patched.blocking_read();
+        // Snapshot the global PatchedVindex so the streaming generation
+        // (multi-second) does not hold model.patched against any queued
+        // writer (apply_patch / insert).  See BUG-infer-deadlock 00a75.3.
+        let patched = model.patched.blocking_read().clone();
         let index = patched.base();
         let backend = larql_compute::default_backend();
         let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
@@ -817,7 +820,10 @@ fn run_chat_completion(
     }
     let prompt_token_count = prompt_ids.len();
 
-    let patched = model.patched.blocking_read();
+    // Snapshot the global PatchedVindex so the streaming generation
+        // (multi-second) does not hold model.patched against any queued
+        // writer (apply_patch / insert).  See BUG-infer-deadlock 00a75.3.
+        let patched = model.patched.blocking_read().clone();
     let index = patched.base();
     let backend = larql_compute::default_backend();
     let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());

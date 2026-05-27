@@ -202,18 +202,27 @@ fn run_insert(
     };
 
     let (inserted, use_constellation) = if let Some(sid) = session_id {
-        // Session-scoped: read from session for residuals, write to session for insert
-        let mut sessions = state.sessions.sessions_blocking_write();
-        let now = std::time::Instant::now();
-
-        let session = sessions.entry(sid.to_string()).or_insert_with(|| {
-            let base = model.patched.blocking_read();
-            crate::session::SessionState::new(base.base().clone(), now)
-        });
-        session.touch(now);
-
-        let residuals = compute_residuals(model, &session.patched, req, &insert_layers);
-        apply_insert(model, &mut session.patched, req, &insert_layers, &residuals)
+        // Session-scoped: read from session for residuals, write to session for insert.
+        //
+        // Lock discipline (BUG-infer-deadlock §5.3): snapshot the per-session
+        // `Arc<RwLock<PatchedVindex>>` out from under the outer sessions write,
+        // drop the outer lock, then take the inner per-session writer for
+        // residual compute + insert.  The outer sessions write is held only
+        // long enough to find-or-insert the session entry; concurrent walks
+        // and patches on other sessions are unaffected.
+        let session_inner = {
+            let mut sessions = state.sessions.sessions_blocking_write();
+            let now = std::time::Instant::now();
+            let session = sessions.entry(sid.to_string()).or_insert_with(|| {
+                let base = model.patched.blocking_read();
+                crate::session::SessionState::new(base.base().clone(), now)
+            });
+            session.touch(now);
+            std::sync::Arc::clone(&session.patched)
+        };
+        let mut session_patched = session_inner.blocking_write();
+        let residuals = compute_residuals(model, &session_patched, req, &insert_layers);
+        apply_insert(model, &mut session_patched, req, &insert_layers, &residuals)
     } else {
         // Global: read from global for residuals, write to global for insert
         let residuals = {
