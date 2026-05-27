@@ -5,6 +5,18 @@
 //!
 //! Sessions are identified by a `X-Session-Id` header. If no header is present,
 //! patches go to the global (shared) PatchedVindex.
+//!
+//! ## Lock discipline (BUG-infer-deadlock §5.3)
+//!
+//! `SessionState.patched` is `Arc<RwLock<PatchedVindex>>` so that callers can
+//! snapshot the inner Arc out from under the outer `sessions` lock and run
+//! multi-second forward passes against the cloned `Arc` without holding the
+//! outer lock.  Without this, concurrent `apply_patch` writers queue behind
+//! the in-flight reader and tokio's writer-priority semantics block every
+//! subsequent reader — wedging `/v1/stats`, walk-ffn, and every other
+//! handler that touches the sessions map.  The previous "reader-not-writer"
+//! fix demoted the lock kind but kept the reader held across the walk; that
+//! still deadlocks under contention against any apply-patch writer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,15 +30,21 @@ use tokio::sync::RwLock;
 use crate::state::LoadedModel;
 
 /// Per-session state — an isolated PatchedVindex overlay.
+///
+/// `patched` lives behind `Arc<RwLock<...>>` so a walk handler can
+/// `Arc::clone` it under a brief outer-sessions reader, drop the
+/// outer lock, and then acquire a per-session reader for the
+/// duration of the forward pass without blocking any other
+/// session.  See module docstring above.
 pub struct SessionState {
-    pub patched: PatchedVindex,
+    pub patched: Arc<RwLock<PatchedVindex>>,
     last_accessed: Instant,
 }
 
 impl SessionState {
     pub fn new(base: larql_vindex::VectorIndex, now: Instant) -> Self {
         Self {
-            patched: PatchedVindex::new(base),
+            patched: Arc::new(RwLock::new(PatchedVindex::new(base))),
             last_accessed: now,
         }
     }
@@ -72,8 +90,9 @@ impl SessionManager {
             session.last_accessed = now;
             // Clone the base and replay patches for isolation.
             let base = model.patched.read().await;
+            let inner = session.patched.read().await;
             let mut cloned = PatchedVindex::new(base.base().clone());
-            for patch in &session.patched.patches {
+            for patch in &inner.patches {
                 cloned.apply_patch(patch.clone());
             }
             return cloned;
@@ -85,7 +104,7 @@ impl SessionManager {
         sessions.insert(
             session_id.to_string(),
             SessionState {
-                patched: PatchedVindex::new(base.base().clone()),
+                patched: Arc::new(RwLock::new(PatchedVindex::new(base.base().clone()))),
                 last_accessed: now,
             },
         );
@@ -114,70 +133,93 @@ impl SessionManager {
     ) -> (usize, usize) {
         let now = Instant::now();
 
-        // Fast path: session already exists. Mutate under one lock and return.
-        {
+        // Fast path: session already exists.  Snapshot the inner
+        // Arc<RwLock<PatchedVindex>> under a brief outer write
+        // (only to bump last_accessed; we could avoid that with an
+        // AtomicU64 timestamp but it's not on any hot path), then
+        // drop the outer lock and mutate the per-session inner lock.
+        // This keeps `apply_patch` from blocking other sessions.
+        let inner_arc = {
             let mut sessions = self.sessions.write().await;
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.last_accessed = now;
-                let op_count = patch.operations.len();
-                session.patched.apply_patch(patch);
-                return (op_count, session.patched.num_patches());
-            }
+            sessions.get_mut(session_id).map(|s| {
+                s.last_accessed = now;
+                Arc::clone(&s.patched)
+            })
+        };
+        if let Some(inner) = inner_arc {
+            let mut guard = inner.write().await;
+            let op_count = patch.operations.len();
+            guard.apply_patch(patch);
+            return (op_count, guard.num_patches());
         }
 
-        // Slow path: session needs creating. Read base outside the sessions
-        // lock so the patched read awaits cleanly without blocking a worker.
+        // Slow path: session needs creating.  Read the global base
+        // outside the sessions lock so the read await doesn't block
+        // a worker.
         let new_base = model.patched.read().await.base().clone();
 
         let mut sessions = self.sessions.write().await;
         let session = sessions
             .entry(session_id.to_string())
             .or_insert_with(|| SessionState {
-                patched: PatchedVindex::new(new_base),
+                patched: Arc::new(RwLock::new(PatchedVindex::new(new_base))),
                 last_accessed: now,
             });
         session.last_accessed = now;
+        let inner = Arc::clone(&session.patched);
+        // Drop the outer sessions guard before taking the inner
+        // writer so nothing else gets blocked while we apply.
+        drop(sessions);
+        let mut guard = inner.write().await;
         let op_count = patch.operations.len();
-        session.patched.apply_patch(patch);
-        (op_count, session.patched.num_patches())
+        guard.apply_patch(patch);
+        (op_count, guard.num_patches())
     }
 
     /// List patches for a session.
     pub async fn list_patches(&self, session_id: &str) -> Vec<serde_json::Value> {
-        let sessions = self.sessions.read().await;
-        match sessions.get(session_id) {
-            Some(session) => session
-                .patched
-                .patches
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "name": p.description.as_deref().unwrap_or(PATCH_UNNAMED),
-                        "operations": p.operations.len(),
-                        "base_model": p.base_model,
+        let inner_arc = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).map(|s| Arc::clone(&s.patched))
+        };
+        match inner_arc {
+            Some(inner) => {
+                let guard = inner.read().await;
+                guard
+                    .patches
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.description.as_deref().unwrap_or(PATCH_UNNAMED),
+                            "operations": p.operations.len(),
+                            "base_model": p.base_model,
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             None => vec![],
         }
     }
 
     /// Remove a patch from a session.
     pub async fn remove_patch(&self, session_id: &str, name: &str) -> Result<usize, String> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("session '{}' not found", session_id))?;
+        let inner_arc = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|s| Arc::clone(&s.patched))
+                .ok_or_else(|| format!("session '{}' not found", session_id))?
+        };
+        let mut guard = inner_arc.write().await;
 
-        let idx = session
-            .patched
+        let idx = guard
             .patches
             .iter()
             .position(|p| p.description.as_deref().unwrap_or(PATCH_UNNAMED) == name)
             .ok_or_else(|| format!("patch '{}' not found in session", name))?;
 
-        session.patched.remove_patch(idx);
-        Ok(session.patched.num_patches())
+        guard.remove_patch(idx);
+        Ok(guard.num_patches())
     }
 
     /// Blocking write access to sessions map (for use in spawn_blocking).

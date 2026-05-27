@@ -185,6 +185,10 @@ mod tests {
             }],
             total_scale_count: 1,
             rms_eps: 1e-5,
+            head_dim: 0,
+            n_q_heads: 0,
+            n_kv_heads: 0,
+            rope_base: 10000.0,
         };
         let weights = load_from_layout(dir, &layout).expect("load");
         let w = weights
@@ -216,6 +220,10 @@ mod tests {
             }],
             total_scale_count: 1,
             rms_eps: 1e-5,
+            head_dim: 0,
+            n_q_heads: 0,
+            n_kv_heads: 0,
+            rope_base: 10000.0,
         };
         let r = load_from_layout(dir, &layout);
         assert!(matches!(r, Err(VindexError::Parse(_))));
@@ -240,6 +248,10 @@ mod tests {
             }],
             total_scale_count: 1,
             rms_eps: 1e-5,
+            head_dim: 0,
+            n_q_heads: 0,
+            n_kv_heads: 0,
+            rope_base: 10000.0,
         };
         let r = load_from_layout(dir, &layout);
         assert!(matches!(r, Err(VindexError::Parse(_))));
@@ -264,6 +276,10 @@ mod tests {
             }],
             total_scale_count: 1,
             rms_eps: 1e-5,
+            head_dim: 0,
+            n_q_heads: 0,
+            n_kv_heads: 0,
+            rope_base: 10000.0,
         };
         let r = load_from_layout(dir, &layout);
         assert!(matches!(r, Err(VindexError::Parse(_))));

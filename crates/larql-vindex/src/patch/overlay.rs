@@ -113,6 +113,40 @@ pub struct PatchedVindex {
     gate_cache: RwLock<HashMap<usize, Arc<LayerGateCache>>>,
 }
 
+/// Snapshot a `PatchedVindex` for handing to a multi-second walk
+/// without holding the outer lock that owns it.
+///
+/// Component-wise clone:
+///   * `base: VectorIndex` — follows that type's Clone contract
+///     (Arc-bump for `MmapStorage`, fresh caches inside
+///     `GateStore`/`FfnStore`/`MetadataStore`).
+///   * `patches`, `overrides_meta`, `overrides_gate`, `deleted` —
+///     standard collection clones.
+///   * `knn_store: KnnStore` — clones entries; rebuilds key matrices
+///     lazily on first query against the new snapshot.
+///   * `gate_cache` — starts empty; warms up against the new
+///     snapshot's reads.
+///
+/// Cost on the production BitNet b1.58-2B-4T-gguf model: a few ms
+/// (dominated by the per-layer override-gate HashMap clones).
+/// That is orders of magnitude shorter than the multi-second walk,
+/// so the snapshot pattern in callers (snapshot under brief
+/// reader, drop, walk against snapshot) is the load-bearing fix
+/// for BUG-infer-deadlock §5.3.
+impl Clone for PatchedVindex {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            patches: self.patches.clone(),
+            overrides_meta: self.overrides_meta.clone(),
+            overrides_gate: self.overrides_gate.clone(),
+            deleted: self.deleted.clone(),
+            knn_store: self.knn_store.clone(),
+            gate_cache: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
 impl PatchedVindex {
     /// Create a patched vindex from a base index.
     pub fn new(base: VectorIndex) -> Self {
