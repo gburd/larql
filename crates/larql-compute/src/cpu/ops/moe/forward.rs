@@ -207,6 +207,12 @@ pub fn cpu_moe_forward(
                         };
                     }
 
+                    // Within-expert feature routing (aim-validation probe);
+                    // no-op unless a schedule is installed. Mirrors the
+                    // Q4_K-direct path so the f32-fallback (LARQL_DISABLE_Q4K_DIRECT)
+                    // measures the same object.
+                    super::within_expert::prune_act(&mut scratch.act, inter);
+
                     let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
                         .unwrap_or_else(|err| panic!("{err}"));
                     if down_w.is_empty() {

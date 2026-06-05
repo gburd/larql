@@ -196,6 +196,11 @@ pub fn moe_ffn_block_cpu(
         let moe_weights =
             crate::layer_graph::pipeline_layer::build_moe_weights(weights, arch, layer);
         if let Some(ref moe) = moe_weights {
+            // Within-expert routing probe: tag the layer for the expert calls
+            // below. No-op (one relaxed atomic store) unless a schedule is
+            // installed via `larql_compute::cpu::ops::moe::set_routing`; layers
+            // run sequentially so one store covers the per-position loop.
+            larql_compute::cpu::ops::moe::set_current_layer(layer);
             for pos in 0..seq_len {
                 let row: Vec<f32> = h_post_attn.row(pos).to_vec();
                 let moe_out =
@@ -340,6 +345,76 @@ mod tests {
         assert!(
             h.iter().all(|v| v.is_finite()),
             "Gemma 4 MoE hidden state must be finite"
+        );
+    }
+
+    /// MoE arch but no per-expert weights → `build_moe_weights` returns `None`
+    /// and `moe_ffn_block_cpu` takes the **dense-FFN fallback** branch
+    /// (`else { … return h_ple }`). Dropping `raw_bytes` removes the packed
+    /// expert blobs the BF16 path reads; attention + dense FFN come from
+    /// `tensors`/`vectors`/the q4k index, so the forward still completes.
+    #[test]
+    fn predict_kquant_hidden_moe_dense_fallback_when_no_expert_weights() {
+        use crate::test_utils::{make_test_gemma4_moe_weights, make_test_q4k_vindex};
+        let mut weights = make_test_gemma4_moe_weights();
+        let index = make_test_q4k_vindex(&weights);
+        weights.raw_bytes.clear(); // drop per-expert blobs → build_moe_weights None
+        let h = predict_kquant_hidden(&mut weights, &[0u32, 1], &index, None);
+        assert_eq!(h.shape(), &[2, weights.hidden_size]);
+        assert!(
+            h.iter().all(|v| v.is_finite()),
+            "dense-FFN fallback hidden state must be finite"
+        );
+    }
+
+    /// Within-expert routing (`larql_compute::…::moe::set_routing`) installed
+    /// before the forward must flow through the in-process MoE path
+    /// (`set_current_layer` → `prune_act` inside the expert kernel) and change
+    /// the output vs the dense (no-routing) baseline. Regression guard for the
+    /// `walk_ffn_v1_moe_within_expert` probe wiring. The `RoutingReset` drop
+    /// guard restores global state even on panic so it can't leak to other
+    /// tests (their MoE assertions are finiteness-only and tolerate pruning).
+    #[test]
+    fn predict_kquant_hidden_within_expert_routing_changes_output() {
+        use crate::test_utils::{make_test_gemma4_moe_weights, make_test_q4k_vindex};
+        use larql_compute::cpu::ops::moe::{
+            set_current_layer, set_routing, ExpertFeatureSelector, WithinExpertRouting,
+        };
+
+        struct RoutingReset;
+        impl Drop for RoutingReset {
+            fn drop(&mut self) {
+                set_routing(None);
+                set_current_layer(0);
+            }
+        }
+
+        let mut weights = make_test_gemma4_moe_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let nl = weights.num_layers;
+
+        let _reset = RoutingReset;
+        set_routing(None);
+        let dense = predict_kquant_hidden(&mut weights, &[0u32, 1], &index, None);
+
+        // Aggressively prune every expert layer's feature set.
+        set_routing(Some(WithinExpertRouting {
+            frac_per_layer: vec![Some(0.125); nl],
+            selector: ExpertFeatureSelector::ActMagnitude,
+        }));
+        let pruned = predict_kquant_hidden(&mut weights, &[0u32, 1], &index, None);
+        drop(_reset); // restore before asserting
+
+        assert_eq!(pruned.shape(), dense.shape());
+        assert!(pruned.iter().all(|v| v.is_finite()));
+        let max_abs_diff = dense
+            .iter()
+            .zip(pruned.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff > 1e-6,
+            "within-expert pruning must change the forward output (got max |Δ|={max_abs_diff})"
         );
     }
 
