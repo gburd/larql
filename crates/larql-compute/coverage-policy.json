@@ -1,5 +1,5 @@
 {
-  "policy_note": "Default policy is 90% line coverage per source file. After the larql-compute-metal extraction (ADR-019), this crate is CPU-side only — the trait, the CpuBackend impl, pipeline types, and env-option helpers. Every file is expected to clear the 90% floor without `exclude_globs` hacks. GPU-shader coverage lives in `crates/larql-compute-metal/coverage-policy.json`. 2026-06-06: two inherited debt baselines added to unblock CI — `attention/decode.rs` (55%) is dominated by the opt-in `run_attention_block_decode_step_q4k_direct` path (LARQL_Q4K_DIRECT_ATTN, roadmap #16) which default tests don't exercise; `kv_dispatch/cpu.rs` (88%) is the engine-unification dispatch surface. FOLLOW-UP: restore both to >=90 (decode.rs needs a Q4_K-attention fixture that runs the q4k-direct path; do not treat these floors as permanent).",
+  "policy_note": "Default policy is 90% line coverage per source file. After the larql-compute-metal extraction (ADR-019), this crate is CPU-side only — the trait, the CpuBackend impl, pipeline types, and env-option helpers. Every file is expected to clear the 90% floor without `exclude_globs` hacks. GPU-shader coverage lives in `crates/larql-compute-metal/coverage-policy.json`. 2026-06-06: the two inherited debt baselines (`attention/decode.rs` 55%, `kv_dispatch/cpu.rs` 88%) were retired — `attention/decode.rs` is now 92.3% and `kv_dispatch/cpu.rs` 97.1%. The q4k-direct decode path is driven directly via the `Q4kFixtureIndex` fixture (`run_attention_block_decode_step_q4k_direct`, no env var needed) plus an env-gated `attention_step` test (LARQL_Q4K_DIRECT_ATTN, OnceLock-owned by that single test). Residual misses in decode.rs are attention-bias / QK-norm / v-norm branches absent from the gemma3/tinymodel Q4K fixtures (no fixture carries attn biases); residual misses in cpu.rs are the indirect-matvec `coarse_decode_step{,_with_state}` arms, which need an index that supports cached-decode but NOT direct-matvec (structurally hard — both consume the same Q4_K slices).",
   "include_globs": [
     "crates/larql-compute/src/*.rs",
     "crates/larql-compute/src/**/*.rs"
@@ -8,8 +8,6 @@
   "default_line_min_percent": 90.0,
   "total_line_min_percent": 95.0,
   "per_file_line_min_percent": {
-    "crates/larql-compute/src/connectors/projector.rs": 80.0,
-    "crates/larql-compute/src/attention/decode.rs": 55.0,
-    "crates/larql-compute/src/kv_dispatch/cpu.rs": 88.0
+    "crates/larql-compute/src/connectors/projector.rs": 80.0
   }
 }
