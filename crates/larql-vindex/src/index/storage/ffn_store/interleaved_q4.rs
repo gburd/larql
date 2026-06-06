@@ -89,10 +89,7 @@ impl VectorIndex {
             if start >= mmap.len() {
                 return;
             }
-            unsafe {
-                let ptr = mmap[start..].as_ptr() as *mut libc::c_void;
-                libc::madvise(ptr, end - start, libc::MADV_WILLNEED);
-            }
+            crate::mmap_util::advise_willneed(mmap[start..].as_ptr(), end - start);
         }
     }
 }

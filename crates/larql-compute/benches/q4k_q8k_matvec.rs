@@ -28,9 +28,13 @@ extern crate blas_src;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use larql_compute::cpu::ops::q4_common::quantize_q4_k;
 use larql_compute::cpu::ops::q4k_q8k_dot::{
-    q4k_q8k_matvec_asm, q4k_q8k_matvec_neon, q4k_q8k_matvec_scalar, quantize_x_to_q8k,
-    Q8KActivation,
+    q4k_q8k_matvec_scalar, quantize_x_to_q8k, Q8KActivation,
 };
+// The NEON + hand-asm kernels are aarch64-only (`#[cfg(target_arch = "aarch64")]`
+// at their definitions); importing them unconditionally breaks the x86_64 build
+// (CI runs benches via `--all-targets`). Gate the import + their bench arms.
+#[cfg(target_arch = "aarch64")]
+use larql_compute::cpu::ops::q4k_q8k_dot::{q4k_q8k_matvec_asm, q4k_q8k_matvec_neon};
 
 const BLOCK_BYTES: usize = 144;
 const ELEMS_PER_BLOCK: usize = 256;
@@ -99,6 +103,7 @@ fn bench_q4k_q8k(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(weight_bytes(rows, cols)));
 
+        #[cfg(target_arch = "aarch64")]
         group.bench_with_input(BenchmarkId::new("neon", name), &(), |b, _| {
             b.iter(|| {
                 q4k_q8k_matvec_neon(&mut out, &q8, &w_q4, rows, cols);
@@ -107,6 +112,7 @@ fn bench_q4k_q8k(c: &mut Criterion) {
         });
 
         // C12 hand-asm kernel (bit-exact with scalar/neon — see parity test).
+        #[cfg(target_arch = "aarch64")]
         group.bench_with_input(BenchmarkId::new("asm", name), &(), |b, _| {
             b.iter(|| {
                 q4k_q8k_matvec_asm(&mut out, &q8, &w_q4, rows, cols);

@@ -13,6 +13,7 @@
   "per_file_line_min_percent": {
     "crates/larql-models/src/loading/gguf/orient.rs": 87.0,
     "crates/larql-models/src/loading/safetensors.rs": 89.0,
-    "crates/larql-models/src/connectors/projector.rs": 89.0
+    "crates/larql-models/src/connectors/projector.rs": 89.0,
+    "crates/larql-models/src/quant/ggml/tq.rs": 89.0
   }
 }

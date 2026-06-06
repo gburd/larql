@@ -22,18 +22,24 @@
 //!          --vindex output/granite-4.1-30b-q4k.vindex [--blob interleaved_q4k.bin] \
 //!          [--topk-frac 0.1] [--out PATH]`
 
+// Unix-only probe (madvise / F_NOCACHE / getrusage). On Windows everything but
+// a stub `main` is cfg'd out, leaving the cross-platform helpers as dead code.
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
+
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
 
 /// (major_faults, minor_faults) for this process so far.
+#[cfg(unix)]
 fn rusage_faults() -> (i64, i64) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     (ru.ru_majflt as i64, ru.ru_minflt as i64)
 }
 
+#[cfg(unix)]
 fn page_size() -> usize {
     let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if p > 0 {
@@ -45,6 +51,7 @@ fn page_size() -> usize {
 
 /// `madvise(MADV_DONTNEED)` over the whole mapping — request eviction of
 /// resident pages so the next touch faults from disk.
+#[cfg(unix)]
 fn evict(mmap: &Mmap) {
     #[cfg(unix)]
     unsafe {
@@ -160,6 +167,12 @@ fn summarize(
     })
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("mmap_cold_read_probe is unix-only (madvise / F_NOCACHE / getrusage).");
+}
+
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut vindex = None;

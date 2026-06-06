@@ -52,6 +52,22 @@ pub unsafe fn mmap_demand_paged(file: &std::fs::File) -> Result<memmap2::Mmap, s
     Ok(mmap)
 }
 
+/// Best-effort `MADV_WILLNEED` over a region already resolved to a raw
+/// pointer + length (e.g. a per-layer sub-range of a larger mmap). Centralises
+/// the `libc` reference so callers stay platform-agnostic — unix-only, a no-op
+/// on Windows (no `madvise`; the OS manages readahead).
+///
+/// # Safety
+///
+/// `ptr`/`len` must describe a region of a live mmap that outlives the call.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub fn advise_willneed(ptr: *const u8, len: usize) {
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_WILLNEED);
+    }
+}
+
 /// Apply sequential + willneed hints to an existing mmap. Unix-only;
 /// on Windows the function is a no-op (the OS handles readahead).
 #[cfg_attr(not(unix), allow(unused_variables))]

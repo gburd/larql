@@ -42,6 +42,13 @@ fn try_run(session: &mut Session, sql: &str) -> Result<Vec<String>, String> {
         .map_err(|e| format!("execute: {e}"))
 }
 
+/// Escape a filesystem path for embedding in an LQL string literal. The lexer
+/// treats `\` as an escape (dropping `\U`/`\T`/etc.), so Windows paths must
+/// double their backslashes — same fix `fresh_session` applies to the USE path.
+fn esc(p: &str) -> String {
+    p.replace('\\', "\\\\")
+}
+
 // ── COMPOSE-mode INSERT pipeline ───────────────────────────────────────
 //
 // A single `MODE COMPOSE` INSERT walks plan.rs (default-layer branch
@@ -264,7 +271,7 @@ fn merge_synthetic_into_current_default_strategy() {
     // `(None, _) => true` match arm (merge.rs 68) fires. Default strategy
     // is KeepSource (41).
     let (mut session, _dir, path) = fresh_session();
-    let out = try_run(&mut session, &format!(r#"MERGE "{path}";"#))
+    let out = try_run(&mut session, &format!(r#"MERGE "{}";"#, esc(&path)))
         .expect("merge into current should succeed");
     assert!(
         out.iter()
@@ -283,7 +290,7 @@ fn merge_with_keep_source_strategy() {
     let (mut session, _dir, path) = fresh_session();
     let out = try_run(
         &mut session,
-        &format!(r#"MERGE "{path}" ON CONFLICT KEEP_SOURCE;"#),
+        &format!(r#"MERGE "{}" ON CONFLICT KEEP_SOURCE;"#, esc(&path)),
     )
     .expect("merge keep_source");
     assert!(!out.is_empty());
@@ -294,7 +301,7 @@ fn merge_with_keep_target_strategy() {
     let (mut session, _dir, path) = fresh_session();
     let out = try_run(
         &mut session,
-        &format!(r#"MERGE "{path}" ON CONFLICT KEEP_TARGET;"#),
+        &format!(r#"MERGE "{}" ON CONFLICT KEEP_TARGET;"#, esc(&path)),
     )
     .expect("merge keep_target");
     assert!(!out.is_empty());
@@ -305,7 +312,7 @@ fn merge_with_highest_confidence_strategy() {
     let (mut session, _dir, path) = fresh_session();
     let out = try_run(
         &mut session,
-        &format!(r#"MERGE "{path}" ON CONFLICT HIGHEST_CONFIDENCE;"#),
+        &format!(r#"MERGE "{}" ON CONFLICT HIGHEST_CONFIDENCE;"#, esc(&path)),
     )
     .expect("merge highest_confidence");
     assert!(!out.is_empty());
@@ -317,8 +324,11 @@ fn merge_explicit_existing_target_returns_path() {
     // returned (not the NoBackend / current-backend fallback). Point both
     // source and target at the same valid synthetic dir.
     let (mut session, _dir, path) = fresh_session();
-    let out = try_run(&mut session, &format!(r#"MERGE "{path}" INTO "{path}";"#))
-        .expect("merge into existing target");
+    let out = try_run(
+        &mut session,
+        &format!(r#"MERGE "{p}" INTO "{p}";"#, p = esc(&path)),
+    )
+    .expect("merge into existing target");
     assert!(out.iter().any(|l| l.contains(&path)));
 }
 
