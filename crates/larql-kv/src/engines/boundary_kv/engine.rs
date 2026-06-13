@@ -217,6 +217,48 @@ impl KvEngine for BoundaryKvEngine {
         Ok(hidden)
     }
 
+    /// Resident-path prefill: forwards to the inner `StandardEngine`'s
+    /// resident form (threads `index` → Q4K-direct attention family) and
+    /// keeps the boundary frame emission identical to [`Self::prefill`].
+    fn prefill_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        let hidden = self.inner.prefill_resident(weights, ffn, index, token_ids)?;
+        self.abs_position = token_ids.len();
+        if self.maybe_emit_frame(weights, &hidden).is_err() {
+            return Err(EngineError::BackendFailure {
+                details: "boundary frame emit failed".into(),
+            });
+        }
+        Ok(hidden)
+    }
+
+    /// Resident-path decode: forwards to the inner `StandardEngine`'s
+    /// resident form; frame emission identical to [`Self::decode_step`].
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        let hidden = self.inner.decode_step_resident(weights, ffn, index, token_id)?;
+        self.abs_position += 1;
+        if self.maybe_emit_frame(weights, &hidden).is_err() {
+            return Err(EngineError::BackendFailure {
+                details: "boundary frame emit failed".into(),
+            });
+        }
+        Ok(hidden)
+    }
+
     fn memory_bytes(&self) -> usize {
         self.inner.memory_bytes()
     }

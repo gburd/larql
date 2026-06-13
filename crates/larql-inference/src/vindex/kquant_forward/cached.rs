@@ -1215,6 +1215,103 @@ mod tests {
         );
     }
 
+    /// Scaled-RoPE regression: on a Gemma-3 arch with linear
+    /// `rope_scaling` (position divisor 8 on the global layer), the
+    /// direct step must still track the staged step. Pre-2026-06-12 the
+    /// direct path roped Q/K with the UNSCALED `apply_rope_partial_at` —
+    /// no position divisor, no llama3 scaling — so on any rope-scaled
+    /// config the global layer's K landed at 8× the position the prefill
+    /// cache used. The non-scaled fixtures can't see that gap; this one
+    /// exists to.
+    #[test]
+    fn predict_kquant_decode_step_direct_tracks_staged_on_rope_scaled_arch() {
+        use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights_rope_scaled};
+
+        let mut weights_a = make_test_q4k_weights_rope_scaled();
+        // Guard: the fixture must actually parse into a divisor-8 global
+        // layer — otherwise this test silently stops testing anything.
+        let scaled_layers: Vec<usize> = (0..weights_a.num_layers)
+            .filter(|&l| weights_a.arch.rope_position_divisor_for_layer(l) == 8.0)
+            .collect();
+        assert!(
+            !scaled_layers.is_empty(),
+            "fixture drift: no layer carries rope position divisor 8 — \
+             the rope_scaling config no longer parses as global-only linear"
+        );
+        let index = make_test_q4k_vindex(&weights_a);
+        assert!(
+            supports_direct_matvec_decode(&weights_a, &index),
+            "rope-scaled fixture must support the direct-matvec path"
+        );
+
+        // Prompt long enough that the scaled position (pos/8) and the
+        // unscaled position differ by a large rotary angle.
+        let token_ids = vec![1u32, 2, 3, 4, 5];
+        let next = 6u32;
+
+        let (_, mut cache_a, _) =
+            predict_kquant_prefill(&mut weights_a, &token_ids, &index);
+        let (h_staged, _) = predict_kquant_decode_step(
+            &mut weights_a,
+            next,
+            &index,
+            &mut cache_a,
+            token_ids.len(),
+        )
+        .expect("staged step");
+
+        let mut weights_b = make_test_q4k_weights_rope_scaled();
+        let (_, mut cache_b, _) =
+            predict_kquant_prefill(&mut weights_b, &token_ids, &index);
+        let backend = CpuBackend;
+        let h_direct = predict_kquant_decode_step_direct(
+            &mut weights_b,
+            next,
+            &index,
+            &backend,
+            &mut cache_b,
+            token_ids.len(),
+        )
+        .expect("direct step");
+
+        // Primary assertion: the K row each path APPENDED to the cache.
+        // RoPE is relative — if the direct step ropes both new-Q and
+        // new-K at the wrong scale, their geometry to each other is
+        // preserved and the hidden state barely moves on a bland random
+        // fixture. The appended K row is the object the divisor rotates,
+        // and it must match the staged row at every layer (most of all
+        // the divisor-8 global layers).
+        for layer in 0..weights_a.num_layers {
+            let (k_a, _) = cache_a[layer].as_ref().expect("staged cache");
+            let (k_b, _) = cache_b[layer].as_ref().expect("direct cache");
+            let ra = k_a.row(k_a.nrows() - 1);
+            let rb = k_b.row(k_b.nrows() - 1);
+            let dot: f32 = ra.iter().zip(rb.iter()).map(|(x, y)| x * y).sum();
+            let na: f32 = ra.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = rb.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cos = dot / (na * nb);
+            assert!(
+                cos > 0.999,
+                "appended K row diverged at layer {layer} (divisor {}): cosine {cos} — \
+                 check the rope divisor / llama3 scaling in attention_decode_step_native",
+                weights_a.arch.rope_position_divisor_for_layer(layer)
+            );
+        }
+
+        // Secondary: the hidden state still tracks.
+        let a = h_staged.row(0);
+        let b = h_direct.row(0);
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(
+            cos > 0.999,
+            "direct step hidden diverged from staged on the rope-scaled arch \
+             (global layers {scaled_layers:?}): cosine {cos}"
+        );
+    }
+
     #[test]
     fn predict_kquant_decode_step_direct_returns_finite_hidden() {
         let mut fx = Q4KTestFixtures::build();

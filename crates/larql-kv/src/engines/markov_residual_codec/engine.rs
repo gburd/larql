@@ -89,6 +89,31 @@ impl MarkovResidualCodecEngine {
 // mutate `store` / `kv_handle` / `abs_position` / `profile` (all
 // `pub(super)`).
 
+impl MarkovResidualCodecEngine {
+    /// Shared body for `decode_step` / `decode_step_resident`.
+    fn decode_step_impl(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Result<Array2<f32>, EngineError> {
+        let rs = self
+            .store
+            .take()
+            .ok_or_else(|| EngineError::InvariantViolation {
+                what: "decode_step called before prefill (store missing)".into(),
+            })?;
+        let (hidden, new_rs) =
+            rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref(), Some(ffn), index)
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "rs_decode_step_codec returned None".into(),
+                })?;
+        self.store = Some(new_rs);
+        Ok(hidden)
+    }
+}
+
 impl KvEngine for MarkovResidualCodecEngine {
     fn name(&self) -> &str {
         "markov-rs-codec"
@@ -140,19 +165,19 @@ impl KvEngine for MarkovResidualCodecEngine {
         ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        let rs = self
-            .store
-            .take()
-            .ok_or_else(|| EngineError::InvariantViolation {
-                what: "decode_step called before prefill (store missing)".into(),
-            })?;
-        let (hidden, new_rs) =
-            rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref(), Some(ffn))
-                .ok_or_else(|| EngineError::BackendFailure {
-                    details: "rs_decode_step_codec returned None".into(),
-                })?;
-        self.store = Some(new_rs);
-        Ok(hidden)
+        self.decode_step_impl(weights, ffn, token_id, None)
+    }
+
+    /// Resident-path decode: threads `index` to the attention step's
+    /// Q4K-direct route (the non-standard-engine structural-gap fix).
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.decode_step_impl(weights, ffn, token_id, Some(index))
     }
 
     fn memory_bytes(&self) -> usize {

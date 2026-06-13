@@ -1,5 +1,38 @@
 # Roadmap — larql-kv
 
+## CPU resident fast-path — all engines pluggable into it (2026-06-13)
+
+The 2026-06-11/12 CPU fast-path arc (Q4K-direct + int8 attention, q4k
+lm_head/dense residency, hand-asm kernels, KV append-in-place — see
+`bench/baselines/c10_gemma4-26b-a4b_cpu_reconciled.json`) initially landed
+only on `StandardEngine`: the `KvEngine::decode_step_resident` trait default
+DROPPED the index (`let _ = index`), so every own-walk-loop engine stayed on
+f32 attention. **Fixed:**
+
+- New single-source dispatcher
+  `larql_compute::attention::run_attention_block_decode_step_auto` — makes
+  the same q4k-direct-vs-f32 per-layer choice as
+  `CpuBackend::attention_step`, for callers that own `SharedKV` caches.
+- `markov-rs`, `markov-rs-codec`, `turbo-quant`, `unlimited-context`,
+  `boundary_per_layer` now override `decode_step_resident` and thread the
+  vindex down their walk loops to `_auto`. `boundary-kv` forwards both
+  resident methods to its inner `StandardEngine` (was silently dropping to
+  the f32 path). `no_cache`/`apollo` keep the default by design (debug /
+  bench-only full re-forward).
+- Regression pin: `engines::resident_identity_tests` — for 7 concrete
+  engine specs, `prefill/decode_step_resident` must be BIT-IDENTICAL to
+  `prefill/decode_step` with the flags off, and the covered-engine count
+  must not shrink.
+- Measured effect (26B, flags on, within-run ratios vs standard — absolute
+  numbers pending a quiet machine): turbo 0.64×→0.85×, unlimited
+  0.76×→1.07×; markov/codec/boundary_per_layer flat — their cost is their
+  own recompute/codec machinery (the feature), not the attention path;
+  markov's walk already tries the kquant-native attention helper first.
+
+Prefill stays on the f32 BLAS gemm for all engines deliberately (the task
+#16 prefill falsification: q4k repeated-matvec loses ~20× to AMX at
+prefill shapes).
+
 ## Hardening — codebase review 2026-05-28
 
 From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):

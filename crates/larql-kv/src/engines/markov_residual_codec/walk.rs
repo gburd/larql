@@ -10,7 +10,7 @@
 
 use larql_compute::ComputeBackend;
 use larql_inference::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
+    run_attention_with_kv_backend, SharedKV,
 };
 use larql_inference::forward::{embed_tokens_pub, run_ffn};
 use larql_inference::model::ModelWeights;
@@ -224,13 +224,14 @@ pub fn rs_decode_step_codec_walk(
             abs_position,
         );
         let (h_post_attn, new_kv_full) = native_result.or_else(|| {
-            run_attention_block_decode_step_backend(
+            larql_inference::attention::run_attention_block_decode_step_auto(
                 weights,
                 &h_new,
                 layer,
                 Some(&kv_pair),
                 abs_position,
                 Some(backend),
+                Some(index as &dyn larql_compute::KvIndex),
             )
         })?;
         if let Some(t) = t_attn {

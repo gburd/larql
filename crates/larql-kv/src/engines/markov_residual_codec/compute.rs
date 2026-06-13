@@ -7,7 +7,7 @@
 
 use larql_compute::ComputeBackend;
 use larql_inference::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
+    run_attention_with_kv_backend, SharedKV,
 };
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::embed_tokens_pub;
@@ -99,6 +99,7 @@ pub fn rs_decode_step_codec(
     rs: RsStoreCodec,
     backend: &dyn ComputeBackend,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStoreCodec)> {
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
@@ -148,13 +149,14 @@ pub fn rs_decode_step_codec(
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
+        let (h_post_attn, _new_kv) = larql_inference::attention::run_attention_block_decode_step_auto(
             weights,
             &h_new,
             layer,
             Some(&(k_full, v_full)),
             abs_position,
             Some(backend),
+            index.map(|v| v as &dyn larql_compute::KvIndex),
         )?;
 
         let bffn = BackendFfn { weights, backend };
@@ -302,7 +304,7 @@ mod tests {
             None,
         );
         assert_eq!(prefill.store.next_position, 2);
-        let (_, rs2) = rs_decode_step_codec(&weights, 2, prefill.store, &CpuBackend, None).unwrap();
+        let (_, rs2) = rs_decode_step_codec(&weights, 2, prefill.store, &CpuBackend, None, None).unwrap();
         assert_eq!(rs2.next_position, 3);
     }
 
@@ -318,7 +320,7 @@ mod tests {
             None,
         );
         assert!(prefill.store.cold_kv.is_some());
-        let (h, _) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None).unwrap();
+        let (h, _) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }
@@ -336,10 +338,10 @@ mod tests {
             &CpuBackend,
             None,
         );
-        let (_, rs2) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None).unwrap();
+        let (_, rs2) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
         // Second decode: cold_kv was cleared by overflow at the first decode,
         // so this step exercises the cold_encoded recompute branch.
-        let (h, _) = rs_decode_step_codec(&weights, 5, rs2, &CpuBackend, None).unwrap();
+        let (h, _) = rs_decode_step_codec(&weights, 5, rs2, &CpuBackend, None, None).unwrap();
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }

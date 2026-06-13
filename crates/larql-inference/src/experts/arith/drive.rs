@@ -15,7 +15,7 @@ use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 use tokenizers::Tokenizer;
 
-use crate::vindex::generate_kquant_cpu_constrained_cached;
+use crate::vindex::generate_kquant_cpu_constrained_cached_streaming;
 
 /// Why the forced decode stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,23 @@ pub fn force_decode_kquant(
     prompt_ids: &[u32],
     schedule: &[u32],
 ) -> ForcedDecode {
+    force_decode_kquant_streaming(weights, tokenizer, index, prompt_ids, schedule, |_, _| {})
+}
+
+/// Streaming sibling of [`force_decode_kquant`]: `on_token(id, text)` fires
+/// as each forced token decodes — the showcase path, where the splice is
+/// rendered live into the model's own sentence.
+pub fn force_decode_kquant_streaming<F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    index: &VectorIndex,
+    prompt_ids: &[u32],
+    schedule: &[u32],
+    on_token: F,
+) -> ForcedDecode
+where
+    F: FnMut(u32, &str),
+{
     if schedule.is_empty() {
         return ForcedDecode {
             emitted: String::new(),
@@ -66,7 +83,7 @@ pub fn force_decode_kquant(
         };
     }
     let sched = schedule.to_vec();
-    let out = generate_kquant_cpu_constrained_cached(
+    let out = generate_kquant_cpu_constrained_cached_streaming(
         weights,
         tokenizer,
         prompt_ids,
@@ -89,6 +106,7 @@ pub fn force_decode_kquant(
                 }
             }
         },
+        on_token,
     );
 
     let ids: Vec<u32> = out.iter().map(|(_, id)| *id).collect();

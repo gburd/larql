@@ -133,10 +133,37 @@ pub fn generate_kquant_cpu_constrained_cached<M>(
     prompt_ids: &[u32],
     max_tokens: usize,
     index: &VectorIndex,
-    mut mask_fn: M,
+    mask_fn: M,
 ) -> Vec<(String, u32)>
 where
     M: FnMut(&[u32], &mut Vec<f32>),
+{
+    generate_kquant_cpu_constrained_cached_streaming(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        |_, _| {},
+    )
+}
+
+/// Streaming-callback sibling of [`generate_kquant_cpu_constrained_cached`]:
+/// fires `on_token(id, text)` after each pick so callers can render tokens
+/// as they decode (the showcase/demo path).
+pub fn generate_kquant_cpu_constrained_cached_streaming<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mut mask_fn: M,
+    mut on_token: F,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str),
 {
     if !super::cached::supports_cached_decode(weights) {
         return generate_kquant_cpu_constrained(
@@ -189,6 +216,7 @@ where
         }
         let tok = tokenizer.decode(&[id], true).unwrap_or_default();
         let stop = eos.is_eos_with_tokenizer(id, &tok, tokenizer);
+        on_token(id, &tok);
         out.push((tok, id));
         generated.push(id);
         if stop || step + 1 == max_tokens {

@@ -10,7 +10,7 @@ use super::store::RsStore;
 use crate::profiler::EngineProfiler;
 use larql_inference::attention::SharedKV;
 use larql_inference::attention::{
-    apply_rope_partial_at, run_attention_block_decode_step_backend, run_attention_with_kv_backend,
+    apply_rope_partial_at, run_attention_with_kv_backend,
 };
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::{add_bias, apply_norm, embed_tokens_pub};
@@ -152,10 +152,12 @@ pub fn rs_decode_step(
     rs: RsStore,
     backend: &dyn ComputeBackend,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStore)> {
-    rs_decode_step_inner(weights, new_token_id, rs, backend, None, moe_ffn)
+    rs_decode_step_inner(weights, new_token_id, rs, backend, None, moe_ffn, index)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rs_decode_step_profiled(
     weights: &ModelWeights,
     new_token_id: u32,
@@ -163,8 +165,9 @@ pub(crate) fn rs_decode_step_profiled(
     backend: &dyn ComputeBackend,
     profiler: &mut EngineProfiler,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStore)> {
-    rs_decode_step_inner(weights, new_token_id, rs, backend, Some(profiler), moe_ffn)
+    rs_decode_step_inner(weights, new_token_id, rs, backend, Some(profiler), moe_ffn, index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,6 +178,7 @@ fn rs_decode_step_inner(
     backend: &dyn ComputeBackend,
     mut profiler: Option<&mut EngineProfiler>,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStore)> {
     use std::time::Instant;
 
@@ -257,13 +261,14 @@ fn rs_decode_step_inner(
         } else {
             None
         };
-        let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
+        let (h_post_attn, _new_kv) = larql_inference::attention::run_attention_block_decode_step_auto(
             weights,
             &h_new,
             layer,
             Some(&(k_full, v_full)),
             abs_position,
             Some(backend),
+            index.map(|v| v as &dyn larql_compute::KvIndex),
         )?;
         if let Some(t) = t_attn {
             attention_us += t.elapsed().as_secs_f64() * 1e6;
@@ -995,7 +1000,7 @@ mod tests {
         let weights = make_test_weights();
         let prefill = rs_prefill(&weights, &[0u32], None, &CpuBackend, None);
         let (h, _) =
-            rs_decode_step(&weights, 1, prefill.store, &CpuBackend, None).expect("decode step");
+            rs_decode_step(&weights, 1, prefill.store, &CpuBackend, None, None).expect("decode step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }
@@ -1005,9 +1010,9 @@ mod tests {
         let weights = make_test_weights();
         let prefill = rs_prefill(&weights, &[0u32, 1], None, &CpuBackend, None);
         assert_eq!(prefill.store.next_position, 2);
-        let (_, rs2) = rs_decode_step(&weights, 2, prefill.store, &CpuBackend, None).unwrap();
+        let (_, rs2) = rs_decode_step(&weights, 2, prefill.store, &CpuBackend, None, None).unwrap();
         assert_eq!(rs2.next_position, 3);
-        let (_, rs3) = rs_decode_step(&weights, 3, rs2, &CpuBackend, None).unwrap();
+        let (_, rs3) = rs_decode_step(&weights, 3, rs2, &CpuBackend, None, None).unwrap();
         assert_eq!(rs3.next_position, 4);
     }
 
@@ -1023,14 +1028,14 @@ mod tests {
             prefill.store.cold_kv.is_some(),
             "expected cold_kv to be set"
         );
-        let (h, rs2) = rs_decode_step(&weights, 4, prefill.store, &CpuBackend, None)
+        let (h, rs2) = rs_decode_step(&weights, 4, prefill.store, &CpuBackend, None, None)
             .expect("decode_step over cold_kv");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
         // After overflow merges into cold_residuals, cold_kv is cleared
         // (compute.rs line 260) so a second decode exercises the
         // cold_residuals-only branch (lines 149-160).
-        let (h2, _) = rs_decode_step(&weights, 5, rs2, &CpuBackend, None)
+        let (h2, _) = rs_decode_step(&weights, 5, rs2, &CpuBackend, None, None)
             .expect("decode_step over cold_residuals");
         assert_eq!(h2.shape(), &[1, weights.hidden_size]);
         assert!(h2.iter().all(|v| v.is_finite()));
@@ -1089,7 +1094,7 @@ mod tests {
         assert!(prefill.store.cold_kv.is_some());
         let mut profiler = EngineProfiler::default();
         let result =
-            rs_decode_step_profiled(&weights, 4, prefill.store, &CpuBackend, &mut profiler, None);
+            rs_decode_step_profiled(&weights, 4, prefill.store, &CpuBackend, &mut profiler, None, None);
         assert!(result.is_some());
         // Profiler must record positive durations across all stages.
         assert!(profiler.recompute_hot.count > 0);
@@ -1106,13 +1111,13 @@ mod tests {
         // cold_kv (compute.rs line 260); second hits the cold_residuals
         // branch (lines 149-160) under profiling.
         let prefill = rs_prefill(&weights, &[0u32, 1, 2, 3], Some(2), &CpuBackend, None);
-        let (_, rs2) = rs_decode_step(&weights, 4, prefill.store, &CpuBackend, None).unwrap();
+        let (_, rs2) = rs_decode_step(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
         assert!(
             rs2.cold_kv.is_none(),
             "cold_kv should be cleared after overflow"
         );
         let mut profiler = EngineProfiler::default();
-        let result = rs_decode_step_profiled(&weights, 5, rs2, &CpuBackend, &mut profiler, None);
+        let result = rs_decode_step_profiled(&weights, 5, rs2, &CpuBackend, &mut profiler, None, None);
         assert!(result.is_some());
         // cold_residuals branch exercises recompute_cold counter (line 171).
         assert!(profiler.recompute_cold.count > 0);
@@ -1385,7 +1390,7 @@ mod tests {
             max_window: None,
             cold_len: 0,
         };
-        let result = rs_decode_step(&weights, 0, store, &CpuBackend, None);
+        let result = rs_decode_step(&weights, 0, store, &CpuBackend, None, None);
         assert!(result.is_some());
         let (h, _) = result.unwrap();
         assert_eq!(h.shape(), &[1, weights.hidden_size]);

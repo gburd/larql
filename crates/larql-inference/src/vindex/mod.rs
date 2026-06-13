@@ -17,7 +17,7 @@ pub use kquant_forward::{
     attention_decode_step_native, ffn_decode_step_native, fused_decode_step,
     fused_decode_step_with_state, fused_prefill, generate_kquant_cpu, generate_kquant_cpu_cached,
     generate_kquant_cpu_constrained, generate_kquant_cpu_constrained_cached,
-    generate_kquant_cpu_constrained_streaming,
+    generate_kquant_cpu_constrained_cached_streaming, generate_kquant_cpu_constrained_streaming,
     generate_kquant_cpu_constrained_streaming_sampled, generate_kquant_cpu_remote,
     insert_q4k_layer_tensors, is_end_of_turn, kquant_ffn_forward_layer,
     kquant_ffn_forward_layer_q8k, moe_ffn_block_cpu, moe_ffn_block_cpu_with_index, predict_kquant,

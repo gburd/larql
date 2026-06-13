@@ -39,6 +39,7 @@ pub fn rs_extend_from_checkpoint(
         abs_start,
         &larql_compute::CpuBackend,
         None,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ pub fn rs_extend_from_checkpoint_backend(
     abs_start: usize,
     backend: &dyn ComputeBackend,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
@@ -79,13 +81,14 @@ pub fn rs_extend_from_checkpoint_backend(
                 None
             };
 
-            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+            let (h_post_attn, new_kv) = larql_inference::attention::run_attention_block_decode_step_auto(
                 weights,
                 &h,
                 layer,
                 kv_entry,
                 abs_position,
                 Some(backend),
+                index.map(|v| v as &dyn larql_compute::KvIndex),
             )?;
 
             let bffn = BackendFfn { weights, backend };

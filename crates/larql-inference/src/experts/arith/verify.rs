@@ -32,7 +32,7 @@ pub fn magnitude_prior(
     let Some(text) = native_text else {
         return Verdict::Skipped;
     };
-    let Some(native) = first_number(text) else {
+    let Some(native) = native_answer_number(text) else {
         return Verdict::Skipped;
     };
 
@@ -55,6 +55,21 @@ pub fn magnitude_prior(
             "native {native} vs alu {answer} (magnitude ratio {ratio:.2})"
         ))
     }
+}
+
+/// The number the native text offers as its ANSWER. Models typically
+/// restate the operands before answering ("123456 + 654321 = 777777"), so
+/// the first number in the text is usually an echo, not the answer — that
+/// misread false-flagged the showcase. The model's own `=` is its answer
+/// marker: take the first number after the LAST `=`; fall back to the
+/// first number in the text when no marked answer exists.
+fn native_answer_number(text: &str) -> Option<BigInt> {
+    if let Some(idx) = text.rfind('=') {
+        if let Some(n) = first_number(&text[idx + 1..]) {
+            return Some(n);
+        }
+    }
+    first_number(text)
 }
 
 /// First decimal number in free text (optional leading `-`, separators
@@ -172,5 +187,28 @@ mod tests {
         assert_eq!(first_number("x-5y"), Some(big("-5")));
         assert_eq!(first_number("12-5"), Some(big("12")));
         assert_eq!(first_number(""), None);
+    }
+
+    #[test]
+    fn native_answer_reads_after_the_models_own_equals_marker() {
+        // The showcase false-flag: the model restates operands before
+        // answering — the answer is the number after its `=`, not the
+        // first number in the text.
+        assert_eq!(
+            magnitude_prior(&big("777777"), Some("123456 + 654321 = 777777"), 6),
+            Verdict::Consistent
+        );
+        // Trailing `=` with nothing after it (the model starting a new
+        // problem) falls back to the first number — which IS the answer
+        // in the "19\n12 - 7 =" continuation shape.
+        assert_eq!(
+            magnitude_prior(&big("19"), Some("19\n12 - 7 ="), 2),
+            Verdict::Consistent
+        );
+        // No `=` at all: first number, as before.
+        assert_eq!(
+            magnitude_prior(&big("42"), Some("The answer is 42."), 2),
+            Verdict::Consistent
+        );
     }
 }

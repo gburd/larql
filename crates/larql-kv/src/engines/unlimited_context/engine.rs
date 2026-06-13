@@ -131,12 +131,25 @@ impl UnlimitedContextEngine {
         tokens: &[u32],
         moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
     ) -> Option<()> {
+        self.process_with_index(weights, tokens, moe_ffn, None)
+    }
+
+    /// `process` with an optional vindex threaded to the per-token attention
+    /// steps (Q4K-direct route under `LARQL_Q4K_DIRECT_ATTN` — the
+    /// non-standard-engine structural-gap fix).
+    pub fn process_with_index(
+        &mut self,
+        weights: &ModelWeights,
+        tokens: &[u32],
+        moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Option<()> {
         let mut remaining = tokens;
         while !remaining.is_empty() {
             let free = self.window_size - self.current_window_tokens.len();
             let take = remaining.len().min(free);
             let (chunk, rest) = remaining.split_at(take);
-            self.extend_current(weights, chunk, moe_ffn)?;
+            self.extend_current(weights, chunk, moe_ffn, index)?;
             remaining = rest;
             if self.current_window_tokens.len() >= self.window_size {
                 self.close_window();
@@ -177,6 +190,7 @@ impl UnlimitedContextEngine {
             prior,
             abs_offset,
             self.backend.as_ref(),
+            None,
             None,
         )?;
         let abs_end = abs_offset + tokens.len() - 1;
@@ -306,6 +320,7 @@ impl UnlimitedContextEngine {
         weights: &ModelWeights,
         chunk: &[u32],
         moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<()> {
         if chunk.is_empty() {
             return Some(());
@@ -332,6 +347,7 @@ impl UnlimitedContextEngine {
             abs_start,
             self.backend.as_ref(),
             moe_ffn,
+            index,
         )?;
 
         self.last_hidden = Some(out.last_hidden);
@@ -471,6 +487,26 @@ impl KvEngine for UnlimitedContextEngine {
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
         self.process(weights, &[token_id], Some(ffn))
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process returned None during decode_step".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after decode_step".into(),
+            })
+    }
+
+    /// Resident-path decode: threads `index` to the per-token attention
+    /// steps' Q4K-direct route (the non-standard-engine structural-gap fix).
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.process_with_index(weights, &[token_id], Some(ffn), Some(index))
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process returned None during decode_step".into(),
             })?;

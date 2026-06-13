@@ -19,6 +19,12 @@ algorithm (bounded-depth, A4e/A5). Therefore:
 > once surface form is uncontrolled (template-fragility 0.58–0.67 at sizes where one
 > template scored 0.93); A10 measured dispatch ≥ native in every cell at equal-or-known
 > token cost. The model's own arithmetic output is consumed only as a verification prior.
+>
+> Scale note (A14, 12B): the capability WALLS are per-model — at 12B the carry wall moved
+> ~7–8 → ~13–16 digits and the magnitude wall ~24–28 → 28–32, while exact-long-random
+> stayed ~0 at both scales. This does NOT touch this policy: "fired ⇒ dispatch, always" is
+> justified by A8's template-fragility (surface-form), which was never length-based. Any
+> future length-aware variant must re-derive its thresholds on the host model.
 
 This component is also **instance #1 of the VirtualExpert trait** (§8) — the gate /
 extract / compute / drive / verify decomposition is intended to be reused by future
@@ -57,9 +63,16 @@ Two tiers, evaluated during the prompt forward pass (which runs anyway — the t
 free read, not a 0.24-forward surcharge; the 0.24 framing only applies if an early-exit
 dispatch skips the remaining layers, which is an optional optimization, OPEN).
 
-**Tier 0 — symbolic (explicit math).** Regex/scanner over the token stream for operator
-tokens adjacent to digit spans. Cost ~0. MEASURED: fire 1.0, extraction downstream 1.0
-(A10 bare cells).
+**Tier 0 — symbolic (explicit math notation).** Scanner over the prompt surface for
+digit chains joined by math notation. Cost ~0. MEASURED: fire 1.0, extraction
+downstream 1.0 (A10 bare cells). **Scope rule (larql-rs v0.1, adversarial-prose
+measured):** tier-0 fires on *notation*, never on inferred intent — strong glyphs
+(`+`, `*`, `×`, `−`) fire anywhere; ambiguous prose operators (spaced `-`, standalone
+`x` — ranges, scores, shifts, dimensions, spaced dates) fire only with an explicit
+trailing `=`. Everything else is the designed fallthrough: deciding whether "9 - 5"
+is arithmetic is an engagement question and belongs to the model (tier-1 exhaust, or
+an FR3-style explicit classify), not to surface heuristics. Adversarial prose corpus:
+0 false fires (`examples/scanner_adversarial.rs`).
 
 **Tier 1 — engagement probe (disguised math). DEMOTED (A11).** Ridge probe on the L8
 residual at the last prompt token, reading arithmetic-engagement exhaust (math vs
@@ -140,8 +153,9 @@ The native estimator is retained as a **magnitude prior**, nothing more:
 - Use: after extraction, compare ALU result's magnitude (digit count, leading digit)
   against the model's native answer *if one was produced*, or skip. Mismatch ⇒ flag
   `extract_suspect`, re-extract once, surface on second failure.
-- HARD RULE: the prior is void past 24-digit operands (A5 magnitude wall). Never gate a
-  correctness decision on it; it is a tripwire for extraction bugs only.
+- HARD RULE: the prior is void past 24-digit operands (A5 magnitude wall, **4B**; at 12B
+  the wall measured 28–32, A14 — the void threshold is PER-MODEL, re-derive on host).
+  Never gate a correctness decision on it; it is a tripwire for extraction bugs only.
 - v0.1 status: not exercised in any assembly run (A10 pre-registered it out) — wire it
   but treat its thresholds as ASSUMED until an assembly increment measures the
   false-flag rate.
@@ -202,6 +216,7 @@ weights touched, no model routing used); compute is **never** the model's.
 | disguised-path token overhead | ~2× (rewrite floor) | MEASURED | A8/A10 |
 | estimator prior envelope | ±25–35% to 24 digits; void ≥28 | MEASURED | A4c/A5 |
 | end-to-end demo | 24-digit add 0.92 vs native 0.00, equal tokens | MEASURED | A10 |
+| forced decode, Metal Q4_K | 6/6 exact, schedule-end 6/6, ~20 tok/s e2e | MEASURED | larql-rs 2026-06-12 |
 
 ## 10. Out of scope / risks
 
@@ -220,9 +235,14 @@ weights touched, no model routing used); compute is **never** the model's.
    is an audit instrument and disguised coverage is parked behind the exhaust-generality
    instrument science. The explicit path — the measured-1.0 path — is the product
    surface; native is the designed fallthrough for everything else.
-5. **Quantization.** All measurements bf16/MLX. Behavior under Q4_K/Q6_K on the Metal
-   pipeline: ASSUMED stable for forced decode (sampler-level, quantization-independent);
-   probe and injection paths need one re-calibration run.
+5. **Quantization.** Arc measurements bf16/MLX. Forced decode under Q4_K on the Metal
+   pipeline: **MEASURED** (2026-06-12, larql-rs assembly run): AT-1 6/6 exact with
+   schedule-end termination through the backend-routed constrained path, 345 ms–1.26 s
+   per item incl. prefill (24-digit add = 25 forced tokens at ~20 tok/s end-to-end) —
+   `bench/aim-validation/ave_demo_gemma3-4b.json`, `ave_demo --metal`. The
+   sampler-level argument held: the mask applies to CPU-resident logits, so the drive
+   is backend- and quantization-independent by construction *and now by measurement*.
+   Probe and injection paths still need a re-calibration run if revived.
 
 ## 11. Acceptance tests (assembly increments)
 

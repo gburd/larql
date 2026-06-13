@@ -56,7 +56,14 @@ where
         out_slice
             .par_chunks_mut(head_dim)
             .enumerate()
-            .for_each(|(h, out_h)| {
+            .for_each_init(
+                // Per-worker scores scratch, reused across all heads this
+                // worker processes (and across calls — rayon workers are
+                // long-lived). The per-head `vec![0.0; total_len]` it
+                // replaces was ~480 allocs+zeroings per token at 26B sizes
+                // and grew with context.
+                Vec::<f32>::new,
+                |scores, (h, out_h)| {
                 let kv_h = h / reps;
                 let q_off = h * head_dim;
                 let kv_off = kv_h * head_dim;
@@ -64,7 +71,7 @@ where
                 let q_row = q_new.slice(ndarray::s![0, q_off..q_off + head_dim]);
                 let k_block = k_full.slice(ndarray::s![.., kv_off..kv_off + head_dim]);
                 let raw: ndarray::Array1<f32> = k_block.dot(&q_row);
-                let mut scores = vec![0.0f32; total_len];
+                scores.resize(total_len, 0.0);
                 for i in 0..total_len {
                     let mut s = raw[i] * scale_f32;
                     if let Some(cap) = softcap {
@@ -91,7 +98,8 @@ where
                 out_h.copy_from_slice(
                     weighted_v.as_slice().expect("1-D dot output is contiguous"),
                 );
-            });
+                },
+            );
     }
     out
 }
@@ -297,6 +305,55 @@ pub fn run_attention_block_decode_step_backend(
     };
 
     Some((h_post_attn, (k_concat, v_concat)))
+}
+
+/// `LARQL_Q4K_DIRECT_ATTN=1`: route decode-step attention projections through
+/// the Q4K-direct kernels (packed bytes from the index) instead of the
+/// f32-BLAS path over pre-dequantised `weights.tensors`. Single source of
+/// truth for the flag — `CpuBackend::attention_step` and the engine walk
+/// loops (via [`run_attention_block_decode_step_auto`]) must make the same
+/// choice. Cached once; never in the hot loop.
+pub fn q4k_direct_attn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LARQL_Q4K_DIRECT_ATTN").as_deref() == Ok("1"))
+}
+
+/// Best-available decode-step attention for callers that own their cache as
+/// `SharedKV` tuples (engine walk loops, the cached-generation parity
+/// oracle): Q4K-direct projections (int8 under `LARQL_Q4K_ATTN_INT8`, asm
+/// under `LARQL_Q4K_ASM`) when the flag is on and an index with attention
+/// bytes is supplied, else the f32 path — the SAME per-layer choice
+/// `CpuBackend::attention_step` makes on the dispatch path, so engines and
+/// the oracle stay numerically aligned. With the flag off (default) this is
+/// byte-identical to calling `run_attention_block_decode_step_backend`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn run_attention_block_decode_step_auto(
+    weights: &larql_models::ModelWeights,
+    h_new: &Array2<f32>,
+    layer: usize,
+    kv_entry: Option<&SharedKV>,
+    abs_position: usize,
+    backend: Option<&dyn crate::ComputeBackend>,
+    index: Option<&dyn crate::KvIndex>,
+) -> Option<(Array2<f32>, SharedKV)> {
+    if q4k_direct_attn_enabled() {
+        if let (Some(be), Some(idx)) = (backend, index) {
+            if let Some(r) = run_attention_block_decode_step_q4k_direct(
+                weights,
+                h_new,
+                layer,
+                kv_entry,
+                abs_position,
+                be,
+                idx,
+            ) {
+                return Some(r);
+            }
+        }
+    }
+    run_attention_block_decode_step_backend(weights, h_new, layer, kv_entry, abs_position, backend)
 }
 
 /// `LARQL_Q4K_ATTN_INT8=1`: upgrade the Q4K-direct attention projections from

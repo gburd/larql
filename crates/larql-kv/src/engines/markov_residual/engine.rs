@@ -61,6 +61,46 @@ impl MarkovResidualEngine {
 // additional `impl MarkovResidualEngine` block. They mutate the
 // `pub(super)` fields above.
 
+impl MarkovResidualEngine {
+    /// Shared body for `decode_step` / `decode_step_resident` — `index`
+    /// reaches the attention step's Q4K-direct route when present.
+    fn decode_step_impl(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Result<Array2<f32>, EngineError> {
+        let rs = self
+            .store
+            .take()
+            .ok_or_else(|| EngineError::InvariantViolation {
+                what: "decode_step called before prefill (store missing)".into(),
+            })?;
+        let (hidden, new_rs) = if self.profiling {
+            rs_decode_step_profiled(
+                weights,
+                token_id,
+                rs,
+                self.backend.as_ref(),
+                &mut self.profile,
+                Some(ffn),
+                index,
+            )
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "rs_decode_step_profiled returned None".into(),
+            })?
+        } else {
+            rs_decode_step(weights, token_id, rs, self.backend.as_ref(), Some(ffn), index)
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "rs_decode_step returned None".into(),
+                })?
+        };
+        self.store = Some(new_rs);
+        Ok(hidden)
+    }
+}
+
 impl KvEngine for MarkovResidualEngine {
     fn name(&self) -> &str {
         "markov-rs"
@@ -110,33 +150,21 @@ impl KvEngine for MarkovResidualEngine {
         ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        let rs = self
-            .store
-            .take()
-            .ok_or_else(|| EngineError::InvariantViolation {
-                what: "decode_step called before prefill (store missing)".into(),
-            })?;
-        let (hidden, new_rs) = if self.profiling {
-            rs_decode_step_profiled(
-                weights,
-                token_id,
-                rs,
-                self.backend.as_ref(),
-                &mut self.profile,
-                Some(ffn),
-            )
-            .ok_or_else(|| EngineError::BackendFailure {
-                details: "rs_decode_step_profiled returned None".into(),
-            })?
-        } else {
-            rs_decode_step(weights, token_id, rs, self.backend.as_ref(), Some(ffn)).ok_or_else(
-                || EngineError::BackendFailure {
-                    details: "rs_decode_step returned None".into(),
-                },
-            )?
-        };
-        self.store = Some(new_rs);
-        Ok(hidden)
+        self.decode_step_impl(weights, ffn, token_id, None)
+    }
+
+    /// Resident-path decode: threads `index` down to the walk's attention
+    /// step so the Q4K-direct projections (`LARQL_Q4K_DIRECT_ATTN` family)
+    /// can fire — the structural gap that left non-standard engines on the
+    /// f32 path after the standard engine got the fast attention.
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.decode_step_impl(weights, ffn, token_id, Some(index))
     }
 
     fn memory_bytes(&self) -> usize {

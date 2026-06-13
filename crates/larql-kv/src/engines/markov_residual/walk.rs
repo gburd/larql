@@ -296,13 +296,14 @@ pub(super) fn rs_decode_step_walk(
             }
         }
         let (h_post_attn, new_kv_full) = native_result.or_else(|| {
-            larql_inference::attention::run_attention_block_decode_step_backend(
+            larql_inference::attention::run_attention_block_decode_step_auto(
                 weights,
                 &h_new,
                 layer,
                 Some(&kv_pair),
                 abs_position,
                 Some(backend),
+                Some(index as &dyn larql_compute::KvIndex),
             )
         })?;
         if let Some(t) = t_attn {

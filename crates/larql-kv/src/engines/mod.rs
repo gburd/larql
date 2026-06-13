@@ -201,3 +201,80 @@ mod layer_ffn_or_moe_tests {
         assert_eq!(a.shape(), &[2, 1]);
     }
 }
+
+#[cfg(test)]
+mod resident_identity_tests {
+    //! Structural-gap pin (2026-06-13): every pluggable engine overrides
+    //! `decode_step_resident` (or forwards it, for wrappers) so the vindex
+    //! reaches the attention step's Q4K-direct route. With the flags OFF —
+    //! the default test environment — the resident path must be
+    //! BIT-IDENTICAL to the plain path for every engine; a fork here means
+    //! an engine's resident override drifted from its decode_step.
+
+    use crate::EngineKind;
+    use larql_inference::ffn::NullFfn;
+    use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+    #[test]
+    fn every_engine_decode_step_resident_matches_decode_step_flag_off() {
+        // Concrete specs (parameterised kinds need real params). Excluded:
+        // apollo (bench-only, full re-forward by design; resident default =
+        // forward to decode_step is the documented intent) and boundary-kv
+        // (frame emission needs an archive sink; its resident forwarding is
+        // a thin wrapper over StandardEngine — pinned here — plus its own
+        // frame tests).
+        let specs = [
+            "standard",
+            "standard:window=4",
+            "no-cache",
+            "markov-rs",
+            "markov-rs-codec",
+            "turbo-quant",
+            "unlimited-context:window=4",
+        ];
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let prompt = [0u32, 1, 2];
+
+        let mut tested = 0usize;
+        for spec in specs {
+            let Some(kind) = EngineKind::from_name(spec) else {
+                panic!("spec {spec:?} no longer parses — update this pin");
+            };
+            let mut plain = kind.clone().build(larql_inference::cpu_engine_backend());
+            let mut resident = kind.build(larql_inference::cpu_engine_backend());
+
+            let h_plain = plain
+                .prefill(&weights, &ffn, &prompt)
+                .unwrap_or_else(|e| panic!("{spec}: prefill failed: {e:?}"));
+            let h_res = resident
+                .prefill_resident(&weights, &ffn, &index, &prompt)
+                .unwrap_or_else(|e| panic!("{spec}: prefill_resident failed: {e:?}"));
+            assert_eq!(
+                h_plain.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                h_res.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{spec}: prefill outputs diverged with flags off"
+            );
+
+            for (step, tok) in [3u32, 4, 5].into_iter().enumerate() {
+                let d_plain = plain
+                    .decode_step(&weights, &ffn, tok)
+                    .unwrap_or_else(|e| panic!("{spec}: decode_step failed: {e:?}"));
+                let d_res = resident
+                    .decode_step_resident(&weights, &ffn, &index, tok)
+                    .unwrap_or_else(|e| panic!("{spec}: decode_step_resident failed: {e:?}"));
+                assert_eq!(
+                    d_plain.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    d_res.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{spec}: decode outputs diverged at step {step} with flags off"
+                );
+            }
+            tested += 1;
+        }
+        assert!(
+            tested >= 7,
+            "engine coverage shrank ({tested} < 7) — no silent caps"
+        );
+    }
+}

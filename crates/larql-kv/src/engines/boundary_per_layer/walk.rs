@@ -11,7 +11,7 @@
 
 use larql_compute::ComputeBackend;
 use larql_inference::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
+    run_attention_with_kv_backend, SharedKV,
 };
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::embed_tokens_pub;
@@ -86,6 +86,7 @@ pub(super) fn run_prefill(
 
 /// Run one decode step through the dense walk. Consumes `rs`, returns
 /// the new store alongside the hidden output.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_decode(
     weights: &ModelWeights,
     ffn: &dyn FfnBackend,
@@ -93,6 +94,7 @@ pub(super) fn run_decode(
     policy: &BoundaryLayerPolicy,
     mut rs: RsStorePerLayer,
     token_id: u32,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStorePerLayer)> {
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
@@ -141,13 +143,14 @@ pub(super) fn run_decode(
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
+        let (h_post_attn, _new_kv) = larql_inference::attention::run_attention_block_decode_step_auto(
             weights,
             &h_new,
             layer,
             Some(&(k_full, v_full)),
             abs_position,
             Some(backend),
+            index.map(|v| v as &dyn larql_compute::KvIndex),
         )?;
 
         let h_out = crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, ffn, Some(ffn));
@@ -251,7 +254,7 @@ mod tests {
         let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(4), &[0]).unwrap();
         assert!(rs.cold_encoded.is_none());
 
-        let (hidden, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 1).unwrap();
+        let (hidden, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 1, None).unwrap();
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs_after.next_position, 2);
         for slab in &rs_after.stored {
@@ -285,7 +288,7 @@ mod tests {
         assert!(rs.cold_encoded.as_ref().unwrap()[0].n_positions > 0);
 
         let _ = ColdResidualCodec::Bf16; // keep import live
-        let (hidden, _) = run_decode(&weights, &ffn, &backend, &policy, rs, 3)
+        let (hidden, _) = run_decode(&weights, &ffn, &backend, &policy, rs, 3, None)
             .expect("decode should succeed without cold_kv");
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
     }
@@ -306,7 +309,7 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(initial, 1);
 
-        let (_, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 3).unwrap();
+        let (_, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 3, None).unwrap();
         let after = rs_after
             .cold_encoded
             .as_ref()

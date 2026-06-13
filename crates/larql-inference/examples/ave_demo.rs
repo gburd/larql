@@ -17,6 +17,13 @@
 //! (`--metal` needs `--features gpu`; reruns the AT-1 forced-decode leg on
 //! the Metal pipeline — the spec §10.5 quantization/backend note.)
 //! Writes `bench/aim-validation/ave_demo_gemma3-4b.json`.
+//!
+//! **Showcase mode:** `ave_demo -- --prompt "what is 123456 + 654321?"`
+//! runs one free prompt twice — native first (the model alone), then
+//! through the expert with the state-machine trace rendered live:
+//! GATE → EXTRACT → COMPUTE → DRIVE (forced tokens streaming into the
+//! model's own sentence) → TERMINATE → VERIFY. The model is never asked
+//! for the answer; the trace makes the invisibility property visible.
 
 use larql_inference::experts::{ave_generate_kquant, ArithmeticExpert, AveOptions};
 use larql_inference::load_tokenizer;
@@ -37,6 +44,9 @@ const EXPLICIT: &[(&str, &str)] = &[
 ];
 
 /// Distractors: digits present, no computation asked — gate must stay cold.
+/// The second block is the adversarial-prose family (spaced ranges, scores,
+/// shift idioms, dimensions, question forms) that drove the
+/// notation-only tier-0 rule.
 const DISTRACTORS: &[&str] = &[
     "My phone number is 4415550172.",
     "The meeting is on 2026-06-11.",
@@ -44,17 +54,37 @@ const DISTRACTORS: &[&str] = &[
     "Order 66 was executed in 19 BBY.",
     "Account 123456789012345678901234567890 is active.",
     "What is the capital of France?",
+    "It takes 5 - 10 business days.",
+    "I work a 9 - 5 job.",
+    "a 4 x 4 truck parked outside",
+    "Are you available 9 - 5?",
+    "dated 2026 - 06 - 11 in the ledger",
 ];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let use_metal = args.iter().any(|a| a == "--metal");
-    let vindex = args
+    let showcase_prompt = args
         .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .unwrap_or_else(|| "output/gemma3-4b-q4k-v2.vindex".to_string());
+        .position(|a| a == "--prompt")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let mut vindex = "output/gemma3-4b-q4k-v2.vindex".to_string();
+    let mut skip_next = false;
+    for a in args.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--prompt" {
+            skip_next = true;
+            continue;
+        }
+        if !a.starts_with("--") {
+            vindex = a.clone();
+            break;
+        }
+    }
     let dir = std::path::PathBuf::from(&vindex);
     if !dir.exists() {
         eprintln!("skipped: vindex not found at {vindex}");
@@ -75,6 +105,11 @@ fn main() {
     // gate runs tier-0 only, which is the measured-1.0 explicit path.
     let ave = ArithmeticExpert::new();
     let opts = AveOptions::default();
+
+    if let Some(prompt) = showcase_prompt {
+        showcase(&ave, &mut weights, &tok, &index, &prompt);
+        return;
+    }
 
     println!("\n=== AVE assembly increment on {vindex} ===");
     println!("    gate: tier-0 symbolic (no probe artifact); drive: forced decode + schedule-end termination\n");
@@ -252,6 +287,107 @@ fn main() {
     } else {
         println!("\nwrote {out_path}");
     }
+}
+
+/// Showcase: one free prompt, native first, then the expert with the
+/// state-machine trace rendered live. The trace is the star — the viewer
+/// should see the model never being asked.
+fn showcase(
+    ave: &larql_inference::experts::ArithmeticExpert,
+    weights: &mut larql_models::ModelWeights,
+    tok: &tokenizers::Tokenizer,
+    index: &larql_vindex::VectorIndex,
+    prompt: &str,
+) {
+    use larql_inference::experts::arith::drive::{force_decode_kquant_streaming, TerminationCause};
+    use larql_inference::experts::VirtualExpert;
+    use larql_inference::vindex::generate_kquant_cpu_constrained_cached_streaming;
+    use std::io::Write;
+
+    let flush = || std::io::stdout().flush().ok();
+    let prompt_ids = tok
+        .encode(prompt, true)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+
+    println!("\n════════════════ AVE showcase ════════════════");
+
+    // ── The model alone ──────────────────────────────────────────────
+    println!("\n── native (the model alone) ──");
+    print!("{prompt}");
+    flush();
+    let t0 = std::time::Instant::now();
+    let native = generate_kquant_cpu_constrained_cached_streaming(
+        weights,
+        tok,
+        &prompt_ids,
+        24,
+        index,
+        |_, _| {},
+        |_, text| {
+            print!("{text}");
+            flush();
+        },
+    );
+    let native_ms = t0.elapsed().as_millis();
+    let native_text: String = native.iter().map(|(t, _)| t.as_str()).collect();
+    println!("\n({} tokens, {} ms)", native.len(), native_ms);
+
+    // ── The expert ────────────────────────────────────────────────────
+    println!("\n── AVE (the model is never asked) ──");
+    let t = std::time::Instant::now();
+    let fire = ave.gate(None, prompt);
+    let gate_us = t.elapsed().as_micros();
+    if !fire.fired() {
+        println!("GATE       no fire — no math notation on the prompt surface   [{gate_us} µs]");
+        println!("           native path untouched (the designed fallthrough)");
+        return;
+    }
+    println!("GATE       tier-0 fire — math notation adjacent to digit spans   [{gate_us} µs]");
+
+    let t = std::time::Instant::now();
+    let expr = ave.extract(prompt, None).expect("tier-0 fire ⇒ symbolic extract");
+    let extract_us = t.elapsed().as_micros();
+    println!("EXTRACT    {expr}   [symbolic, 0 model tokens, {extract_us} µs]");
+
+    let t = std::time::Instant::now();
+    let answer = ave.compute(&expr);
+    let compute_us = t.elapsed().as_micros();
+    println!("COMPUTE    = {}   [exact, {compute_us} µs]", answer.value);
+
+    let schedule = ave.drive(&answer);
+    let schedule_ids = schedule.forced_ids(tok);
+    println!(
+        "DRIVE      {}-token forced schedule at the sampler",
+        schedule_ids.len()
+    );
+
+    print!("{prompt}");
+    flush();
+    let t0 = std::time::Instant::now();
+    let fd = force_decode_kquant_streaming(weights, tok, index, &prompt_ids, &schedule_ids, |_, text| {
+        print!("{text}");
+        flush();
+    });
+    let drive_ms = t0.elapsed().as_millis();
+    println!();
+    let n = fd.ids.len();
+    match fd.cause {
+        TerminationCause::ScheduleEnd => println!(
+            "TERMINATE  schedule end ({n}/{n} tokens — delivery 1.0 by construction)   [{drive_ms} ms, {:.0} ms/tok]",
+            drive_ms as f64 / n.max(1) as f64
+        ),
+        TerminationCause::EarlyStop { at } => {
+            println!("TERMINATE  EARLY STOP at {at}/{} — investigate", schedule_ids.len())
+        }
+    }
+
+    // The side-by-side produced a native answer, so the verify prior has
+    // something to read — the one place the model's own arithmetic is
+    // consumed, as a tripwire, never as the emission.
+    let verdict = ave.verify(&answer, Some(&native_text));
+    println!("VERIFY     magnitude prior vs the native attempt: {}", verdict.label());
 }
 
 #[cfg(all(feature = "gpu", target_os = "macos"))]

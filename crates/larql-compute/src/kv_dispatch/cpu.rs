@@ -35,22 +35,16 @@ use crate::attention::{
 };
 use larql_models::ModelWeights;
 
-/// Opt-in: route the CPU decode-step attention projections through the
-/// Q4K-direct kernels (`quant_matvec` straight from the index) instead of the
-/// f32-BLAS path on pre-dequantised `weights.tensors`. Gated while parity +
-/// end-to-end are validated on the 26B (task #16); falls back to f32 per layer
-/// when the index lacks Q4K attn bytes or a format is unsupported.
-///
-/// ⚠️ SIBLING PATH: `cached_decode_step_q4k` / `CpuQ4kCacheHandle` (below, in
-/// `crate::kquant_forward`) is a SECOND independent CPU Q4K attention decode.
-/// Any RoPE / softcap / QK-V-norm / GQA change here must mirror there (and vice
-/// versa) or the two silently diverge. Consolidate before either is load-bearing
-/// — see `docs/diagnoses/q4k-direct-attention.md` §"CONSOLIDATION HAZARD".
-fn q4k_direct_attn_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LARQL_Q4K_DIRECT_ATTN").as_deref() == Ok("1"))
-}
+// Opt-in flag (`LARQL_Q4K_DIRECT_ATTN`) lives in `attention::decode` — single
+// source shared with `run_attention_block_decode_step_auto` so the dispatch
+// path and the engine walk loops make the same per-layer choice.
+//
+// ⚠️ SIBLING PATH: `cached_decode_step_q4k` / `CpuQ4kCacheHandle` (in
+// `crate::kquant_forward`) is a SECOND independent CPU Q4K attention decode.
+// Any RoPE / softcap / QK-V-norm / GQA change here must mirror there (and vice
+// versa) or the two silently diverge. Consolidate before either is load-bearing
+// — see `docs/diagnoses/q4k-direct-attention.md` §"CONSOLIDATION HAZARD".
+use crate::attention::decode::q4k_direct_attn_enabled;
 
 // ─── CpuKvHandle ────────────────────────────────────────────────────────────
 
@@ -134,14 +128,16 @@ impl CpuKvHandle {
         Some((k, v))
     }
 
-    /// Move the state out as an owned `SharedKV`, leaving the handle empty
-    /// (the f32 fallback path re-populates via `replace_state`).
-    fn take_shared(&mut self) -> Option<SharedKV> {
-        let out = self.to_shared();
-        self.k_buf.clear();
-        self.v_buf.clear();
-        self.rows = 0;
-        out
+    /// Remove the most recently appended row (failure-path undo: the q4k
+    /// attend half can in principle fail AFTER the project half appended —
+    /// the handle must be left exactly as before the step so engine
+    /// fallbacks that reuse it see consistent state).
+    fn pop_row(&mut self) {
+        if self.rows > 0 {
+            self.rows -= 1;
+            self.k_buf.truncate(self.rows * self.kv_dim);
+            self.v_buf.truncate(self.rows * self.kv_dim);
+        }
     }
 }
 
@@ -362,7 +358,7 @@ impl KvDispatch for CpuBackend {
                     .expect("[1, kv_dim] projection row is contiguous");
                 h.append_row(k_row, v_row);
                 let (k_all, v_all) = h.views().expect("non-empty after append");
-                return crate::attention::decode::decode_step_attend_q4k_direct(
+                match crate::attention::decode::decode_step_attend_q4k_direct(
                     weights,
                     query,
                     layer,
@@ -371,16 +367,26 @@ impl KvDispatch for CpuBackend {
                     v_all,
                     self,
                     idx,
-                );
+                ) {
+                    Some(h_post_attn) => return Some(h_post_attn),
+                    None => {
+                        // Attend failed after the append — undo it so the f32
+                        // fallback (and any engine-level fallback that reuses
+                        // this handle) sees the pre-step state, matching the
+                        // old monolithic form's failure semantics.
+                        cpu_handle_mut(kv).pop_row();
+                    }
+                }
             }
         }
 
         // Default (f32) path: CpuBackend reads f32 attention tensors out of
         // `weights.tensors`, which the caller pre-populates via
         // `ensure_attn_tensors_dequantised` (the up-front dequant-to-f32 tax).
-        // The state moves OUT of the handle (no full-cache clone) and the
-        // concatenated result moves back in.
-        let prior_kv = cpu_handle_mut(kv).take_shared();
+        // The prior state is COPIED out (not moved) so a backend failure
+        // leaves the handle intact — same semantics as the pre-refactor
+        // clone, and this path is cold whenever the q4k flags are on.
+        let prior_kv = cpu_handle(kv).to_shared();
         let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
             weights,
             query,
