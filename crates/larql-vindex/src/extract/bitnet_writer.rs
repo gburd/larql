@@ -13,17 +13,28 @@
 //! struct on `VindexConfig::bitnet_layout`; the loader (`bitnet_
 //! loader.rs`) reads it back into typed `BitLinearWeight` containers.
 //!
-//! ## Why scales aren't bundled with bytes
+//! ## Where the scale comes from
 //!
-//! Two reasons:
-//! 1. The BitLinear *scale* in BitNet b1.58 is a per-output-row f32
-//!    derived at training from `absmean(W)` of that row \u2014 it is not
-//!    stored alongside the I2_S blocks; instead the GGUF carries it
-//!    in adjacent `*_sub_norm.weight` (or `*_norm.weight`) tensors.
-//!    We bring the two together at load time.
-//! 2. Concatenating all scales into one f32 file lets the loader
-//!    do a single mmap + slice, avoiding 200 small file opens for
-//!    a 30-layer BitNet 2 B 4 T model.
+//! Verified against microsoft/BitNet `ggml-bitnet-mad.cpp`
+//! (`quantize_i2_s`): the I2_S format stores a SINGLE per-tensor f32
+//! scale (= `max|W|` over the whole tensor at quant time) appended
+//! immediately after the `n/4` packed-trit bytes, inside the
+//! tensor's 32-byte-aligned data region.  Reconstruction convention
+//! is `W = trit * scale` (trits are sign(W); magnitude lives in the
+//! scalar).  It is NOT the adjacent `*_sub_norm.weight` (an
+//! activation RMSNorm sized to the projection INPUT width, applied
+//! separately in the forward pass), and NOT `absmean` of the
+//! dequantised trits (that recovers nonzero density, not magnitude).
+//! Both were wrong earlier guesses; see BUG-infer-deadlock 5.4.
+//!
+//! The keep-quant GGUF loader captures that trailing f32 into
+//! `ModelWeights::raw_bytes` under `{key}{I2S_SCALE_SUFFIX}`; this
+//! writer reads it back and broadcasts it across all output rows
+//! (runtime `BitLinearWeight::channel_scales` is per-row, leaving
+//! room for a future per-row-quantised variant without a format
+//! change).  Concatenating all per-row scales into one f32 file lets
+//! the loader do a single mmap + slice rather than 200 small file
+//! opens for a 30-layer BitNet 2 B 4 T model.
 
 use std::fs::File;
 use std::io::Write;
@@ -44,14 +55,22 @@ use crate::format::filenames::{
 ///
 /// Matches `microsoft/bitnet-b1.58-2B-4T-gguf @ ggml-model-i2_s.gguf`
 /// (verified by the repository's existing inspection script).
+/// BitLinear projection suffixes, in the HF-normalised namespace that
+/// the loader actually produces. The GGUF→HF key map (loader
+/// `constants.rs` GGUF_TO_HF_KEY_REPLACEMENTS) rewrites
+/// `blk.N.attn_q.weight` → `layers.N.self_attn.q_proj.weight` etc. BEFORE
+/// these bytes reach the writer, and re-keys `raw_bytes` through the same
+/// normalisation. Matching GGUF-native suffixes here found nothing on a
+/// real convert (the loader→writer seam was untested), so we match the
+/// HF suffixes the writer is actually handed.
 const BITLINEAR_KEY_SUFFIXES: &[&str] = &[
-    ".attn_q.weight",
-    ".attn_k.weight",
-    ".attn_v.weight",
-    ".attn_output.weight",
-    ".ffn_gate.weight",
-    ".ffn_up.weight",
-    ".ffn_down.weight",
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
 ];
 
 /// Architecture metadata captured from the source GGUF at convert
@@ -146,26 +165,35 @@ pub fn write_bitnet_artifacts(
             )));
         }
 
-        // Resolve per-channel scale tensor.  BitNet b1.58 stores it
-        // in the adjacent `*_sub_norm.weight` for q/o/ffn_down, and
-        // (for k/v projections that share a sub-norm with q) we
-        // fall back to `attn_norm.weight`.  In practice the sub_norm
-        // is matched per (layer, projection family).
-        let scale_key = pick_scale_key_for(key, weights);
-        let scales = weights
-            .vectors
+        // Per-tensor scale.  BitNet I2_S stores a single f32 per
+        // tensor (= max|W| at quant time) appended after the packed
+        // trits; the keep-quant loader captured it into raw_bytes
+        // under `"{key}{I2S_SCALE_SUFFIX}"`.  The reconstruction is
+        // `W = trit * scale`, so every output row shares the same
+        // scalar.  We broadcast it to a per-row vector of length
+        // `rows` because the runtime BitLinearWeight.channel_scales
+        // is per-row (allowing future per-row-quantised variants
+        // without a format change).
+        let scale_key = format!("{key}{}", larql_models::I2S_SCALE_SUFFIX);
+        let scale = weights
+            .raw_bytes
             .get(&scale_key)
+            .filter(|b| b.len() == 4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .ok_or_else(|| {
                 VindexError::Parse(format!(
-                    "BitNet --keep-quant: missing scale tensor {scale_key} for {key}"
+                    "BitNet --keep-quant: missing per-tensor I2_S scale for {key} \
+                     (loader must capture the trailing scale f32; see \
+                     gguf loader I2S_SCALE_SUFFIX)"
                 ))
             })?;
-        if scales.len() != rows {
+        if !(scale.is_finite() && scale > 0.0) {
             return Err(VindexError::Parse(format!(
-                "BitNet --keep-quant: scale tensor {scale_key} has len {}, expected {rows}",
-                scales.len()
+                "BitNet --keep-quant: tensor {key} has non-positive/NaN scale {scale}"
             )));
         }
+        let scales: Vec<f32> = vec![scale; rows];
+        debug_assert_eq!(scales.len(), rows);
 
         // Write the I2_S bytes.
         let path = out_dir.join(bitnet_tensor_filename(key));
@@ -174,7 +202,7 @@ pub fn write_bitnet_artifacts(
 
         // Append scale to the concat buffer.
         let scale_offset = all_scales.len();
-        all_scales.extend_from_slice(scales);
+        all_scales.extend_from_slice(&scales);
 
         entries.push(BitnetTensorEntry {
             name: key.clone(),
@@ -185,9 +213,13 @@ pub fn write_bitnet_artifacts(
     }
 
     if entries.is_empty() {
-        return Err(VindexError::Parse(
-            "BitNet --keep-quant: no I2_S BitLinear tensors found in weights".into(),
-        ));
+        return Err(VindexError::Parse(format!(
+            "BitNet --keep-quant: no I2_S BitLinear tensors found in weights \
+             (saw {} tensors / {} raw_bytes entries; expected HF-normalised \
+             keys like layers.N.self_attn.q_proj.weight)",
+            weights.tensors.len(),
+            weights.raw_bytes.len(),
+        )));
     }
 
     // Write the concatenated scales file.
@@ -226,73 +258,26 @@ fn is_bitlinear_key(key: &str) -> bool {
     BITLINEAR_KEY_SUFFIXES.iter().any(|s| key.ends_with(s))
 }
 
-/// Pick the per-channel scale tensor for a BitLinear weight.
-///
-/// In BitNet b1.58 GGUFs the sub-norm tensors are:
-///
-/// | BitLinear weight        | Scale tensor key                  |
-/// |-------------------------|-----------------------------------|
-/// | blk.N.attn_q.weight     | blk.N.attn_q.weight  (if present) |
-/// | blk.N.attn_k.weight     | blk.N.attn_k.weight  (if present) |
-/// | blk.N.attn_v.weight     | blk.N.attn_v.weight  (if present) |
-/// | blk.N.attn_output.weight| blk.N.attn_sub_norm.weight        |
-/// | blk.N.ffn_gate.weight   | blk.N.ffn_norm.weight             |
-/// | blk.N.ffn_up.weight     | blk.N.ffn_norm.weight             |
-/// | blk.N.ffn_down.weight   | blk.N.ffn_sub_norm.weight         |
-///
-/// Microsoft's release happens to expose per-channel scales in the
-/// canonical sub-norm slots; if a future BitNet variant includes
-/// per-tensor `*.scale` floats we'll plumb them here.
-fn pick_scale_key_for(weight_key: &str, weights: &ModelWeights) -> String {
-    // Try to derive the sub-norm key from the BitLinear name.
-    if let Some(layer) = parse_layer_index(weight_key) {
-        let prefix = format!("blk.{layer}");
-        let candidate = if weight_key.ends_with(".attn_output.weight") {
-            format!("{prefix}.attn_sub_norm.weight")
-        } else if weight_key.ends_with(".ffn_down.weight") {
-            format!("{prefix}.ffn_sub_norm.weight")
-        } else if weight_key.ends_with(".ffn_gate.weight") || weight_key.ends_with(".ffn_up.weight")
-        {
-            format!("{prefix}.ffn_norm.weight")
-        } else {
-            // attn_q/k/v share attn_norm.weight in BitNet b1.58.
-            format!("{prefix}.attn_norm.weight")
-        };
-        if weights.vectors.contains_key(&candidate) {
-            return candidate;
-        }
-    }
-    // Fallback: the input key itself (some BitNet variants may pack
-    // scale alongside the weight).
-    weight_key.to_string()
-}
-
-fn parse_layer_index(key: &str) -> Option<usize> {
-    let rest = key.strip_prefix("blk.")?;
-    let dot = rest.find('.')?;
-    rest[..dot].parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_layer_index_from_key() {
-        assert_eq!(parse_layer_index("blk.0.attn_q.weight"), Some(0));
-        assert_eq!(parse_layer_index("blk.29.ffn_down.weight"), Some(29));
-        assert_eq!(parse_layer_index("token_embd.weight"), None);
-        assert_eq!(parse_layer_index("blk.bad.attn_q.weight"), None);
-    }
-
-    #[test]
     fn recognises_bitlinear_keys() {
-        assert!(is_bitlinear_key("blk.0.attn_q.weight"));
-        assert!(is_bitlinear_key("blk.29.ffn_down.weight"));
-        assert!(is_bitlinear_key("blk.0.attn_output.weight"));
-        assert!(!is_bitlinear_key("blk.0.attn_norm.weight"));
-        assert!(!is_bitlinear_key("blk.0.ffn_sub_norm.weight"));
-        assert!(!is_bitlinear_key("token_embd.weight"));
+        // The writer is handed HF-normalised names; match those.
+        assert!(is_bitlinear_key("layers.0.self_attn.q_proj.weight"));
+        assert!(is_bitlinear_key("layers.29.mlp.down_proj.weight"));
+        assert!(is_bitlinear_key("layers.0.self_attn.o_proj.weight"));
+        assert!(is_bitlinear_key("layers.0.mlp.gate_proj.weight"));
+        assert!(is_bitlinear_key("layers.0.mlp.up_proj.weight"));
+        // Norm / scale tensors are NOT BitLinear.
+        assert!(!is_bitlinear_key("layers.0.input_layernorm.weight"));
+        assert!(!is_bitlinear_key("layers.0.attn_sub_norm.weight"));
+        assert!(!is_bitlinear_key("layers.0.ffn_sub_norm.weight"));
+        assert!(!is_bitlinear_key("embed_tokens.weight"));
+        // GGUF-native names must NOT match (they never reach the writer
+        // post-normalisation; matching them was the original bug).
+        assert!(!is_bitlinear_key("blk.0.attn_q.weight"));
     }
 
     #[test]
@@ -301,5 +286,82 @@ mod tests {
         // in `larql_models::quant::ggml` doesn't silently break the
         // writer.
         assert_eq!(larql_models::quant::ggml::TYPE_I2_S, 36);
+    }
+
+    /// Regression for BUG-infer-deadlock §5.4: the writer must read
+    /// the per-tensor I2_S scale the loader captured into
+    /// `raw_bytes` under the `I2S_SCALE_SUFFIX` sentinel, broadcast
+    /// it across all output rows, and round-trip it into
+    /// `bitnet/scales.f32`.  Guards against regressing back to the
+    /// absmean or sub_norm scale guesses, both of which produced
+    /// numerically wrong scales that loaded fine but generated
+    /// garbage at inference time.
+    #[test]
+    fn writes_per_tensor_scale_from_captured_trailing_f32() {
+        use larql_models::I2S_SCALE_SUFFIX;
+        use ndarray::Array2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+
+        // One tiny BitLinear tensor: rows=2, cols=4 (cols %4 == 0).
+        // Trits packed 1 byte per 4 elements => 2 bytes.
+        let key = "layers.0.self_attn.q_proj.weight".to_string();
+        let rows = 2usize;
+        let cols = 4usize;
+        let want_scale = 1.234_567_f32;
+
+        let mut weights = larql_models::test_fixtures::make_test_weights();
+        // Dequantised array is only used by the writer for shape; the
+        // values don't affect the scale (which comes from raw_bytes).
+        weights
+            .tensors
+            .insert(key.clone(), Array2::<f32>::zeros((rows, cols)).into_shared());
+        weights
+            .raw_bytes
+            .insert(key.clone(), vec![0u8; rows * cols / 4]);
+        weights.raw_bytes.insert(
+            format!("{key}{I2S_SCALE_SUFFIX}"),
+            want_scale.to_le_bytes().to_vec(),
+        );
+
+        let arch = BitnetArchMeta::default();
+        let layout = write_bitnet_artifacts(out, &weights, arch).expect("write");
+
+        // One entry, rows scale slots, all equal to want_scale.
+        assert_eq!(layout.tensors.len(), 1);
+        assert_eq!(layout.total_scale_count, rows);
+        let scales_bytes =
+            std::fs::read(out.join(BITNET_SCALES_BIN)).expect("scales.f32");
+        assert_eq!(scales_bytes.len(), rows * 4);
+        for r in 0..rows {
+            let s = f32::from_le_bytes([
+                scales_bytes[r * 4],
+                scales_bytes[r * 4 + 1],
+                scales_bytes[r * 4 + 2],
+                scales_bytes[r * 4 + 3],
+            ]);
+            assert!(
+                (s - want_scale).abs() < 1e-6,
+                "row {r}: got {s}, want {want_scale}"
+            );
+        }
+    }
+
+    /// A BitLinear tensor missing its captured scale is a hard error
+    /// (a silently-defaulted scale would corrupt inference).
+    #[test]
+    fn missing_captured_scale_is_an_error() {
+        use ndarray::Array2;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "layers.0.mlp.down_proj.weight".to_string();
+        let mut weights = larql_models::test_fixtures::make_test_weights();
+        weights
+            .tensors
+            .insert(key.clone(), Array2::<f32>::zeros((2, 4)).into_shared());
+        weights.raw_bytes.insert(key, vec![0u8; 2]);
+        // No I2S_SCALE_SUFFIX entry.
+        let err = write_bitnet_artifacts(dir.path(), &weights, BitnetArchMeta::default());
+        assert!(err.is_err(), "missing scale must error");
     }
 }

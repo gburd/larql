@@ -11,7 +11,9 @@ mod parser;
 mod reader;
 mod types;
 
-pub use loader::{load_gguf, load_gguf_keep_quant, load_gguf_validated, normalize_gguf_key};
+pub use loader::{
+    load_gguf, load_gguf_keep_quant, load_gguf_validated, normalize_gguf_key, I2S_SCALE_SUFFIX,
+};
 pub use types::{GgufFile, GgufTensorInfo, GgufValue, ShardInfo};
 
 // Preserve original pub(crate) API surface — some items are consumed only within
