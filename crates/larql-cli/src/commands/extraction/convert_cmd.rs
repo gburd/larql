@@ -492,6 +492,18 @@ fn run_gguf_to_vindex(
         _ => larql_vindex::ExtractLevel::Browse,
     };
 
+    // --keep-quant needs the dense norms / embeddings / lm_head that
+    // only inference/all levels extract; load_bitnet_model fails at
+    // serve time on a browse-level vindex with "vindex does not
+    // contain model weights".  Reject up front rather than producing
+    // an unusable vindex after a multi-minute extract.
+    if do_keep_quant && extract_level == larql_vindex::ExtractLevel::Browse {
+        return Err("--keep-quant requires --level inference (or all): BitNet \
+             inference needs the dense norm/embed/lm_head tensors that browse \
+             level does not extract. Re-run with --level inference."
+            .into());
+    }
+
     let dtype = if use_f16 {
         larql_vindex::StorageDtype::F16
     } else {
