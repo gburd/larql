@@ -5,7 +5,7 @@
   ],
   "exclude_globs": [],
   "default_line_min_percent": 90.0,
-  "total_line_min_percent": 71.0,
+  "total_line_min_percent": 90.0,
   "per_file_line_min_percent": {
     "crates/larql-vindex/src/clustering/labeling.rs": 65.5,
     "crates/larql-vindex/src/clustering/pair_matching/database.rs": 83.0,

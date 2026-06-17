@@ -356,6 +356,7 @@ async fn handle_stream_infer(
                 Some(&patched.knn_store),
                 &token_ids,
                 top_k,
+                &larql_inference::KnnRouteMode::from_env(),
             );
             r.predictions
         }

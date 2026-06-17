@@ -312,12 +312,22 @@ SELECT [<fields>]
 
 -- Query edges in the vindex.
 -- Fields: entity, relation, target, layer, feature, confidence, gate
+--
+-- WHERE relation = "<word>" matches the stored relation label exactly. If an
+-- exact match finds nothing, FR3 synonym resolution kicks in: the relation word
+-- is resolved to a known relation BY MEANING (a trained residual probe — "seat"
+-- → capital, "money" → currency) and the query re-runs against the canonical
+-- relation, printing a note. Needs a vindex with model weights + relation
+-- labels; otherwise exact-only (no change). One-time probe build is cached.
 
 SELECT entity, relation, target, confidence
     FROM EDGES
     WHERE entity = "France"
     ORDER BY confidence DESC
     LIMIT 10;
+
+-- Synonym-robust relation filter (FR3): "seat" resolves to "capital".
+SELECT * FROM EDGES WHERE relation = "seat" LIMIT 5;
 
 SELECT entity, target
     FROM EDGES
@@ -356,6 +366,7 @@ EXPLAIN WALK "The capital of France is"
 
 ```
 INFER <prompt>
+    [ROUTE VERIFY [FALLBACK] [TOPK <n>] [EXIT]]
     [TOP <n>]
     [COMPARE]
 
@@ -365,10 +376,42 @@ INFER <prompt>
 -- Uses walk FFN (gate KNN from vindex) as the FFN backend,
 -- but runs real attention for token routing.
 -- COMPARE: also run dense inference and show both.
+--
+-- ROUTE selects the KnnStore router (FR1/FR2) for INSERT … MODE KNN facts.
+-- Default (no clause): legacy top-1 + fixed 0.75 cosine gate — fires on
+--   near-rank-1 collisions and can inject a confident-wrong fact.
+-- ROUTE VERIFY (FR1): top-k candidates + a verifier that only overrides with a
+--   fact whose entity the PROMPT names, else abstains. Fixes confident-wrong.
+--   TOPK <n> sets the candidate count (default 5).
+-- ROUTE VERIFY FALLBACK (FR2): adds an activation alias fallback — if no
+--   candidate's entity is named (alias/paraphrase, e.g. "Persia"→Iran), route
+--   by the top-1 activation key. Recovers aliases exact-string can't, at a
+--   fuzzy ~0.7-0.9 rate. WARNING: the fallback has no entity-name guard, so on
+--   an open query about a NON-stored entity it confident-wrongs like the legacy
+--   gate (measured 0/20 distractor-safe vs VERIFY's 20/20). Use FALLBACK only
+--   for queries known to be aliases of stored entities; VERIFY is the safe
+--   open default.
+-- ROUTE VERIFY EXIT: retrieval-augmented EARLY EXIT. When the verified router
+--   fires, the forward short-circuits at the resolved layer (~0.7 depth) — the
+--   stored target is emitted and the remaining layers + lm_head are SKIPPED.
+--   Parity-exact (the emitted token is byte-identical to the full forward) and
+--   ~1.4× faster on fact-lookup answer tokens. Verified-only: EXIT is ignored
+--   when FALLBACK is set (the FR2 fallback needs the full forward to stay
+--   parity-identical). On a verify-miss the forward completes normally.
+-- (The LARQL_KNN_VERIFY / LARQL_KNN_FALLBACK / LARQL_KNN_TOPK / LARQL_KNN_MIN_COS
+--  env vars set the default when no ROUTE clause is present;
+--  LARQL_KNN_EARLY_EXIT turns on EXIT for the env-default verified path.)
 
 INFER "The capital of France is" TOP 5;
 
 INFER "The capital of France is" TOP 5 COMPARE;
+
+INFER "The capital of Atlantis is" ROUTE VERIFY TOP 3;
+
+INFER "The capital of Persia is" ROUTE VERIFY FALLBACK TOPK 8 TOP 3;
+
+-- Early-exit: emit the stored target the moment the verified hit fires.
+INFER "The capital of Atlantis is" ROUTE VERIFY EXIT TOP 3;
 ```
 
 ```

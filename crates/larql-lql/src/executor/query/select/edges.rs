@@ -154,28 +154,47 @@ impl Session {
         };
 
         let mut rows: Vec<EdgeRow> = Vec::new();
+        collect_edges(
+            patched,
+            path,
+            classifier,
+            filters.entity,
+            filters.relation,
+            filters.feature,
+            &scan_layers,
+            &mut rows,
+        )?;
 
-        if let (Some(entity), Some(rel)) = (filters.entity, filters.relation) {
-            collect_via_walk(
-                patched,
-                path,
-                classifier,
-                entity,
-                rel,
-                filters.feature,
-                &scan_layers,
-                &mut rows,
-            )?;
-        } else {
-            collect_via_scan(
-                patched,
-                classifier,
-                filters.entity,
-                filters.relation,
-                filters.feature,
-                &scan_layers,
-                &mut rows,
-            );
+        // FR3 — synonym-robust relation addressing. If an exact relation filter
+        // matched nothing, the word may be a SYNONYM of a known relation
+        // ("seat"→capital, "money"→currency). Resolve it by meaning (a trained
+        // residual probe, not string/cosine — see relation_resolver) and
+        // re-collect against the canonical relation.
+        let mut notes: Vec<String> = Vec::new();
+        if rows.is_empty() {
+            if let (Some(rel), Some(rc)) = (filters.relation, classifier) {
+                let relations = rc.relation_labels();
+                let already_exact = relations.iter().any(|r| r.eq_ignore_ascii_case(rel));
+                if relations.len() >= 2 && !already_exact {
+                    if let Some((canonical, conf)) =
+                        self.resolve_relation_synonym(path, relations, rel)
+                    {
+                        notes.push(format!(
+                            "  (relation '{rel}' resolved to '{canonical}' by meaning, confidence {conf:.2})"
+                        ));
+                        collect_edges(
+                            patched,
+                            path,
+                            classifier,
+                            filters.entity,
+                            Some(canonical.as_str()),
+                            filters.feature,
+                            &scan_layers,
+                            &mut rows,
+                        )?;
+                    }
+                }
+            }
         }
 
         if let Some(ord) = order {
@@ -185,8 +204,75 @@ impl Session {
         rows.retain(|r| filters.score_matches(r.c_score));
         rows.truncate(limit);
 
-        Ok(format_rows(&rows, filters.relation.is_some()))
+        let mut out = notes;
+        out.extend(format_rows(&rows, filters.relation.is_some()));
+        Ok(out)
     }
+
+    /// FR3 — build (once, cached per vindex path) the relation resolver and
+    /// resolve a relation word to a known canonical relation by meaning.
+    fn resolve_relation_synonym(
+        &self,
+        path: &std::path::Path,
+        relations: Vec<String>,
+        word: &str,
+    ) -> Option<(String, f32)> {
+        // Cache hit for the active vindex?
+        {
+            let cache = self.relation_resolver.borrow();
+            if let Some((p, resolver)) = cache.as_ref() {
+                if p == path {
+                    return resolver.as_ref().and_then(|r| r.resolve(word));
+                }
+            }
+        }
+        // Build (one-time forward passes), cache, then resolve.
+        let built = crate::executor::relation_resolver::RelationResolver::build(path, relations)
+            .ok()
+            .flatten();
+        let result = built.as_ref().and_then(|r| r.resolve(word));
+        *self.relation_resolver.borrow_mut() = Some((path.to_path_buf(), built));
+        result
+    }
+}
+
+/// Dispatch edge collection: walk-anchored when both entity and relation are
+/// given, else a metadata scan. Shared so the FR3 synonym fallback can re-run
+/// it against the resolved canonical relation.
+#[allow(clippy::too_many_arguments)]
+fn collect_edges(
+    patched: &larql_vindex::PatchedVindex,
+    path: &std::path::Path,
+    classifier: Option<&crate::relations::RelationClassifier>,
+    entity: Option<&str>,
+    relation: Option<&str>,
+    feature: Option<usize>,
+    scan_layers: &[usize],
+    rows: &mut Vec<EdgeRow>,
+) -> Result<(), LqlError> {
+    if let (Some(entity), Some(rel)) = (entity, relation) {
+        collect_via_walk(
+            patched,
+            path,
+            classifier,
+            entity,
+            rel,
+            feature,
+            scan_layers,
+            rows,
+        )?;
+    } else {
+        collect_via_scan(
+            patched,
+            classifier,
+            entity,
+            relation,
+            feature,
+            scan_layers,
+            rows,
+        );
+    }
+    Ok(())
 }
 
 /// Walk-anchored collection: embed the entity, walk every requested

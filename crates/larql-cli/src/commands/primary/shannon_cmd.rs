@@ -962,6 +962,25 @@ struct VindexShannonRuntime {
     backend: Box<dyn larql_compute::ComputeBackend>,
 }
 
+/// Build the Metal compute backend for `--metal`, or a clear error when the
+/// crate was built without the `gpu` feature (or off macOS). Split by `cfg`
+/// so the gpu-off build rejects through a normal `Result` — a diverging
+/// `let backend = { … return Err … }` binding would otherwise mark all
+/// downstream code unreachable and its locals unused in the gpu-off compile.
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
+{
+    let b = larql_compute_metal::MetalBackend::new()
+        .ok_or("Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac.")?;
+    Ok(Box::new(b))
+}
+
+#[cfg(not(all(feature = "gpu", target_os = "macos")))]
+fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
+{
+    Err("`--metal` requires the `gpu` feature on macOS".into())
+}
+
 fn load_vindex_runtime(
     vindex: &Path,
     metal: bool,
@@ -988,7 +1007,16 @@ fn load_vindex_runtime(
     index.load_attn_kquant(vindex)?;
     index.load_interleaved_kquant(vindex)?;
     let _ = index.load_lm_head_kquant(vindex);
-    let backend = larql_compute::default_backend();
+    // `larql_compute::default_backend()` always returns CPU since the
+    // GPU-backend extraction (ADR-019) — GPU selection is the caller's
+    // responsibility. The fused Q4 forced-token scorer
+    // (`stream_forced_full_logits`) requires Metal, so build it directly here
+    // when `--metal` is set, mirroring `walk_cmd.rs` and
+    // `bench/local_runtime.rs`. The previous `default_backend()` call silently
+    // fell through to CPU and then errored out at "forced Shannon logits
+    // require a fused Q4 backend", making the `encode`/`decode` --metal path
+    // unreachable on every machine.
+    let backend: Box<dyn larql_compute::ComputeBackend> = metal_backend_box()?;
     if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
         return Err("Metal/Q4 backend is not available".into());
     }
@@ -1015,6 +1043,14 @@ fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>>
     let ids = encode_prompt(&rt.tokenizer, &*rt.weights.arch, &text)?;
     if ids.len() < 2 {
         return Err("input must tokenize to at least one encoded token".into());
+    }
+
+    // Diagnostic: run two forced passes in ONE process and compare the
+    // per-step quantized frequency tables. Distinguishes per-dispatch GPU
+    // non-determinism (in-process passes disagree) from cross-process-only
+    // drift (in-process agree). Gated so it never runs in the demo path.
+    if std::env::var("LARQL_SHANNON_SELFTEST").is_ok() {
+        return run_encode_vindex_selftest(&mut rt, &ids);
     }
 
     eprintln!(
@@ -1093,6 +1129,101 @@ fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>>
         println!("decode avg:      {:>10.1} ms/token", avg);
     }
     println!("wrote: {}", args.out.display());
+    Ok(())
+}
+
+/// Run two forced passes over the first block in one process and compare the
+/// per-step quantized frequency tables. The arithmetic coder desyncs at the
+/// first step whose count table differs, so this reports exactly where (and
+/// by how much) the GPU forward drifts. See the `--metal` round-trip notes in
+/// `docs/replay/shannon-transformers-the-same.md`.
+fn run_encode_vindex_selftest(
+    rt: &mut VindexShannonRuntime,
+    ids: &[u32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = ids.len().min(VINDEX_BLOCK_TARGET_TOKENS + 1);
+    let block_ids = ids[..n].to_vec();
+    eprintln!(
+        "[selftest] two in-process forced passes over {} forced tokens",
+        block_ids.len() - 1
+    );
+
+    // Per step: (bits at the forced target, FNV fingerprint of the full count
+    // table, cumulative-low of the target symbol).
+    fn run_pass(
+        rt: &mut VindexShannonRuntime,
+        block_ids: &[u32],
+    ) -> Result<Vec<(f64, u64, u32)>, String> {
+        let mut per_step = Vec::with_capacity(block_ids.len());
+        larql_inference::layer_graph::generate::stream_forced_full_logits(
+            &mut rt.weights,
+            block_ids[0],
+            block_ids.len() - 1,
+            &rt.index,
+            rt.backend.as_ref(),
+            |step, logits| {
+                let target = block_ids[step + 1];
+                let counts = quantized_counts(logits).map_err(|e| e.to_string())?;
+                let (low, _high) =
+                    interval_for_symbol(&counts, target).map_err(|e| e.to_string())?;
+                let bits = bits_for_target(logits, target).map_err(|e| e.to_string())?;
+                let mut fp: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+                for (i, &c) in counts.iter().enumerate() {
+                    fp ^= (c as u64).wrapping_mul((i as u64).wrapping_add(1));
+                    fp = fp.wrapping_mul(0x100000001b3);
+                }
+                per_step.push((bits, fp, low));
+                Ok(target)
+            },
+        )?;
+        Ok(per_step)
+    }
+
+    let a = run_pass(rt, &block_ids)?;
+    let b = run_pass(rt, &block_ids)?;
+
+    let mut first_div: Option<usize> = None;
+    let mut max_bits_delta = 0.0_f64;
+    for (i, (pa, pb)) in a.iter().zip(b.iter()).enumerate() {
+        max_bits_delta = max_bits_delta.max((pa.0 - pb.0).abs());
+        if first_div.is_none() && pa.1 != pb.1 {
+            first_div = Some(i);
+        }
+    }
+
+    eprintln!("[selftest] steps compared:                 {}", a.len());
+    eprintln!(
+        "[selftest] max |Δ bits(target)| across steps: {:.6}",
+        max_bits_delta
+    );
+    match first_div {
+        Some(i) => {
+            eprintln!(
+                "[selftest] first step with DIFFERING count table: {} of {}",
+                i,
+                a.len()
+            );
+            eprintln!(
+                "[selftest]   cum_low(target) A={} B={}  Δbits={:.6}",
+                a[i].2,
+                b[i].2,
+                (a[i].0 - b[i].0).abs()
+            );
+            eprintln!(
+                "[selftest] VERDICT: per-dispatch non-determinism — two passes in ONE process"
+            );
+            eprintln!("[selftest]          disagree, so the coder cannot round-trip on this path.");
+        }
+        None => {
+            eprintln!(
+                "[selftest] count tables IDENTICAL at every step across two in-process passes."
+            );
+            eprintln!(
+                "[selftest] VERDICT: in-process is deterministic; drift is cross-process only"
+            );
+            eprintln!("[selftest]          (buffer init / dispatch geometry) and may be fixable.");
+        }
+    }
     Ok(())
 }
 

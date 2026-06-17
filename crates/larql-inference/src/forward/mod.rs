@@ -56,8 +56,10 @@ pub use hooks::{
     ZeroAblateHook,
 };
 pub use infer_patched::{
-    apply_knn_override, infer_patched, infer_patched_q4k, walk_trace_from_residuals,
-    InferPatchedResult, KnnOverride, KNN_COSINE_THRESHOLD,
+    apply_knn_override, apply_knn_override_two_tier, apply_knn_override_verified, infer_patched,
+    infer_patched_early_exit, infer_patched_q4k, infer_patched_q4k_early_exit,
+    walk_trace_from_residuals, InferPatchedResult, KnnOverride, KnnRouteMode, KNN_COSINE_THRESHOLD,
+    KNN_VERIFY_TOPK,
 };
 pub use inference_weights::InferenceWeights;
 pub use layer::{run_attention_public, run_ffn, run_layer_with_capture_hooked, run_layer_with_ffn};

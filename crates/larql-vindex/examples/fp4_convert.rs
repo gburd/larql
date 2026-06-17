@@ -17,7 +17,7 @@
 //!
 //! ```bash
 //! cargo run --release -p larql-vindex --example fp4_convert -- \
-//!   --in  output/gemma3-4b-f16.vindex \
+//!   --in  output/gemma3-4b-fresh.vindex \
 //!   --out output/gemma3-4b-fp4.vindex \
 //!   --policy option-b
 //! ```

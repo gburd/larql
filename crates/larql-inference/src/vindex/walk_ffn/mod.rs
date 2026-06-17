@@ -263,6 +263,15 @@ impl<'a> WalkFfn<'a> {
         self.trace_residuals.borrow_mut().drain(..).collect()
     }
 
+    /// Non-draining snapshot of the residuals captured so far. Used by the
+    /// early-exit path to inspect the stored-layer residuals at the resolved
+    /// layer *mid-forward* (after layer L*, before the tail runs) without
+    /// consuming the trace — the full forward, if it continues on a miss,
+    /// keeps appending.
+    pub fn peek_residuals(&self) -> Vec<(usize, Vec<f32>)> {
+        self.trace_residuals.borrow().clone()
+    }
+
     pub fn take_trace(&self) -> WalkTrace {
         let residuals = self
             .trace_residuals

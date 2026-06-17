@@ -92,7 +92,8 @@ impl<'a> WalkFfn<'a> {
         // restriction is set: in both cases gemv would bypass the
         // alternative selection criterion, so we force the walk.
         let selector_forces_walk = !matches!(self.config.selector, FeatureSelector::GateOnly)
-            || self.config.pool_per_layer.is_some();
+            || self.config.pool_per_layer.is_some()
+            || self.config.cell_router.is_some();
         let k_is_full =
             !selector_forces_walk && hits_len_ge_intermediate(&self.config, layer, intermediate);
         if !layer_has_overrides && is_gated && k_is_full {
@@ -153,11 +154,113 @@ impl<'a> WalkFfn<'a> {
             };
 
             let top_k = self.top_k_for(layer);
+
+            // ── Gather-contiguous Q4K fast path (task #24/#25) ───────────
+            // For a KNOWN-pool route (precomputed pool or cell-router, no
+            // within-pool ranking) the active feature set is decided without
+            // gate scores, so we skip the scattered `local_pool_gate_knn` and
+            // gather gate+up+down (down from the feature-major sidecar)
+            // contiguous, running the fused kernel in one cache-friendly pass.
+            // Fixes the ~4× per-row overhead at faithful K; re-gathers every
+            // position (the content-addressed pool moves per token). Declines
+            // (→ scalar paths) unless gated, no overrides, Q4K up, the down
+            // sidecar is loaded, and the route has ≥256 features.
+            if is_gated
+                && !layer_has_overrides
+                && up_native.is_none()
+                && !self.config.rank_within_pool
+                && self.index.has_down_features_kquant()
+            {
+                let route_feats: Option<Vec<usize>> =
+                    if let Some(router) = self.config.cell_router.as_ref() {
+                        router.pool_for(layer, x_slice).map(|p| p.to_vec())
+                    } else if self.config.precomputed_routing {
+                        self.config.pool_per_layer.as_ref().and_then(|ppl| {
+                            ppl.get(layer).map(|p| {
+                                let mut v = p.clone();
+                                v.truncate(top_k);
+                                v
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                if let Some(feats) = route_feats {
+                    if feats.len() >= 256 {
+                        if let Some((out_vec, acts)) =
+                            self.gather_q4k_accumulate(layer, &feats, x_slice, use_gelu, hidden)
+                        {
+                            let mut out_row = out.row_mut(s);
+                            out_row.as_slice_mut().unwrap().copy_from_slice(&out_vec);
+                            for (&feat, &a) in feats.iter().zip(&acts) {
+                                full_activation[[s, feat]] = a;
+                            }
+                            self.trace_path(layer, "sparse:gather_q4k");
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let t_gate = std::time::Instant::now();
-            let hits = if let Some(pool_per_layer) = self.config.pool_per_layer.as_ref() {
+            let hits = if let Some(router) = self.config.cell_router.as_ref() {
+                // Residual-cell content-addressed route (task #22): the
+                // per-position residual picks its nearest cell, and that
+                // cell's precomputed pool is the candidate set. Scored via
+                // the O(|pool|) local gate (no full projection). Used
+                // directly (the gate-KNN-union route) unless
+                // `rank_within_pool` narrows it to top-K. Falls back to
+                // gate-KNN when the layer has no cell pool.
+                match router.pool_for(layer, x_slice) {
+                    Some(pool) => match self.local_pool_gate_knn(layer, x_slice, pool) {
+                        Some(mut h) => {
+                            if self.config.rank_within_pool && h.len() > top_k {
+                                h.select_nth_unstable_by(top_k - 1, |a, b| {
+                                    b.1.abs()
+                                        .partial_cmp(&a.1.abs())
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                h.truncate(top_k);
+                            }
+                            h
+                        }
+                        None => self.pool_restricted_gate_knn(layer, &x_owned, top_k, pool),
+                    },
+                    None => self
+                        .index
+                        .gate_walk(layer, &x_owned, top_k)
+                        .unwrap_or_else(|| self.index.gate_knn(layer, &x_owned, top_k)),
+                }
+            } else if let Some(pool_per_layer) = self.config.pool_per_layer.as_ref() {
                 let empty = Vec::new();
                 let pool = pool_per_layer.get(layer).unwrap_or(&empty);
-                self.pool_restricted_gate_knn(layer, &x_owned, top_k, pool)
+                if self.config.precomputed_routing {
+                    // Cheap routing: gate scored only for the pool features
+                    // (O(|pool|)), no full gate projection. Falls back to
+                    // the projection path if Q4K gate bytes are absent.
+                    match self.local_pool_gate_knn(layer, x_slice, pool) {
+                        Some(mut h) => {
+                            if self.config.rank_within_pool && h.len() > top_k {
+                                // Two-stage: rank the candidate pool by
+                                // |gate_score| and keep the real top-K
+                                // (content-addressed within the pool).
+                                h.select_nth_unstable_by(top_k - 1, |a, b| {
+                                    b.1.abs()
+                                        .partial_cmp(&a.1.abs())
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                h.truncate(top_k);
+                            } else {
+                                // Pure precomputed route — pool order.
+                                h.truncate(top_k);
+                            }
+                            h
+                        }
+                        None => self.pool_restricted_gate_knn(layer, &x_owned, top_k, pool),
+                    }
+                } else {
+                    self.pool_restricted_gate_knn(layer, &x_owned, top_k, pool)
+                }
             } else {
                 match self.config.selector {
                     FeatureSelector::GateOnly => self
@@ -342,6 +445,122 @@ impl<'a> WalkFfn<'a> {
         self.trace_path(layer, "sparse:serial");
         Some((out, full_activation))
     }
+
+    /// Gather-contiguous Q4K accumulate — faithful-K fast-path kernel
+    /// (task #24, **experimental — not yet correct for production down**).
+    ///
+    /// The scattered per-feature loop pays ~4× per-row overhead at large K
+    /// (cache-unfriendly gather + per-hit dispatch), so it loses to dense
+    /// above ~20% density. This gathers the selected rows' up/down Q4K
+    /// **bytes** into contiguous buffers and runs the *same* fused NEON
+    /// kernels (`row_dot` / `row_scaled_add`) — no f32 materialisation.
+    /// Contiguity recovers the cost win: at K=4096 (40%) the kernel runs
+    /// ~1.4× faster than dense vs the scattered path's 0.80×
+    /// (`examples/walk_ffn_gather_gemm.rs`).
+    ///
+    /// `up` (`slices[1]`) is feature-major Q4K (gatherable). **`down`** must
+    /// come from the **feature-major down sidecar**
+    /// (`down_features_kquant.bin` via `down_features_q4k_layer_data`) — the
+    /// interleaved down is stored *transposed* `[hidden × intermediate]`, so a
+    /// feature's down vector is a strided column there, not a gatherable row.
+    /// Returns `None` (caller falls back to the correct scalar paths) when the
+    /// sidecar is absent.
+    ///
+    /// Returns `(out[hidden], acts[feats.len()])`. **Gate is recomputed** from
+    /// gathered gate bytes (not taken from any prior scattered scoring) so the
+    /// whole gate/up/down pass is contiguous — `feats` need only be the route's
+    /// feature indices.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn gather_q4k_accumulate(
+        &self,
+        layer: usize,
+        feats: &[usize],
+        x_slice: &[f32],
+        use_gelu: bool,
+        hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        let slices = self.index.interleaved_kquant_layer_data(layer)?;
+        let gate_info = larql_vindex::quant::registry::lookup(slices[0].1)?;
+        let up_info = larql_vindex::quant::registry::lookup(slices[1].1)?;
+        let gate_rd = gate_info.row_dot?;
+        let up_rd = up_info.row_dot?;
+        let gbpr = gate_info.bytes_per_row(hidden)?;
+        let ubpr = up_info.bytes_per_row(hidden)?;
+        let gate_b = slices[0].0;
+        let up_b = slices[1].0;
+        // Down from the feature-major sidecar (gatherable rows).
+        let (down_b, down_fmt, padded_width) = self.index.down_features_q4k_layer_data(layer)?;
+        let down_info = larql_vindex::quant::registry::lookup(down_fmt)?;
+        let down_sa = down_info.row_scaled_add?;
+        let dbpr = down_info.bytes_per_row(padded_width)?;
+        let k = feats.len();
+        if k == 0 {
+            return None;
+        }
+
+        // Gather gate + up + down bytes for the route's rows into contiguous
+        // buffers (sequential layout = cache-friendly fused kernel passes).
+        let mut gg = vec![0u8; k * gbpr];
+        let mut gu = vec![0u8; k * ubpr];
+        let mut gd = vec![0u8; k * dbpr];
+        for (i, &feat) in feats.iter().enumerate() {
+            let (gs, ge) = (feat * gbpr, feat * gbpr + gbpr);
+            let (us, ue) = (feat * ubpr, feat * ubpr + ubpr);
+            let (ds, de) = (feat * dbpr, feat * dbpr + dbpr);
+            if ge > gate_b.len() || ue > up_b.len() || de > down_b.len() {
+                return None; // out-of-range feature — bail to the safe path
+            }
+            gg[i * gbpr..(i + 1) * gbpr].copy_from_slice(&gate_b[gs..ge]);
+            gu[i * ubpr..(i + 1) * ubpr].copy_from_slice(&up_b[us..ue]);
+            gd[i * dbpr..(i + 1) * dbpr].copy_from_slice(&down_b[ds..de]);
+        }
+
+        // gate + up scores: fused row-dot over contiguous rows, parallel.
+        let gate_s: Vec<f32> = (0..k)
+            .into_par_iter()
+            .map(|i| gate_rd(&gg[i * gbpr..(i + 1) * gbpr], x_slice).unwrap_or(0.0))
+            .collect();
+        let up_s: Vec<f32> = (0..k)
+            .into_par_iter()
+            .map(|i| up_rd(&gu[i * ubpr..(i + 1) * ubpr], x_slice).unwrap_or(0.0))
+            .collect();
+        let acts: Vec<f32> = gate_s
+            .iter()
+            .zip(&up_s)
+            .map(|(&g, &u)| {
+                let ag = if use_gelu {
+                    crate::ffn::gelu_tanh(g)
+                } else {
+                    g * crate::ffn::sigmoid(g)
+                };
+                ag * u
+            })
+            .collect();
+
+        // down accumulate: fused scaled-add over contiguous rows, chunked.
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk = k.div_ceil(n_threads).max(1);
+        let partials: Vec<Vec<f32>> = (0..k)
+            .collect::<Vec<_>>()
+            .par_chunks(chunk)
+            .map(|ch| {
+                let mut part = vec![0.0f32; hidden];
+                for &i in ch {
+                    if acts[i].abs() > 1e-10 {
+                        let _ = down_sa(&gd[i * dbpr..(i + 1) * dbpr], acts[i], &mut part);
+                    }
+                }
+                part
+            })
+            .collect();
+        let mut out = vec![0.0f32; hidden];
+        for p in &partials {
+            for (o, v) in out.iter_mut().zip(p) {
+                *o += v;
+            }
+        }
+        Some((out, acts))
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +594,162 @@ mod tests {
             assert_eq!(out.shape(), &[1, weights.hidden_size]);
             assert_eq!(activation.shape()[0], 1);
         }
+    }
+
+    /// Cheap routing (task #18): a precomputed per-layer pool with
+    /// `precomputed_routing = true` drives the walk through
+    /// `local_pool_gate_knn` (gate scored only for the route features),
+    /// not `pool_restricted_gate_knn`. Output must be well-formed.
+    #[test]
+    fn walk_ffn_sparse_precomputed_routing_q4k_fixture() {
+        use std::sync::Arc;
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let pool: Vec<usize> = vec![0, 1, 2];
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 8)
+            .with_pool_per_layer(Arc::new(vec![pool; weights.num_layers]))
+            .with_precomputed_routing(true);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let (out, _act) = ffn
+            .walk_ffn_sparse(0, &x(1, weights.hidden_size))
+            .expect("precomputed-routing walk should produce output");
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// Safety property (task #25): `gather_q4k_accumulate` must **decline**
+    /// (return None) when the feature-major down sidecar is absent — the
+    /// interleaved down is transposed and not gatherable, so the caller falls
+    /// back to the correct scalar paths. The test fixture ships no sidecar.
+    /// (With-sidecar correctness is validated against dense on a real vindex
+    /// in `examples/walk_ffn_gather_gemm.rs`.)
+    #[test]
+    fn gather_q4k_accumulate_declines_without_down_sidecar() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let hidden = weights.hidden_size;
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 4);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let x1 = x(1, hidden);
+        let x_slice = x1.row(0).to_vec();
+        assert!(!index.has_down_features_kquant());
+        assert!(
+            ffn.gather_q4k_accumulate(0, &[0, 1, 2, 3], &x_slice, false, hidden)
+                .is_none(),
+            "gather must decline without the feature-major down sidecar"
+        );
+    }
+
+    /// Residual-cell router (task #22): a per-position residual selects its
+    /// nearest cell, whose pool becomes the route. With a single all-zero
+    /// centroid every position lands in cell 0; output must be well-formed.
+    #[test]
+    fn walk_ffn_sparse_cell_router_q4k_fixture() {
+        use crate::vindex::CellRouter;
+        use std::sync::Arc;
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let hidden = weights.hidden_size;
+        let nl = weights.num_layers;
+        let router = CellRouter {
+            centroids: vec![vec![0.0f32; hidden]; nl], // 1 cell/layer at origin
+            n_cells: vec![1; nl],
+            pools: vec![vec![vec![0usize, 1, 2]]; nl],
+            hidden,
+        };
+        let cfg = WalkFfnConfig::sparse(nl, 8).with_cell_router(Arc::new(router));
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let (out, _act) = ffn
+            .walk_ffn_sparse(0, &x(1, hidden))
+            .expect("cell-router walk should produce output");
+        assert_eq!(out.shape(), &[1, hidden]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// Cell router with an empty pool set for the layer falls back to the
+    /// gate-KNN path (no cell pool available) — still produces output.
+    #[test]
+    fn walk_ffn_sparse_cell_router_empty_falls_back_to_gate_knn() {
+        use crate::vindex::CellRouter;
+        use std::sync::Arc;
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        // Router with no cells for any layer → pool_for returns None.
+        let router = CellRouter {
+            centroids: vec![Vec::new(); weights.num_layers],
+            n_cells: vec![0; weights.num_layers],
+            pools: vec![Vec::new(); weights.num_layers],
+            hidden: weights.hidden_size,
+        };
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 8).with_cell_router(Arc::new(router));
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let result = ffn.walk_ffn_sparse(0, &x(1, weights.hidden_size));
+        assert!(result.is_some());
+    }
+
+    /// Two-stage routing: a candidate pool larger than K, ranked within by
+    /// gate score (`rank_within_pool`), keeps the real top-K and still
+    /// produces well-formed output.
+    #[test]
+    fn walk_ffn_sparse_rank_within_pool_q4k_fixture() {
+        use std::sync::Arc;
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let feats = index.num_features(0);
+        // Candidate pool = all features; K = 4 < pool, so ranking kicks in.
+        let pool: Vec<usize> = (0..feats).collect();
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 4)
+            .with_pool_per_layer(Arc::new(vec![pool; weights.num_layers]))
+            .with_precomputed_routing(true)
+            .with_rank_within_pool(true);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let (out, _act) = ffn
+            .walk_ffn_sparse(0, &x(1, weights.hidden_size))
+            .expect("ranked two-stage walk should produce output");
+        assert_eq!(out.shape(), &[1, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `local_pool_gate_knn` scores only the pool features (O(K)), in
+    /// pool order, and filters out-of-range indices. Empty pool → empty.
+    #[test]
+    fn local_pool_gate_knn_scores_only_pool_features() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 8);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let x1 = x(1, weights.hidden_size);
+        let x_slice = x1.row(0).to_vec();
+
+        // Empty pool → empty hits.
+        let empty = ffn.local_pool_gate_knn(0, &x_slice, &[]);
+        assert_eq!(empty, Some(Vec::new()));
+
+        // Valid pool + an out-of-range index that must be filtered.
+        let huge = usize::MAX;
+        let hits = ffn
+            .local_pool_gate_knn(0, &x_slice, &[2, 0, 1, huge])
+            .expect("q4k fixture exposes interleaved gate bytes");
+        // huge filtered out; the three valid features kept in pool order.
+        assert_eq!(
+            hits.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert!(hits.iter().all(|(_, g)| g.is_finite()));
+    }
+
+    /// When the layer exposes no interleaved Q4K gate bytes (plain f32
+    /// fixture), `local_pool_gate_knn` returns None so the caller routes
+    /// to the `pool_restricted_gate_knn` projection fallback.
+    #[test]
+    fn local_pool_gate_knn_none_without_q4k_gate_bytes() {
+        let weights = make_test_weights();
+        let index = make_test_vindex(&weights);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 4);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let x1 = x(1, weights.hidden_size);
+        let x_slice = x1.row(0).to_vec();
+        assert!(ffn.local_pool_gate_knn(0, &x_slice, &[0, 1]).is_none());
     }
 
     /// Sparse walk over the feature-major f32 fixture — `up_layer_matrix`

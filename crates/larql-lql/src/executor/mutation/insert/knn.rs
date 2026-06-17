@@ -76,8 +76,17 @@ impl Session {
             // do not need to know the on-disk format.
             let mut iw = larql_inference::InferenceWeights::load(path, config, &mut cb)
                 .map_err(|e| LqlError::exec("failed to load model weights", e))?;
+            // Install only needs the residuals (knn_store=None → no override
+            // fires); the route mode is irrelevant here.
             let residuals = iw
-                .infer_patched(&tokenizer, patched, None, &token_ids, 1)
+                .infer_patched(
+                    &tokenizer,
+                    patched,
+                    None,
+                    &token_ids,
+                    1,
+                    &larql_inference::KnnRouteMode::Legacy,
+                )
                 .residuals;
 
             residual_key = residuals

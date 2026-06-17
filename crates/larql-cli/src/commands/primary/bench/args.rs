@@ -32,8 +32,18 @@ pub struct BenchArgs {
 
     /// Also query a local Ollama server on the default port with this
     /// model name (e.g. `gemma3:4b`). Requires `ollama serve` running.
+    /// By default Ollama runs on its own backend (Metal GPU on Apple
+    /// silicon) — that is NOT a CPU comparison. Pair with `--ollama-cpu`
+    /// to force a true CPU baseline.
     #[arg(long, value_name = "MODEL")]
     pub ollama: Option<String>,
+
+    /// Force the `--ollama` query onto CPU (`options.num_gpu=0`,
+    /// `num_thread` = the bench thread count) so it is a true llama.cpp-
+    /// on-CPU baseline matching `larql bench --cpu`, instead of the
+    /// default Metal-GPU run. No effect without `--ollama`.
+    #[arg(long)]
+    pub ollama_cpu: bool,
 
     /// KV engines to bench alongside the GPU path.
     ///

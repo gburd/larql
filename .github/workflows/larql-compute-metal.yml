@@ -67,11 +67,17 @@ jobs:
         # the same flag for the same reason.
         run: cargo clippy -p larql-compute-metal --all-targets --no-deps -- -D warnings
 
+      # `--test-threads=1` serialises the test runner, matching the Makefile
+      # targets (`larql-compute-metal-test{,-tests}`). Many tests read
+      # process-global state cached at `MetalBackend::new()` (decode flags) and
+      # share the single GPU; cargo's default parallel runner races on them and
+      # intermittently yields NaN/zero pipeline output. Serial execution is the
+      # same fix larql-inference uses for its OpenBLAS global-buffer race.
       - name: Unit tests
-        run: cargo test -p larql-compute-metal --lib
+        run: cargo test -p larql-compute-metal --lib -- --test-threads=1
 
       - name: Integration tests
-        run: cargo test -p larql-compute-metal --tests
+        run: cargo test -p larql-compute-metal --tests -- --test-threads=1
 
       - name: Coverage policy gate
         run: |

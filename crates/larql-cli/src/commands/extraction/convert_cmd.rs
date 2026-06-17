@@ -727,6 +727,24 @@ fn run_gguf_info(input: &std::path::Path) -> Result<(), Box<dyn std::error::Erro
 
     println!();
 
+    // Print tensor info table (name, dims, ggml type id) — the layout spec a
+    // consumer (e.g. a vindex→GGUF exporter) must match. Sorted by name.
+    println!();
+    println!("Tensors ({}):", gguf.tensor_infos.len());
+    let mut infos: Vec<&larql_models::loading::gguf::GgufTensorInfo> =
+        gguf.tensor_infos.iter().collect();
+    infos.sort_by(|a, b| a.name().cmp(b.name()));
+    for t in &infos {
+        println!(
+            "  {:<40} dims={:?} type={}",
+            t.name(),
+            t.dims(),
+            t.tensor_type(),
+        );
+    }
+
+    println!();
+
     // Print synthesised config
     let config = gguf.to_config_json();
     println!("Detected config:");

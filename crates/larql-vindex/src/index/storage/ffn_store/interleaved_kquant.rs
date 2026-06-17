@@ -254,10 +254,7 @@ impl VectorIndex {
                 }
                 (s, e - s)
             };
-            unsafe {
-                let ptr = mmap[start..].as_ptr() as *mut libc::c_void;
-                libc::madvise(ptr, len, libc::MADV_WILLNEED);
-            }
+            crate::mmap_util::advise_willneed(mmap[start..].as_ptr(), len);
         }
     }
 }

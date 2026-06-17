@@ -11,6 +11,7 @@ mod lifecycle;
 mod memit_persist;
 mod mutation;
 mod query;
+mod relation_resolver;
 mod remote;
 mod trace;
 mod tuning;
@@ -61,6 +62,12 @@ pub struct Session {
     /// every template query after Hyrule→Hateno install).
     #[allow(dead_code)]
     pub(crate) installed_edges: Vec<InstalledEdge>,
+    /// FR3 synonym-robust relation resolver, built lazily on first synonym
+    /// SELECT and cached per vindex path (rebuilt if the active vindex changes).
+    /// `RefCell` for interior mutability under `&self` query methods; the inner
+    /// `Option` caches a failed/empty build so it isn't retried every query.
+    pub(crate) relation_resolver:
+        std::cell::RefCell<Option<(PathBuf, Option<relation_resolver::RelationResolver>)>>,
     /// LSM epoch counter — advances on every mutation (INSERT/DELETE/UPDATE).
     pub(crate) epoch: u64,
     /// Mutations since last minor compaction (L0 → L1).
@@ -84,6 +91,7 @@ impl Session {
             decoy_residual_cache: std::collections::HashMap::new(),
             raw_install_residuals: std::collections::HashMap::new(),
             installed_edges: Vec::new(),
+            relation_resolver: std::cell::RefCell::new(None),
             epoch: 0,
             mutations_since_minor: 0,
             mutations_since_major: 0,
@@ -238,7 +246,8 @@ impl Session {
                 prompt,
                 top,
                 compare,
-            } => self.exec_infer(prompt, *top, *compare),
+                route,
+            } => self.exec_infer(prompt, *top, *compare, route.as_ref()),
             Statement::Delete { conditions } => {
                 let mut out = self.ensure_patch_session();
                 out.extend(self.exec_delete(conditions)?);
@@ -297,7 +306,7 @@ impl Session {
             Statement::Walk { prompt, top, layers, .. } => {
                 self.remote_walk(prompt, *top, layers.as_ref())
             }
-            Statement::Infer { prompt, top, compare } => {
+            Statement::Infer { prompt, top, compare, route: _ } => {
                 self.remote_infer(prompt, *top, *compare)
             }
             Statement::Stats { .. } => self.remote_stats(),

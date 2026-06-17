@@ -17,7 +17,8 @@
 //! Expected outcome: 10/10 retrieval and 0/4 bleed for both patched
 //! and compiled — validated on Gemma 3 4B in exp 14.
 //!
-//! If the source vindex (`output/gemma3-4b-f16.vindex`) doesn't exist,
+//! If no source vindex is found (the first of `SOURCE_CANDIDATES` that exists,
+//! e.g. `output/gemma3-4b-fresh.vindex`; override with `LARQL_DEMO_VINDEX`),
 //! the example prints a clear "skipped" message and exits 0 so it
 //! still compiles in CI.
 //!
@@ -27,7 +28,24 @@ use larql_lql::{parse, Session};
 use std::path::Path;
 use std::time::Instant;
 
-const SOURCE_VINDEX: &str = "output/gemma3-4b-f16.vindex";
+/// Source vindexes the demo tries, in preference order — first existing
+/// wins. Override with `LARQL_DEMO_VINDEX=path/to.vindex`. All need model
+/// weights (the demo INFERs + COMPILEs).
+const SOURCE_CANDIDATES: &[&str] = &[
+    "output/gemma3-4b-fresh.vindex",
+    "output/gemma3-4b-f16.vindex",
+];
+
+/// First existing candidate (or `$LARQL_DEMO_VINDEX`), else `None`.
+fn resolve_source_vindex() -> Option<String> {
+    if let Ok(p) = std::env::var("LARQL_DEMO_VINDEX") {
+        return Path::new(&p).exists().then_some(p);
+    }
+    SOURCE_CANDIDATES
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|s| (*s).to_string())
+}
 
 /// 10 canonical capital-of facts. Matches the Python reference in
 /// `experiments/14_vindex_compilation`. Validated end-to-end:
@@ -63,25 +81,25 @@ const REGRESSION_PROMPTS: &[&str] = &[
 fn main() {
     println!("=== LQL Refine Demo (end-to-end exp 14 reproduction) ===\n");
 
-    if !Path::new(SOURCE_VINDEX).exists() {
-        println!("  skipped: source vindex not found at {SOURCE_VINDEX}");
+    let Some(source_vindex) = resolve_source_vindex() else {
+        println!("  skipped: no source vindex found (looked for {SOURCE_CANDIDATES:?})");
         println!();
-        println!("  To run this demo, first extract a vindex with model weights:");
+        println!("  Set LARQL_DEMO_VINDEX, or first extract a vindex with model weights:");
         println!("    cargo run -p larql-cli --release -- repl");
         println!("    > EXTRACT MODEL \"google/gemma-3-4b-pt\"");
-        println!("           INTO \"{SOURCE_VINDEX}\" WITH ALL;");
+        println!("           INTO \"output/gemma3-4b-fresh.vindex\" WITH ALL;");
         println!();
         println!("  This is intentional — the example still compiles in CI");
         println!("  without the multi-GB vindex on disk.");
         return;
-    }
+    };
 
     let t0 = Instant::now();
 
     // ── Phase 1: baseline ──
     section("Phase 1 — Baseline (no inserts)");
     let mut baseline_session = Session::new();
-    use_vindex(&mut baseline_session, SOURCE_VINDEX);
+    use_vindex(&mut baseline_session, &source_vindex);
     let baseline_retrieval = measure_retrieval(&mut baseline_session, "baseline");
     let baseline_regression = measure_regression(&mut baseline_session, "baseline");
 
@@ -89,7 +107,7 @@ fn main() {
     //              (no compile yet — this is what the user gets in a REPL after INSERT) ──
     section("Phase 2a — Install + measure on PATCHED session (no compile)");
     let mut patched_session = Session::new();
-    use_vindex(&mut patched_session, SOURCE_VINDEX);
+    use_vindex(&mut patched_session, &source_vindex);
     run(
         &mut patched_session,
         r#"BEGIN PATCH "/tmp/larql_refine_demo_patched.vlp";"#,

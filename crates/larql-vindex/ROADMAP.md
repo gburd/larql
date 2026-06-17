@@ -1,5 +1,12 @@
 # Roadmap — larql-vindex
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — NaN `partial_cmp().unwrap()`** at `router:107`, `lm_head:322`, `gate_store:330`. Route through a shared NaN-safe top-K/sort helper (workspace-wide cleanup, ~10 sites across vindex/core/cli/python).
+- **Low — implicit 4-byte alignment** in the `*const f32` reinterprets in `decode_floats` / `decode_gate_vector`; invariant is enforced only by caller offset arithmetic, not the helper.
+
 ## Current state (as of 2026-05-16)
 
 - **975 lib tests** on `larql-vindex` (`cargo test -p larql-vindex

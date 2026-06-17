@@ -139,6 +139,61 @@ Any downstream analysis that quotes the labeled inventory should use the **stabl
 
 ---
 
+### P5 — Gating-selectivity depth gradient (three tests)
+
+**Context:** the Q4 gating-selectivity pilot (2026-05-25) produced three regimes as a post-hoc observation: L15-L18 features barely fire on prompted templates (mean activation 16-64), L23-L26 features fire ~2x on pertainym vs non-pertainym (noisy selection, not population code), L31-L33 features fire with strong topic selectivity but hypernym at 71% of pertainym (relational-mode encoding, not specific-relation selection). These emerged from a pilot with n=4-5 per zone. The three-regime model is a hypothesis, not a tested prediction. Pre-registering tests to validate or refute.
+
+**P5a — L15-L18 bare-entity activation**
+
+**Prediction:** L15-L18 pertainym features fire with mean gate activation >200 on the bare-entity template ("{entity}") for entities in their matched set (from the original probe), AND fire with mean activation <100 on the three prompted templates from the selectivity pilot.
+
+**Rationale:** the claim that L15-L18 features do "token-level encoding" requires they respond to the entity token alone but not to prompted context. If they also fire weakly on the bare-entity template, the selectivity pilot simply sampled inactive features and the "token-level" regime doesn't exist.
+
+**Falsification:**
+- Bare-entity activation <100 → features are just weakly active; no "token-level encoding" regime; two-regime model (selectivity gradient within a single population)
+- Bare-entity activation >200 AND prompted activation >200 → features fire on everything; L15-L18 is not qualitatively different from L23-L26
+- Bare-entity activation >200 AND prompted activation <100 → confirmed; features respond to token identity, not context
+
+**P5b — L33 relation-resolution compared to L31**
+
+**Prediction:** L33 pertainym features show hypernym activation suppressed below 40% of pertainym activation (vs 71% at L31). The prediction is that the depth gradient in relation selectivity continues through L30-L33, with L33 features achieving sharper relation discrimination than L31 features.
+
+**Rationale:** if selection sharpens with depth, the hypernym co-activation should decline from L31 to L33. If L33 features still show hypernym at 60%+ of pertainym, relation selection is NOT happening in the MLP — it happens in the unembedding.
+
+**Falsification:**
+- L33 hypernym/pertainym ratio <40% → relation selectivity sharpens within L30-L33; MLP features do the selection
+- L33 hypernym/pertainym ratio >60% → relation selectivity does NOT sharpen; the unembedding does the relation-specific projection
+- L33 hypernym/pertainym ratio 40-60% → partial sharpening; both MLP and unembedding contribute
+
+**P5c — Synonym selectivity at L19**
+
+**Prediction:** synonym features at L17-L19 (the Q6 peak zone) show context-dependent gating selectivity similar to L31-L33 features (topic selectivity P-I >500, pertainym/synonym discrimination P-H >200). The prediction is that synonym's earlier depth peak reflects a selector operation, consistent with the "synonym is a lexical-substitution operation" interpretation from Q6.
+
+**Rationale:** if synonym features at L17-L19 are doing context-dependent selection (like L31-L33 features, not like L23-L26 features), this supports the hypothesis that the synonym depth profile is functionally meaningful — synonym resolution IS a selector operation that completes before the population-code zone.
+
+**Falsification:**
+- L19 synonym selectivity like L31-L33 (P-I >500) → synonym is a selector operation; Q6 depth profile is functionally meaningful
+- L19 synonym selectivity like L23-L26 (P-I <500, H ≈ I) → synonym is a noisy relation key like other L23-L26 features; the earlier depth peak is incidental, not mechanistic
+- L19 synonym features barely fire (like L15-L18) → synonym at L19 is token-level encoding; depth peak is not about selection
+
+**Tested by:** three small experiments using the q4_gating_selectivity infrastructure.
+
+**Outcome (2026-05-25, after P5 selectivity tests):**
+
+**P5a observed:** excluding one dead feature (L17_F6710, negative on all conditions), bare-entity activation averages 384 vs pertainym-prompted 162, hypernym-prompted 171, irrelevant-prompted 127. Features fire ~2.4x more on bare entity than on prompted templates. However, prompted activations are ~150, not <100 as predicted. Result: **PARTIAL** — token-level encoding is the primary mode (bare >> prompted), but features are not silent on prompted context. They're dampened, not off. The "token-level encoding" regime exists but is not as clean as predicted.
+
+**P5b observed:** L31 mean hypernym/pertainym ratio = 0.76. L33 mean hypernym/pertainym ratio = **0.85**. The ratio goes UP from L31 to L33, not down. L33 pertainym features fire at 85% of pertainym activation on hypernym prompts — *less* relation-selective than L31. Result: **REFUTED.** Relation selectivity does NOT sharpen within L30-L33. The MLP prepares a relational-mode residual; the unembedding does the relation-specific projection. The claim "L30-L33 is where selection occurs" is wrong about what is being selected — MLP features select topic (relational vs non-relational), the unembedding selects the specific relation.
+
+**P5c observed:** all similar_to features at L17-L19 show negative activations on all three prompted templates (mean similar=-341, opposite=-319, irrelevant=-313). P-I = -28. These features are completely inactive on prompted context. Result: **REFUTED in direction** — synonym features at L17-L19 show the L15-L18 pattern (token-level, not context-dependent), not the L31-L33 pattern (context-dependent). The Q6 interpretation that synonym peaks at L17-L19 because it's a "selector operation" is not supported. The synonym depth peak likely reflects token-level encoding of synonym-shaped vocabulary, not a functionally different computation.
+
+**Working model update (P5 overall):**
+- The three-regime model (token-encoding → noisy selection → sharp selection) is partially supported but the regimes are not as clean as hypothesized. L15-L18 is partially token-level (bare >> prompted but not exclusive). L23-L26 is noisy selection (~2x on target). L31-L33 selects topic (relational vs non-relational) but NOT specific relation (hypernym at 71-85% of pertainym).
+- **Key new finding: the MLP does not select the specific relation.** The unembedding does. MLP features across L15-L33 encode increasingly topic-selective but relation-non-selective gating. The final relation-specific projection is the unembedding's job.
+- Q6 (synonym depth profile) is reframed: synonym features at L17-L19 don't activate on bare entities OR prompted templates (4/5 features negative on all conditions). One exception (L18_F6739) is genuinely context-dependent (fires on similar prompt, not bare entity). The depth peak may reflect gate-vector topography (features whose gate vectors align with synonym-shaped residuals) rather than functional activation. This raises a broader question about whether the probe's gate-matching criterion produces features that are functionally active vs features that match at the geometric level. Not resolved.
+- The publishable finding is: **gating selectivity sharpens monotonically from L15 to L33 for topic (relational vs non-relational), while relation selectivity is flat or declining. The MLP-unembedding interface is where relation-specific information enters the output — MLP features prepare a relation-agnostic "relational mode" residual.** However, the "unembedding does relation selection" claim is currently inferred from one data point (pertainym vs hypernym) with potentially ambiguous entities (see live alternatives in narrative). Needs a second relation pair with unambiguous entities and a logit-lens check before publication.
+
+---
+
 ## Update protocol
 
 When an experiment lands, append an outcome section under each tested prediction:

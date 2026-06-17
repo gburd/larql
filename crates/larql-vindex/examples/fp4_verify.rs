@@ -9,7 +9,7 @@
 //! Usage:
 //! ```
 //! cargo run --release -p larql-vindex --example fp4_verify -- \
-//!   --src output/gemma3-4b-f16.vindex \
+//!   --src output/gemma3-4b-fresh.vindex \
 //!   --fp4 output/gemma3-4b-fp4.vindex
 //! ```
 
@@ -39,7 +39,11 @@ fn parse_args() -> (PathBuf, PathBuf) {
         }
         i += 1;
     }
-    (src.expect("--src"), fp4.expect("--fp4"))
+    let (Some(src), Some(fp4)) = (src, fp4) else {
+        eprintln!("usage: fp4_verify --src SRC.vindex --fp4 FP4.vindex");
+        std::process::exit(1);
+    };
+    (src, fp4)
 }
 
 fn load_source_feature(

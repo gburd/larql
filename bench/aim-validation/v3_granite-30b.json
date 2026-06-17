@@ -1,0 +1,47 @@
+{
+  "blob": "gate_vectors.bin",
+  "method": "cold-seq via mmap+MADV_DONTNEED (verified by major faults); cold-sparse via F_NOCACHE pread (robust, Darwin re-evict unreliable); warm via resident mmap. Not RAM-pressure; 128GB machine, blob < RAM",
+  "metrics": {
+    "blob_gb": 17.179869184,
+    "cold_seq_major_faults_per_page": 1.0,
+    "cold_sequential": {
+      "eff_bandwidth_mb_s": 556.3663640339743,
+      "major_faults": 1048576,
+      "max_us": 3041.458,
+      "mean_us": 28.08401263999825,
+      "minor_faults": 512,
+      "p50_us": 17.875,
+      "p99_us": 160.417,
+      "touches": 1048576
+    },
+    "cold_sparse": {
+      "eff_bandwidth_mb_s": 152.89357020664727,
+      "major_faults": -1,
+      "max_us": 2535.0,
+      "mean_us": 102.19527203715386,
+      "minor_faults": -1,
+      "p50_us": 99.959,
+      "p99_us": 139.75,
+      "touches": 104857
+    },
+    "cold_warm_ratio": 2379.976190476191,
+    "disk_read_p50_ms": 0.099959,
+    "disk_read_p99_ms": 0.13975,
+    "eviction_verified": true,
+    "page_bytes": 16384,
+    "topk_frac": 0.1,
+    "warm_sparse": {
+      "eff_bandwidth_mb_s": 207457.05314323996,
+      "major_faults": 0,
+      "max_us": 6.292,
+      "mean_us": 0.07531679334715907,
+      "minor_faults": 54,
+      "p50_us": 0.041999999999999996,
+      "p99_us": 0.20800000000000002,
+      "touches": 104857
+    }
+  },
+  "model": "granite-4.1-30b-q4k",
+  "notes": "eviction-based cold-read probe; does NOT cover RAM-pressure thrash under load or end-to-end tok/s on a >RAM model (needs >128GB-class vindex or Linux/cgroup box)",
+  "test_id": "V3"
+}

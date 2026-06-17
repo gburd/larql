@@ -23,7 +23,7 @@
 //!
 //! ```bash
 //! cargo run --release -p larql-vindex --example fp4_q1_scan -- \
-//!   --vindex path/to/gemma3-4b-f16.vindex \
+//!   --vindex path/to/gemma3-4b-fresh.vindex \
 //!   --out    path/to/results.json
 //! ```
 
@@ -64,11 +64,16 @@ impl Dtype {
     }
 }
 
-/// `(projection_name, filename)` — scanner opportunistically skips missing files.
-const PROJECTIONS: &[(&str, &str)] = &[
-    ("gate", "gate_vectors.bin"),
-    ("up", "up_features.bin"),
-    ("down", "down_features.bin"),
+/// `(projection_name, candidate_filenames)` — the first candidate that exists
+/// is scanned; if none exist the projection is skipped. Vindex builds vary in
+/// blob naming: older `f16` exports use `*_features.bin`, newer ones (Granite
+/// 4.1, fresh Gemma exports) use `*_weights.bin`. Both are the same
+/// `[intermediate, hidden]` feature-major layout (each feature = one
+/// hidden-length vector), so the scan is identical.
+const PROJECTIONS: &[(&str, &[&str])] = &[
+    ("gate", &["gate_vectors.bin"]),
+    ("up", &["up_features.bin", "up_weights.bin"]),
+    ("down", &["down_features.bin", "down_weights.bin"]),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -344,13 +349,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let t_total = Instant::now();
-    for (proj_name, filename) in PROJECTIONS {
-        let path = vindex_path.join(filename);
-        if !path.exists() {
-            println!("· skipping {proj_name} — {} not present", filename);
-            proj_results.push(None);
-            continue;
-        }
+    for (proj_name, candidates) in PROJECTIONS {
+        let path = match candidates
+            .iter()
+            .map(|f| vindex_path.join(f))
+            .find(|p| p.exists())
+        {
+            Some(p) => p,
+            None => {
+                println!("· skipping {proj_name} — none of {candidates:?} present");
+                proj_results.push(None);
+                continue;
+            }
+        };
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         println!("→ scanning {proj_name} ({}, {dtype_str})", path.display());
         let file = File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };

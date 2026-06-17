@@ -324,6 +324,53 @@ impl<'a> WalkFfn<'a> {
         weighted.into_iter().map(|(i, g, _)| (i, g)).collect()
     }
 
+    /// Precomputed-route gate scoring — the **cheap routing** path.
+    ///
+    /// Unlike `pool_restricted_gate_knn` (which calls
+    /// `gate_scores_batch_backend` = a full gate projection over *all*
+    /// features, then filters to the pool), this computes the gate score
+    /// for **only the pool features** via per-row Q4K dots — O(|pool|),
+    /// not O(num_features). It models hash routing (Exp 27): the feature
+    /// set is decided upstream (token-deterministic), so selection never
+    /// touches the full gate matrix.
+    ///
+    /// Returns `(feature, gate_score)` for each pool feature, in pool
+    /// order (no ranking needed — the route *is* the selection). Falls
+    /// back to `None` when the layer exposes no Q4K interleaved gate
+    /// bytes with a registered `row_dot` (the only storage this fast path
+    /// supports; callers then route to `pool_restricted_gate_knn`).
+    pub(super) fn local_pool_gate_knn(
+        &self,
+        layer: usize,
+        x_slice: &[f32],
+        pool: &[usize],
+    ) -> Option<Vec<(usize, f32)>> {
+        if pool.is_empty() {
+            return Some(Vec::new());
+        }
+        let hidden = self.weights.hidden_size;
+        // Interleaved Q4K layout is [gate, up, down]; gate is slot 0.
+        let slices = self.index.interleaved_kquant_layer_data(layer)?;
+        let (gate_bytes, gate_tag) = (slices[0].0, slices[0].1);
+        let info = larql_vindex::quant::registry::lookup(gate_tag)?;
+        let row_dot = info.row_dot?;
+        let bytes_per_row = info.bytes_per_row(hidden)?;
+        let n_rows = gate_bytes.len() / bytes_per_row;
+        Some(
+            pool.iter()
+                .filter_map(|&feat| {
+                    if feat >= n_rows {
+                        return None;
+                    }
+                    let start = feat * bytes_per_row;
+                    let end = start + bytes_per_row;
+                    let g = row_dot(&gate_bytes[start..end], x_slice).unwrap_or(0.0);
+                    Some((feat, g))
+                })
+                .collect(),
+        )
+    }
+
     /// Fallback when the joint-scoring path can't run — falls back to
     /// the production `gate_walk` → `gate_knn_q4` → `gate_knn` chain so
     /// the walk still produces output.

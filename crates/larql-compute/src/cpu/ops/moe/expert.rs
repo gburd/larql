@@ -498,6 +498,13 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
         t = std::time::Instant::now();
     }
 
+    // Within-expert feature routing (aim-validation probe). No-op (one relaxed
+    // atomic load) unless a schedule is installed via
+    // `super::within_expert::set_routing` — keeps this hot path byte-exact in
+    // production. Prunes the `inter` post-activation features to the configured
+    // subset before the `down` matvec; padding columns stay zero.
+    super::within_expert::prune_act(&mut scratch.act, inter);
+
     // Quantise the per-expert activation to Q8_K in-place into the
     // caller-owned scratch buffer (no allocation on the hot path —
     // eliminates the 150 µs alloc spikes that drag par_iter wall up).

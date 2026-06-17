@@ -140,26 +140,76 @@ fn rand_mat_seeded(rows: usize, cols: usize, scale: f32, seed: u64) -> WeightArr
 /// - **`norm_weight_offset = 1.0`** — non-zero offset added to every
 ///   norm weight at runtime
 pub fn make_gemma3_test_weights() -> ModelWeights {
+    const HIDDEN: usize = 16;
+    const INTER: usize = 32;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 8;
+    const VOCAB: usize = 32;
+    const NUM_LAYERS: usize = 2;
+    gemma3_test_weights_inner(
+        serde_json::json!({
+            "model_type": "gemma3",
+            "hidden_size": HIDDEN,
+            "num_hidden_layers": NUM_LAYERS,
+            "intermediate_size": INTER,
+            "head_dim": HEAD_DIM,
+            "num_attention_heads": NUM_Q,
+            "num_key_value_heads": NUM_KV,
+            "vocab_size": VOCAB,
+            "rope_theta": 10000.0,
+            "residual_multiplier": 0.5,
+        }),
+        NUM_LAYERS,
+    )
+}
+
+/// Like [`make_gemma3_test_weights`] but with the structured per-layer-type
+/// `rope_scaling` form (linear factor 8 on full-attention layers, default on
+/// sliding) and **6 layers**, so layer 5 is a global/full-attention layer with
+/// `position_divisor = 8`. Used to exercise the scaled-RoPE path — the engine
+/// prefill and full-recompute attention must agree there (regression guard for
+/// the 2026-05-28 prefill-RoPE divergence).
+pub fn make_gemma3_rope_scaled_test_weights() -> ModelWeights {
+    const HIDDEN: usize = 16;
+    const INTER: usize = 32;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 8;
+    const VOCAB: usize = 32;
+    const NUM_LAYERS: usize = 6;
+    gemma3_test_weights_inner(
+        serde_json::json!({
+            "model_type": "gemma3",
+            "text_config": {
+                "model_type": "gemma3_text",
+                "hidden_size": HIDDEN,
+                "num_hidden_layers": NUM_LAYERS,
+                "intermediate_size": INTER,
+                "head_dim": HEAD_DIM,
+                "num_attention_heads": NUM_Q,
+                "num_key_value_heads": NUM_KV,
+                "vocab_size": VOCAB,
+                "rope_theta": 10000.0,
+                "residual_multiplier": 0.5,
+                "sliding_window": 1024,
+                "rope_scaling": {
+                    "full_attention": {"rope_type": "linear", "factor": 8.0},
+                    "sliding_attention": {"rope_type": "default"},
+                },
+            },
+        }),
+        NUM_LAYERS,
+    )
+}
+
+fn gemma3_test_weights_inner(arch_json: serde_json::Value, num_layers: usize) -> ModelWeights {
     const VOCAB: usize = 32;
     const HIDDEN: usize = 16;
     const INTER: usize = 32;
     const NUM_Q: usize = 2;
     const NUM_KV: usize = 1;
     const HEAD_DIM: usize = 8;
-    const NUM_LAYERS: usize = 2;
-
-    let arch_json = serde_json::json!({
-        "model_type": "gemma3",
-        "hidden_size": HIDDEN,
-        "num_hidden_layers": NUM_LAYERS,
-        "intermediate_size": INTER,
-        "head_dim": HEAD_DIM,
-        "num_attention_heads": NUM_Q,
-        "num_key_value_heads": NUM_KV,
-        "vocab_size": VOCAB,
-        "rope_theta": 10000.0,
-        "residual_multiplier": 0.5,
-    });
     let arch = detect_from_json(&arch_json);
 
     let mut tensors: HashMap<String, WeightArray> = HashMap::new();
@@ -181,7 +231,7 @@ pub fn make_gemma3_test_weights() -> ModelWeights {
         seed_counter
     };
 
-    for layer in 0..NUM_LAYERS {
+    for layer in 0..num_layers {
         tensors.insert(
             arch.attn_q_key(layer),
             rand_mat_seeded(q_dim, HIDDEN, 0.1, next_seed()),
@@ -243,7 +293,7 @@ pub fn make_gemma3_test_weights() -> ModelWeights {
         lm_head,
         position_embed: None,
         arch,
-        num_layers: NUM_LAYERS,
+        num_layers,
         hidden_size: HIDDEN,
         intermediate_size: INTER,
         vocab_size: VOCAB,
@@ -536,8 +586,17 @@ pub const Q4K_TEST_NUM_LAYERS: usize = 2;
 /// Build a synthetic `ModelWeights` sized to satisfy Q4_K's 256-element
 /// super-block constraint. Uses Gemma 3 architecture so the
 /// `has_post_norms` + `GeluTanh` branches in the cached decode path
-/// are exercised.
+/// are exercised. `Q4K_TEST_NUM_LAYERS` layers.
 pub fn make_test_q4k_weights() -> ModelWeights {
+    make_test_q4k_weights_layers(Q4K_TEST_NUM_LAYERS)
+}
+
+/// Layer-parametrised sibling of [`make_test_q4k_weights`]. Identical
+/// arch / dims, but with `num_layers` decoder layers — for tests that
+/// need a depth-fraction layer index to land inside the model (e.g. the
+/// LQL FR3 relation resolver, whose probe layer clamps to ≥3, so it needs
+/// a model deeper than the default 2-layer fixture).
+pub fn make_test_q4k_weights_layers(num_layers: usize) -> ModelWeights {
     let num_q = 4usize;
     let num_kv = 2usize;
     let head_dim = Q4K_TEST_HIDDEN / num_q;
@@ -545,7 +604,7 @@ pub fn make_test_q4k_weights() -> ModelWeights {
     let arch_json = serde_json::json!({
         "model_type": "gemma3_text",
         "hidden_size": Q4K_TEST_HIDDEN,
-        "num_hidden_layers": Q4K_TEST_NUM_LAYERS,
+        "num_hidden_layers": num_layers,
         "intermediate_size": Q4K_TEST_INTER,
         "head_dim": head_dim,
         "num_attention_heads": num_q,
@@ -579,7 +638,7 @@ pub fn make_test_q4k_weights() -> ModelWeights {
     let q_dim = num_q * head_dim;
     let kv_dim = num_kv * head_dim;
 
-    for layer in 0..Q4K_TEST_NUM_LAYERS {
+    for layer in 0..num_layers {
         tensors.insert(
             arch.attn_q_key(layer),
             rand_mat_seeded(q_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
@@ -633,7 +692,7 @@ pub fn make_test_q4k_weights() -> ModelWeights {
         lm_head,
         position_embed: None,
         arch,
-        num_layers: Q4K_TEST_NUM_LAYERS,
+        num_layers,
         hidden_size: Q4K_TEST_HIDDEN,
         intermediate_size: Q4K_TEST_INTER,
         vocab_size: Q4K_TEST_VOCAB,

@@ -1,5 +1,11 @@
 # Roadmap — larql-lql
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — four `embed.row()` sites bypass the crate's own safe helper** (`walk:38`, `explain:31`, `insert/plan:122`, `compact:242`); they skip `average_embed_rows`, so an OOV/unbounded token id panics. Route through `average_embed_rows` / a bounds-checked helper.
+
 ## Current state
 
 INSERT/SELECT/USE/COMPILE/TRACE grammar fully parsed. INSERT

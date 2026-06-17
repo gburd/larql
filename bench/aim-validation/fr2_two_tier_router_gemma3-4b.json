@@ -1,0 +1,1 @@
+{"experiment":"FR2","vindex":"output/gemma3-4b-q4k-v2.vindex","store_n":115,"symbolic_alias_hits":0,"layers":[{"layer":24,"alias_top1":10,"alias_top5":10,"n_alias":10,"gate_fires":10,"gate_wrong":0},{"layer":26,"alias_top1":10,"alias_top5":10,"n_alias":10,"gate_fires":10,"gate_wrong":0}]}

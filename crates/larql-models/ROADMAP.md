@@ -1,5 +1,12 @@
 # Roadmap — larql-models
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)): exceptionally hardened — **no reachable panics found**. Two cosmetic notes only:
+
+- Unverified TQ1_0 codec path (correctness note, not a reachable defect today).
+- Size-truncation note in loading. Plus the positional QKVO `attn_data[1]/[2]` convention shared with larql-kv (typed-contract candidate).
+
 ## Current: 12 architectures, 309 tests, safetensors + GGUF loading, config-driven `rope_scaling` / `norm_eps` / GPT-2 legacy aliases, multi-modal trait surface + vision tower + projector weights/loaders
 
 ### Multi-modal Phase 1 (landed 2026-05-24, PR #143)

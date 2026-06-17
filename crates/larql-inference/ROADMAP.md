@@ -1,5 +1,19 @@
 # Roadmap — larql-inference
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md), workspace [`ROADMAP.md`](../../../ROADMAP.md) §"Codebase hardening"):
+
+- **P0 — make `FfnBackend::forward` fallible.** The trait method returns an infallible `Array2<f32>`, forcing process-abort on served paths. Three `panic!` sites to convert to `?`-propagation into the existing `GenerateError` channel (sibling `interventions.rs:55` already does this):
+  - ✅ `src/ffn/remote/http.rs:519` — `RemoteWalkBackend::forward` `.unwrap_or_else(|e| panic!())` aborts serving on any remote-shard network blip mid-generation. *(Confirmed by hand; the `from_shape_vec().expect()` at :521 is safe — leave it.)*
+  - `src/vindex/kquant_forward/cached.rs:123,200` and `hidden.rs:38` — Q4K CPU dequant `panic!` on truncated / layer-mismatched / f32-only vindex routed to CPU.
+- Highest-leverage fix in the workspace: the trait signature change also unblocks the `larql-compute` MoE panic sites.
+
+## CPU remote-MoE decode — shipped + follow-up (2026-05-28)
+
+- **✅ Shipped (closes #146):** `larql run --moe-shards … ` without `--metal` previously failed with `decode_token_with_moe returned None during prefill` — the CPU backend's `DecodeBackend::decode_token_with_moe` is a GPU-only trait default returning `None`, and the CLI always called the GPU path. Fix: route the CPU branch through the existing `generate_kquant_cpu_remote` (`predict_kquant_hidden(Some(remote))` → `run_moe_layer_cpu` → `forward_moe_seq`), exported at the crate root and wired backend-aware in `run_cmd.rs`. Also added a clean attention-presence guard in `grid/setup.rs` (a bare vindex now errors instead of panicking in `build_pipeline_layers`). Verified end-to-end on the real Gemma-4-26B-A4B vindex (output "Paris", 240 experts/token dispatched). **Caveat: full-recompute per token, no KV cache → 0.1–0.4 tok/s on 26B.**
+- **✅ Follow-up (C1) shipped (2026-05-28):** KV-cached MoE decode now works and is the default. `RemoteMoeFfn` (`{ weights, remote }`, `forward_moe_full_layer` = `moe_ffn_block_cpu`) rides the MoE-aware `kv_*_via_dispatch` path; fixed a prefill-RoPE bug in `attention/gpu.rs::run_attention_with_kv_backend` (was using unscaled `apply_rope_partial` → wrong on Gemma 4 global layers; now `apply_rope_partial_at_full` with the effective base/divisor/llama3, matching the decode-step + full-recompute paths). **Byte-identical to full-recompute, ~10× faster** on Gemma-4-26B-A4B. Full-recompute kept as `LARQL_MOE_FULL_RECOMPUTE=1` escape hatch + PLE fallback. Details: [larql-kv ROADMAP](../../larql-kv/ROADMAP.md) §"MoE-aware KV engines (C1)".
+
 ## Current: 83.2 tok/s (Metal Q4K, Gemma 3 4B, real vindex, 2026-05-04) | 18.9 tok/s (Gemma 4 26B-A4B MoE, CPU experts) | 6.5 tok/s (Gemma 4 31B remote-FFN batch, Metal GPU server) | Ollama: ~96–104 tok/s | 4 KV engines | 1113 lib tests
 
 ### Multi-modal engine seam (landed 2026-05-24, ADR-0023)

@@ -8,9 +8,19 @@ const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 
 /// Query a local Ollama server for a one-shot generate at `n` tokens.
 /// Reports tok/s based on Ollama's own `eval_duration` / `eval_count`
-/// (GPU wall time on its end, excludes HTTP overhead).
-pub(super) fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
-    run_ollama_with(model, prompt, num_predict, curl_fetch)
+/// (wall time on its end, excludes HTTP overhead).
+///
+/// `cpu_threads`: `Some(n)` forces Ollama onto CPU (`options.num_gpu=0`,
+/// `options.num_thread=n`) so it is a true CPU baseline matching
+/// `larql bench --cpu`. `None` lets Ollama use its default (Metal GPU on
+/// Apple silicon) — which is NOT a CPU comparison.
+pub(super) fn run_ollama(
+    model: &str,
+    prompt: &str,
+    num_predict: usize,
+    cpu_threads: Option<usize>,
+) -> BenchRow {
+    run_ollama_with(model, prompt, num_predict, cpu_threads, curl_fetch)
 }
 
 /// Test-friendly variant of `run_ollama` that takes an injectable fetcher.
@@ -21,16 +31,20 @@ pub(super) fn run_ollama_with<F>(
     model: &str,
     prompt: &str,
     num_predict: usize,
+    cpu_threads: Option<usize>,
     fetch: F,
 ) -> BenchRow
 where
     F: Fn(&str) -> Option<String>,
 {
     // Warmup call — discarded. Lets Ollama hot-load the model without that
-    // first-token latency leaking into the measurement.
-    let _ = fetch(&build_ollama_body(model, "Hi", 5));
+    // first-token latency leaking into the measurement. In CPU mode this
+    // also pays the GPU→CPU mode-switch reload here rather than in the
+    // timed call (an unwarmed num_gpu=0 call mis-measures badly — observed
+    // ~22 tok/s cold vs ~43 tok/s warm on Gemma 3 4B).
+    let _ = fetch(&build_ollama_body(model, "Hi", 5, cpu_threads));
 
-    let body = build_ollama_body(model, prompt, num_predict);
+    let body = build_ollama_body(model, prompt, num_predict, cpu_threads);
     match fetch(&body) {
         Some(text) => parse_ollama_response(model, &text),
         None => unreachable_row(model),
@@ -51,9 +65,22 @@ fn curl_fetch(body: &str) -> Option<String> {
 /// Build the `curl -d` JSON body. Pure; safe to test without a running
 /// Ollama server. Escapes `"` in the prompt so embedded quotes don't break
 /// the inline JSON.
-pub(super) fn build_ollama_body(model: &str, prompt: &str, num_predict: usize) -> String {
+///
+/// `cpu_threads`: `Some(n)` appends `"num_gpu":0,"num_thread":n` to force a
+/// CPU-only run (true llama.cpp-on-CPU baseline); `None` omits them so
+/// Ollama uses its default backend (Metal GPU on Apple silicon).
+pub(super) fn build_ollama_body(
+    model: &str,
+    prompt: &str,
+    num_predict: usize,
+    cpu_threads: Option<usize>,
+) -> String {
+    let cpu_opts = match cpu_threads {
+        Some(n) => format!(r#","num_gpu":0,"num_thread":{n}"#),
+        None => String::new(),
+    };
     format!(
-        r#"{{"model":"{model}","prompt":"{}","stream":false,"options":{{"num_predict":{num_predict}}}}}"#,
+        r#"{{"model":"{model}","prompt":"{}","stream":false,"options":{{"num_predict":{num_predict}{cpu_opts}}}}}"#,
         prompt.replace('"', "\\\""),
     )
 }
@@ -111,7 +138,7 @@ mod tests {
 
     #[test]
     fn build_body_escapes_embedded_quotes() {
-        let body = build_ollama_body("gemma3:4b", r#"say "hi""#, 10);
+        let body = build_ollama_body("gemma3:4b", r#"say "hi""#, 10, None);
         assert!(body.contains(r#"\"hi\""#), "body: {body}");
         assert!(body.contains(r#""model":"gemma3:4b""#));
         assert!(body.contains(r#""num_predict":10"#));
@@ -119,8 +146,29 @@ mod tests {
 
     #[test]
     fn build_body_preserves_unicode_prompts() {
-        let body = build_ollama_body("m", "Привіт", 1);
+        let body = build_ollama_body("m", "Привіт", 1, None);
         assert!(body.contains("Привіт"));
+    }
+
+    #[test]
+    fn build_body_gpu_default_omits_cpu_opts() {
+        let body = build_ollama_body("m", "hi", 8, None);
+        assert!(
+            !body.contains("num_gpu"),
+            "GPU default must not pin num_gpu: {body}"
+        );
+        assert!(!body.contains("num_thread"), "body: {body}");
+    }
+
+    #[test]
+    fn build_body_cpu_mode_pins_num_gpu_zero_and_threads() {
+        let body = build_ollama_body("m", "hi", 8, Some(8));
+        assert!(
+            body.contains(r#""num_gpu":0"#),
+            "CPU mode must pin num_gpu=0: {body}"
+        );
+        assert!(body.contains(r#""num_thread":8"#), "body: {body}");
+        assert!(body.contains(r#""num_predict":8"#), "body: {body}");
     }
 
     #[test]
@@ -184,7 +232,7 @@ mod tests {
                 )
             }
         };
-        let row = run_ollama_with("m", "p", 25, fetch);
+        let row = run_ollama_with("m", "p", 25, None, fetch);
         assert_eq!(row.n_steps, 25);
         assert!((row.tok_per_s - 10.0).abs() < 1e-6);
         let calls = calls.into_inner();
@@ -194,9 +242,28 @@ mod tests {
     }
 
     #[test]
+    fn run_ollama_with_cpu_mode_pins_num_gpu_zero_on_both_calls() {
+        let calls = RefCell::new(Vec::new());
+        let fetch = |body: &str| -> Option<String> {
+            calls.borrow_mut().push(body.to_string());
+            Some(r#"{"eval_count":25,"eval_duration":2500000000,"prompt_eval_duration":0}"#.into())
+        };
+        let _ = run_ollama_with("m", "p", 25, Some(8), fetch);
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 2, "warmup + real call");
+        for c in &calls {
+            assert!(
+                c.contains(r#""num_gpu":0"#),
+                "cpu mode must pin num_gpu on every call: {c}"
+            );
+            assert!(c.contains(r#""num_thread":8"#), "body: {c}");
+        }
+    }
+
+    #[test]
     fn run_ollama_with_fetcher_returns_unreachable_when_fetch_fails() {
         let fetch = |_: &str| -> Option<String> { None };
-        let row = run_ollama_with("m", "p", 25, fetch);
+        let row = run_ollama_with("m", "p", 25, None, fetch);
         assert_eq!(row.tok_per_s, 0.0);
         assert!(row.note.contains("not reachable"));
     }
@@ -211,7 +278,7 @@ mod tests {
                 Some("not json".into())
             }
         };
-        let row = run_ollama_with("m", "p", 10, fetch);
+        let row = run_ollama_with("m", "p", 10, None, fetch);
         assert_eq!(row.tok_per_s, 0.0);
         assert!(row.note.contains("not reachable"));
     }

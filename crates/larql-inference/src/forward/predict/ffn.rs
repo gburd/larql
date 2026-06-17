@@ -51,6 +51,69 @@ pub fn predict_with_ffn(
     logits_to_predictions(weights, &h, tokenizer, top_k, 1.0)
 }
 
+/// Like [`predict_with_ffn`], but after the layer `stop_layer` completes it
+/// calls `on_stop`; if that returns `Some(predictions)`, the forward
+/// **short-circuits there** — skipping layers `stop_layer+1..` and the lm_head —
+/// and returns `(predictions, true)`. Otherwise the full forward + lm_head runs
+/// and returns `(model_predictions, false)`.
+///
+/// This is the early-exit primitive for retrieval-augmented inference: a
+/// decoder is feed-forward, so layers `≤ stop_layer` (and therefore the
+/// residuals `on_stop` inspects via the FFN trace) are computed **identically**
+/// whether or not the tail runs — the early-exit token is byte-identical to the
+/// full forward's (proven in `examples/fr_early_exit_parity.rs`).
+pub fn predict_with_ffn_early_exit(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+    ffn: &dyn FfnBackend,
+    stop_layer: usize,
+    on_stop: &mut dyn FnMut() -> Option<Vec<(String, f64)>>,
+) -> (Vec<(String, f64)>, bool) {
+    let num_layers = weights.num_layers;
+    let mut h = embed_tokens(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
+
+    for layer in 0..num_layers {
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| kv_cache.get(&src));
+
+        match run_layer_with_ffn(
+            weights,
+            &h,
+            layer,
+            ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
+        ) {
+            Some((h_new, _, kv_out)) => {
+                h = h_new;
+                if let Some(kv) = kv_out {
+                    kv_cache.insert(layer, kv);
+                }
+            }
+            None => continue,
+        }
+
+        if layer == stop_layer {
+            if let Some(predictions) = on_stop() {
+                return (predictions, true);
+            }
+        }
+    }
+
+    (
+        logits_to_predictions(weights, &h, tokenizer, top_k, 1.0).predictions,
+        false,
+    )
+}
+
 /// Run a full forward pass with a custom FFN backend, capturing attention weights
 /// and per-layer residuals for logit lens.
 pub fn predict_with_ffn_attention(

@@ -42,6 +42,16 @@ pub trait QuantizedFfnAccess: Send + Sync {
         false
     }
 
+    /// Per-layer slice of the feature-major down sidecar
+    /// (`down_features_kquant.bin`) plus its format tag and padded row
+    /// width (elements). Feature `feat` lives at
+    /// `feat * bytes_per_row(padded_width)`. `None` when the sidecar isn't
+    /// loaded. Lets gather-contiguous kernels fetch a feature's down row
+    /// directly (the interleaved down is transposed and not gatherable).
+    fn down_features_q4k_layer_data(&self, _layer: usize) -> Option<(&[u8], &str, usize)> {
+        None
+    }
+
     /// W2: feature-major down decode. Returns `true` on success and
     /// writes `out += alpha * down[layer][feat]`. Returns `false` when
     /// the file isn't loaded; caller falls back to the cache path.

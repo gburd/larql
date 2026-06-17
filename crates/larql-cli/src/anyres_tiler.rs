@@ -19,7 +19,6 @@ pub struct AnyResTileSpec {
 pub struct TiledImage {
     pub base_tile: Vec<u8>,
     pub detail_tiles: Vec<Vec<u8>>,
-    pub total_tiles: usize,
 }
 
 impl AnyResTileSpec {
@@ -83,11 +82,9 @@ impl AnyResTileSpec {
             }
         }
 
-        let total = 1 + detail_tiles.len();
         TiledImage {
             base_tile,
             detail_tiles,
-            total_tiles: total,
         }
     }
 }
@@ -148,7 +145,6 @@ mod tests {
         let tiled = s.tile(&rgb, 8, 4);
         assert_eq!(tiled.base_tile.len(), 4 * 4 * 3);
         assert!(!tiled.detail_tiles.is_empty());
-        assert_eq!(tiled.total_tiles, 1 + tiled.detail_tiles.len());
     }
 
     #[test]
@@ -183,8 +179,7 @@ mod tests {
         };
         let rgb = vec![128u8; 8 * 8 * 3];
         let tiled = s.tile(&rgb, 8, 8);
-        assert_eq!(tiled.total_tiles, 2);
-        assert_eq!(tiled.detail_tiles.len(), 1);
+        assert_eq!(tiled.detail_tiles.len(), 1); // 1 base + 1 detail = 2 tiles
     }
 
     #[test]
@@ -193,6 +188,5 @@ mod tests {
         let rgb = vec![128u8; 4 * 4 * 3];
         let tiled = s.tile(&rgb, 4, 4);
         assert!(!tiled.base_tile.is_empty());
-        assert!(tiled.total_tiles >= 1);
     }
 }

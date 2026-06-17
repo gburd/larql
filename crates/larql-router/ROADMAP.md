@@ -1,5 +1,12 @@
 # Roadmap — larql-router / larql-router-protocol
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — validate announced layer ranges.** The announce path builds an unbounded route table (`src/routing.rs:237`) from gRPC-announced ranges with no validation; clamp the span to sane model depth before `rebuild_route_table`. DoS class.
+- **larql-router-protocol** — a `None` fingerprint disables TLS verification on a public API; document the contract or gate it behind explicit opt-in.
+
 ---
 
 ## Current state (2026-05-16)
@@ -956,9 +963,11 @@ to serve. Tracked here so they're visible alongside router work.
   across layers and architectures is the next step. Router's interest
   is in the resulting vindex shape — FFN rows become sparse-
   addressable, which changes shard-size economics.
-- **Exp 26 — FP4 generality (V2).** `gemma3-4b-f16.vindex` is **99.83%
-  per-feature block R<16-compliant natively, no QAT**; `down` is the
-  long tail at 99.65% (`ROADMAP_STATUS` item #3). Extending the audit
-  script across architectures is the next step. Router impact: FP4
-  shards quarter the wire-bytes-per-tok metric tracked by the bench
+- **Exp 26 — FP4 generality (V2). DONE 2026-05-31 — CONFIRMED.**
+  `gemma3-4b-fresh` (the live f16 anchor; `gemma3-4b-f16` is a dangling
+  symlink) is **99.83% per-feature R<16 natively, no QAT**, `down` the tail
+  — and the cross-arch extension landed: Granite 4.1 3B/8B match (≥99.8%),
+  and the predictive check (real E2M1 codec) is +0.116 bits/tok vs f32,
+  beating Q4-int. See `docs/diagnoses/v2-fp4-generality.md`. Router impact:
+  FP4 shards quarter the wire-bytes-per-tok metric tracked by the bench
   harness.

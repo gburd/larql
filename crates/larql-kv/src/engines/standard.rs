@@ -382,6 +382,36 @@ impl KvEngine for StandardEngine {
         self.do_decode_step(weights, ffn, token_id, Some(index))
     }
 
+    /// Resident-weights variants (task #16): the caller has already made the
+    /// client weights f32-resident, so these take `&weights` (no `&mut` for
+    /// `ensure_attn_tensors_dequantised`) and just thread `index` to the
+    /// per-layer dispatch. That lets the FFN backend borrow the same `&weights`
+    /// concurrently (no borrow conflict) while a Q4K-direct attention kernel
+    /// reads packed bytes from `index`. CPU uses per-layer handles (the coarse
+    /// path is Metal-only), so these route straight to `do_*`.
+    fn prefill_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        self.do_prefill(weights, ffn, token_ids, Some(index))
+    }
+
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.do_decode_step(weights, ffn, token_id, Some(index))
+    }
+
     fn memory_bytes(&self) -> usize {
         self.cache_memory_bytes()
     }
@@ -940,5 +970,175 @@ mod tests {
         assert!(engine
             .decode_step_quant(&mut weights, &ffn, &index, 0, &*backend)
             .is_err());
+    }
+
+    // ── Empty-prompt guards ────────────────────────────────────────────────
+    //
+    // `prefill` and `prefill_quant` reject an empty token slice with
+    // `EngineError::EmptyPrompt` *before* touching the backend. Pinning
+    // both arms keeps the early-return invariant covered (the dispatch
+    // helpers would otherwise return None and the caller could not tell
+    // "empty input" from "backend failed").
+
+    #[test]
+    fn prefill_empty_prompt_returns_empty_prompt_error() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let mut engine = StandardEngine::new(None);
+        let err = engine.prefill(&weights, &ffn, &[]).unwrap_err();
+        assert!(
+            matches!(err, EngineError::EmptyPrompt),
+            "empty prompt must map to EngineError::EmptyPrompt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prefill_quant_empty_prompt_returns_empty_prompt_error() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        let err = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[], &*backend)
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::EmptyPrompt),
+            "empty prompt must map to EngineError::EmptyPrompt, got {err:?}"
+        );
+    }
+
+    // ── Resident-weights quant path (task #16) ─────────────────────────────
+    //
+    // `prefill_resident` / `decode_step_resident` are the
+    // `--moe-shards`/`LARQL_Q4K_DIRECT_ATTN` entry points: they take
+    // `&ModelWeights` (immutable — the caller has already made the client
+    // weights f32-resident) and thread `index` to the per-layer dispatch.
+    // With `LARQL_Q4K_DIRECT_ATTN` unset (the default in tests) the CPU
+    // backend ignores the index and reads f32 from `weights.tensors`, so
+    // driving these with f32 test weights + a Q4K vindex exercises the
+    // resident code path (`do_prefill` / `do_decode_step` with
+    // `Some(index)`) without needing the Metal-only direct kernel.
+
+    #[test]
+    fn prefill_resident_populates_cache_and_returns_hidden() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        let h = engine
+            .prefill_resident(&weights, &ffn, &index, &[0u32, 1, 2])
+            .expect("prefill_resident");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(h.iter().all(|v| v.is_finite()));
+        assert!(engine.memory_bytes() > 0, "cache should be populated");
+    }
+
+    #[test]
+    fn prefill_resident_empty_prompt_returns_empty_prompt_error() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        let err = engine
+            .prefill_resident(&weights, &ffn, &index, &[])
+            .unwrap_err();
+        assert!(matches!(err, EngineError::EmptyPrompt));
+    }
+
+    #[test]
+    fn decode_step_resident_extends_cache() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        engine
+            .prefill_resident(&weights, &ffn, &index, &[0u32, 1])
+            .expect("prefill_resident");
+        let mem_before = engine.memory_bytes();
+        let h = engine
+            .decode_step_resident(&weights, &ffn, &index, 2)
+            .expect("decode_step_resident");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(h.iter().all(|v| v.is_finite()));
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "K/V cache should grow after a resident decode step"
+        );
+    }
+
+    #[test]
+    fn decode_step_resident_without_prefill_returns_error() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        // No prefill → handles is None → InvariantViolation at the guard.
+        assert!(engine
+            .decode_step_resident(&weights, &ffn, &index, 0)
+            .is_err());
+    }
+
+    // ── Quant paths through the async backend slot ─────────────────────────
+    //
+    // `prefill_quant` / `decode_step_quant` both branch on the
+    // `BackendSlot` to call `coarse_prefill` / `coarse_decode_step`.
+    // The sync-slot arms are covered by the Q4K fixture tests above; these
+    // drive the *async* slot arms. `CpuBackend`'s coarse path returns None
+    // either way, so the engine still falls through to the per-layer
+    // dequant fallback — but the async match arm (and its `coarse_*` call)
+    // is now executed.
+
+    #[test]
+    fn prefill_quant_async_slot_falls_back_via_dequant() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        use larql_inference::AsyncComputeBackend;
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let async_backend: Box<dyn AsyncComputeBackend> = Box::new(CpuBackend);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::with_async_backend(None, async_backend);
+        let h = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill_quant async-slot fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_quant_async_slot_falls_back_via_dequant() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        use larql_inference::AsyncComputeBackend;
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let async_backend: Box<dyn AsyncComputeBackend> = Box::new(CpuBackend);
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::with_async_backend(None, async_backend);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill_quant async-slot");
+        let mem_before = engine.memory_bytes();
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode_step_quant async-slot fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "K/V cache should grow after async-slot Q4K decode step"
+        );
     }
 }

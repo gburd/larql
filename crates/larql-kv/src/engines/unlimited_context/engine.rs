@@ -125,13 +125,18 @@ impl UnlimitedContextEngine {
     }
 
     /// Feed tokens into the engine. Windows auto-close when they fill.
-    pub fn process(&mut self, weights: &ModelWeights, tokens: &[u32]) -> Option<()> {
+    pub fn process(
+        &mut self,
+        weights: &ModelWeights,
+        tokens: &[u32],
+        moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    ) -> Option<()> {
         let mut remaining = tokens;
         while !remaining.is_empty() {
             let free = self.window_size - self.current_window_tokens.len();
             let take = remaining.len().min(free);
             let (chunk, rest) = remaining.split_at(take);
-            self.extend_current(weights, chunk)?;
+            self.extend_current(weights, chunk, moe_ffn)?;
             remaining = rest;
             if self.current_window_tokens.len() >= self.window_size {
                 self.close_window();
@@ -163,12 +168,16 @@ impl UnlimitedContextEngine {
             empty_prior(weights)
         };
 
+        // Archived-window replay does not yet re-dispatch remote MoE experts
+        // (it fires only on window eviction / long context). `None` → dense
+        // FFN; see the larql-kv "MoE-aware KV engines (C1)" roadmap follow-up.
         let out = rs_extend_from_checkpoint_backend(
             weights,
             tokens,
             prior,
             abs_offset,
             self.backend.as_ref(),
+            None,
         )?;
         let abs_end = abs_offset + tokens.len() - 1;
         Some((out.kv_cache, abs_end))
@@ -292,7 +301,12 @@ impl UnlimitedContextEngine {
         })
     }
 
-    fn extend_current(&mut self, weights: &ModelWeights, chunk: &[u32]) -> Option<()> {
+    fn extend_current(
+        &mut self,
+        weights: &ModelWeights,
+        chunk: &[u32],
+        moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    ) -> Option<()> {
         if chunk.is_empty() {
             return Some(());
         }
@@ -317,6 +331,7 @@ impl UnlimitedContextEngine {
             prior,
             abs_start,
             self.backend.as_ref(),
+            moe_ffn,
         )?;
 
         self.last_hidden = Some(out.last_hidden);
@@ -432,13 +447,13 @@ impl KvEngine for UnlimitedContextEngine {
     fn prefill(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_ids: &[u32],
     ) -> Result<Array2<f32>, EngineError> {
         if token_ids.is_empty() {
             return Err(EngineError::EmptyPrompt);
         }
-        self.process(weights, token_ids)
+        self.process(weights, token_ids, Some(ffn))
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process returned None during prefill".into(),
             })?;
@@ -452,10 +467,10 @@ impl KvEngine for UnlimitedContextEngine {
     fn decode_step(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        self.process(weights, &[token_id])
+        self.process(weights, &[token_id], Some(ffn))
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process returned None during decode_step".into(),
             })?;
@@ -782,7 +797,9 @@ mod tests {
 
         // Feed exactly window_size tokens → triggers close
         for tok in 0..window_size as u32 {
-            engine.process(&weights, &[tok]).expect("process failed");
+            engine
+                .process(&weights, &[tok], None)
+                .expect("process failed");
         }
         assert_eq!(engine.archive.len(), 1, "one window should be archived");
         assert_eq!(
@@ -805,7 +822,7 @@ mod tests {
 
         // 4 tokens = 2 complete windows
         for tok in 0u32..4 {
-            engine.process(&weights, &[tok]).expect("process");
+            engine.process(&weights, &[tok], None).expect("process");
         }
         assert_eq!(engine.archive.len(), 2);
         assert_eq!(engine.checkpoints.len(), 2);
@@ -818,7 +835,9 @@ mod tests {
         let mut engine = UnlimitedContextEngine::new(4);
 
         // 3 tokens < window_size=4 → no close
-        engine.process(&weights, &[0u32, 1, 2]).expect("process");
+        engine
+            .process(&weights, &[0u32, 1, 2], None)
+            .expect("process");
         assert_eq!(engine.archive.len(), 0, "no window closed yet");
         assert_eq!(engine.window_tokens(), 3);
     }
@@ -828,7 +847,7 @@ mod tests {
         use larql_inference::test_utils::make_test_weights;
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(4);
-        engine.process(&weights, &[0u32, 1]).expect("process");
+        engine.process(&weights, &[0u32, 1], None).expect("process");
         assert_eq!(engine.archive.len(), 0);
         engine.flush();
         assert_eq!(engine.archive.len(), 1, "flush should close partial window");
@@ -840,7 +859,7 @@ mod tests {
         let weights = make_test_weights();
         let mut engine = UnlimitedContextEngine::new(2);
         assert_eq!(engine.cold_bytes(), 0);
-        engine.process(&weights, &[0u32, 1]).expect("process"); // closes window
+        engine.process(&weights, &[0u32, 1], None).expect("process"); // closes window
         assert!(
             engine.cold_bytes() > 0,
             "cold tier should grow after window close"

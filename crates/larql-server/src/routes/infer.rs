@@ -245,6 +245,7 @@ fn run_infer(
             Some(&patched.knn_store),
             &token_ids,
             req.top,
+            &larql_inference::KnnRouteMode::from_env(),
         )
     };
 

@@ -1,39 +1,19 @@
 {
-  "policy_note": "Default policy is 90% line coverage per source file. Files listed below carry inherited debt baselines from 2026-05-17 — they MUST only ratchet upward toward 90%, never down. Run `make larql-lql-coverage-summary` to refresh; numbers are floored from the measured value to leave noise headroom.",
+  "policy_note": "Default policy is 90% line coverage per source file. Files listed below carry debt baselines that MUST only ratchet upward toward 90%, never down. Run `make larql-lql-coverage-summary` to refresh; numbers are floored from the measured value to leave noise headroom. Session 2 (2026-06-05/06): added ~230 targeted tests across tests/cov_{mutation,query,lifecycle,executor_core,parser_lexer}_synthetic.rs + cov_tier_a*.rs + cov_remote_mockito.rs + cov_patch_lifecycle_synthetic.rs; TOTAL 89.21% -> 93.91%; 20 files cleared 90% and were removed from this list. The 7 remaining debt files are all genuinely hard: they require a real HuggingFace model directory (a Backend::Weight session — extract.rs, lifecycle/compile/into_model.rs, lifecycle/use_cmd.rs USE MODEL success, query/infer.rs dense-inference arm, executor/backend.rs Weight arms, parts of introspection.rs) or are an interactive REPL (repl.rs). These are reachable only with a hand-built safetensors fixture in larql-inference test_utils (out of scope here) or via in-crate #[cfg(test)] unit tests that — confirmed this session — do not move the integration-link coverage summary.",
   "include_globs": [
     "crates/larql-lql/src/*.rs",
     "crates/larql-lql/src/**/*.rs"
   ],
   "exclude_globs": [],
   "default_line_min_percent": 90.0,
-  "total_line_min_percent": 88.0,
+  "total_line_min_percent": 93.0,
   "per_file_line_min_percent": {
     "crates/larql-lql/src/executor/lifecycle/extract.rs": 52.0,
-    "crates/larql-lql/src/executor/introspection.rs": 65.0,
-    "crates/larql-lql/src/executor/mod.rs": 67.0,
-    "crates/larql-lql/src/executor/query/describe/exec.rs": 71.0,
-    "crates/larql-lql/src/executor/lifecycle/use_cmd.rs": 72.0,
+    "crates/larql-lql/src/executor/introspection.rs": 68.0,
+    "crates/larql-lql/src/executor/lifecycle/use_cmd.rs": 73.0,
     "crates/larql-lql/src/executor/lifecycle/compile/into_model.rs": 77.0,
-    "crates/larql-lql/src/parser/helpers.rs": 78.0,
     "crates/larql-lql/src/repl.rs": 79.0,
-    "crates/larql-lql/src/executor/query/infer.rs": 79.0,
-    "crates/larql-lql/src/executor/backend.rs": 79.0,
-    "crates/larql-lql/src/executor/remote/query.rs": 80.0,
-    "crates/larql-lql/src/executor/compact.rs": 82.0,
-    "crates/larql-lql/src/executor/mutation/merge.rs": 83.0,
-    "crates/larql-lql/src/executor/trace.rs": 83.0,
-    "crates/larql-lql/src/executor/mutation/insert/plan.rs": 83.0,
-    "crates/larql-lql/src/executor/query/select/entities.rs": 83.0,
-    "crates/larql-lql/src/lexer.rs": 84.0,
-    "crates/larql-lql/src/executor/query/explain.rs": 86.0,
-    "crates/larql-lql/src/executor/query/walk.rs": 85.0,
-    "crates/larql-lql/src/executor/mutation/insert/capture.rs": 85.0,
-    "crates/larql-lql/src/executor/mutation/update.rs": 85.0,
-    "crates/larql-lql/src/executor/mutation/rebalance.rs": 86.0,
-    "crates/larql-lql/src/executor/lifecycle/compile/into_vindex.rs": 87.0,
-    "crates/larql-lql/src/parser/lifecycle.rs": 88.0,
-    "crates/larql-lql/src/executor/mutation/insert/mod.rs": 89.0,
-    "crates/larql-lql/src/executor/mutation/insert/knn.rs": 89.0,
-    "crates/larql-lql/src/executor/mutation/insert/balance.rs": 89.0
+    "crates/larql-lql/src/executor/backend.rs": 80.0,
+    "crates/larql-lql/src/executor/query/infer.rs": 81.0
   }
 }

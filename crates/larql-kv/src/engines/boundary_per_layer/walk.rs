@@ -14,7 +14,7 @@ use larql_inference::attention::{
     run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
 };
 use larql_inference::ffn::FfnBackend;
-use larql_inference::forward::{embed_tokens_pub, run_ffn};
+use larql_inference::forward::embed_tokens_pub;
 use larql_inference::model::ModelWeights;
 use ndarray::{s, Array2};
 
@@ -45,7 +45,7 @@ pub(super) fn run_prefill(
         stored.push(h.clone());
         let (h_post_attn, _k, _v) =
             run_attention_with_kv_backend(weights, &h, layer, be).expect("attention failed");
-        let (h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let h_out = crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, ffn, Some(ffn));
         h = h_out;
     }
 
@@ -150,7 +150,7 @@ pub(super) fn run_decode(
             Some(backend),
         )?;
 
-        let (h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let h_out = crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, ffn, Some(ffn));
         h_new = h_out;
     }
 

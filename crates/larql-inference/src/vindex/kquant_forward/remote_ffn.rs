@@ -25,6 +25,53 @@ pub fn predict_kquant_with_ffn(
     crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
 }
 
+/// **Early-exit** Q4_K predict — the q4k twin of
+/// [`crate::forward::predict_with_ffn_early_exit`]. After layer `stop_layer`
+/// completes, calls `on_stop`; if it returns `Some(predictions)`, the forward
+/// short-circuits there — skipping the remaining per-layer dequant + compute
+/// and the lm_head — returning `(predictions, true)`. Otherwise the full
+/// forward + lm_head runs, returning `(model_predictions, false)`.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_kquant_with_ffn_early_exit(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+    index: &VectorIndex,
+    ffn_backend: &dyn crate::ffn::FfnBackend,
+    stop_layer: usize,
+    on_stop: &mut dyn FnMut() -> Option<Vec<(String, f64)>>,
+) -> (Vec<(String, f64)>, bool) {
+    let mut early_preds: Option<Vec<(String, f64)>> = None;
+    let (h, exited);
+    {
+        let mut stop_hook = || -> bool {
+            if let Some(p) = on_stop() {
+                early_preds = Some(p);
+                true
+            } else {
+                false
+            }
+        };
+        (h, exited) = predict_kquant_hidden_inner(
+            weights,
+            token_ids,
+            index,
+            ffn_backend,
+            Some((stop_layer, &mut stop_hook)),
+        );
+    }
+    if exited {
+        (early_preds.unwrap_or_default(), true)
+    } else {
+        (
+            crate::forward::predict::logits_to_predictions_pub(weights, &h, tokenizer, top_k, 1.0)
+                .predictions,
+            false,
+        )
+    }
+}
+
 /// End-to-end hidden-state forward on a Q4_K vindex with the FFN served by an
 /// external [`crate::ffn::FfnBackend`].
 pub fn predict_kquant_hidden_with_ffn(
@@ -33,6 +80,20 @@ pub fn predict_kquant_hidden_with_ffn(
     index: &VectorIndex,
     ffn_backend: &dyn crate::ffn::FfnBackend,
 ) -> ndarray::Array2<f32> {
+    predict_kquant_hidden_inner(weights, token_ids, index, ffn_backend, None).0
+}
+
+/// Core Q4_K hidden forward with an optional early-exit hook. `early =
+/// Some((stop_layer, on_stop))` checks `on_stop()` after `stop_layer` completes;
+/// `true` returns the current hidden + `exited = true`. `None` runs the full
+/// stack (the behaviour of [`predict_kquant_hidden_with_ffn`]).
+fn predict_kquant_hidden_inner(
+    weights: &mut ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    ffn_backend: &dyn crate::ffn::FfnBackend,
+    mut early: Option<(usize, &mut dyn FnMut() -> bool)>,
+) -> (ndarray::Array2<f32>, bool) {
     let num_layers = weights.num_layers;
     let hidden = weights.hidden_size;
 
@@ -106,9 +167,19 @@ pub fn predict_kquant_hidden_with_ffn(
         weights.tensors.remove(&k_key);
         weights.tensors.remove(&v_key);
         weights.tensors.remove(&o_key);
+
+        // Early-exit hook: after the resolved layer, let the caller short-circuit
+        // (the WalkFfn FFN trace already captured this layer's residual). MoE
+        // full-layer `continue` paths above skip this — they don't populate the
+        // residual trace, so the verified route would abstain there anyway.
+        if let Some((stop, on_stop)) = early.as_mut() {
+            if layer == *stop && on_stop() {
+                return (h, true);
+            }
+        }
     }
 
-    h
+    (h, false)
 }
 
 #[cfg(test)]

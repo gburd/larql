@@ -70,6 +70,13 @@ kernel void kv_attention(
     }
 
     float sg_sum = simd_sum(local_sum);
+    // tg_sg_vals is reused from the max-reduction above. Without this barrier
+    // a fast simdgroup can overwrite its slot with sg_sum while a slow
+    // simdgroup is still reading that slot for global_max — corrupting the max
+    // non-deterministically per dispatch. That drift is invisible to sampling
+    // but desyncs the Shannon arithmetic coder (see docs/replay/
+    // shannon-transformers-the-same.md). Fence the reuse.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) tg_sg_vals[sg_id] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float global_sum = tg_sg_vals[0];
@@ -150,6 +157,13 @@ kernel void kv_attention_long(
     }
 
     float sg_sum = simd_sum(local_sum);
+    // tg_sg_vals is reused from the max-reduction above. Without this barrier
+    // a fast simdgroup can overwrite its slot with sg_sum while a slow
+    // simdgroup is still reading that slot for global_max — corrupting the max
+    // non-deterministically per dispatch. That drift is invisible to sampling
+    // but desyncs the Shannon arithmetic coder (see docs/replay/
+    // shannon-transformers-the-same.md). Fence the reuse.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) tg_sg_vals[sg_id] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float global_sum = tg_sg_vals[0];

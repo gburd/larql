@@ -1,5 +1,12 @@
 # Roadmap — larql-kv
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P2 — CLI-supplied sizing params can reach prefill panics**; validate at the boundary.
+- **P2 — positional QKVO contract** (`attn_data[1]/[2]`, shared with larql-models) is maintained by convention, not type. Silent-drift risk — consider a typed accessor.
+
 ## Current state (as of 2026-05-18)
 
 **Performance equilibrium post W7 + W8 + W8.2 + Step 9** (Gemma 3 4B
@@ -187,6 +194,182 @@ between flaky parallel tests, `serial_test` ceremony, or a
 config-injection refactor.
 
 ## Open work
+
+### P1 — MoE-aware KV engines (C1) — new 2026-05-28
+
+The KvEngine layer is **dense-only today**: `do_prefill` / `do_decode_step`
+dispatch dense FFN via `ffn.forward(layer, x)` and are KV-cached, but no engine
+branches on MoE layers (grep for `forward_moe_full_layer` / `run_moe_layer_cpu`
+in `larql-kv` is empty). MoE decode — both `--ffn` whole-layer offload and
+`--moe-shards` client-side expert sharding — runs through the standalone
+full-recompute `predict_kquant_hidden*` path with **no KV cache**. CPU
+`--moe-shards` was measured at **0.1–0.4 tok/s** on Gemma-4-26B-A4B (the
+full-recompute fix that closed #146, 2026-05-28).
+
+Goal: make the engine layer MoE-aware so CPU MoE decode is KV-cached and
+**engine-selectable** (standard / unlimited_context / markov* / turbo_quant /
+apollo all apply their mechanism to MoE models, not just dense).
+
+Subtasks:
+1. **Engine per-layer MoE branch.** The shared per-layer forward must, on MoE
+   layers, compute `h1` (dense FFN) + `h2` (expert contribution via
+   `forward_moe_full_layer`) then apply the hybrid-MoE combine + outer-norm.
+   Today only `run_moe_layer_cpu` (larql-inference `vindex/kquant_forward/hidden.rs`)
+   does this — lift it so the engine forward can call it.
+2. **`RemoteMoeFfn` `FfnBackend` wrapper** (larql-inference). `RemoteMoeBackend`
+   is the one remote backend that is *not* an `FfnBackend`.
+   `FfnBackend::forward_moe_full_layer(layer, h_post_attn)` gets no weights, but
+   the moe-shards combine needs local dense FFN + router + norms — so wrap
+   `{ weights, remote }` and implement `forward_moe_full_layer` as the
+   `run_moe_layer_cpu` body (dense local + experts remote via `forward_moe_seq`
+   + combine). This makes `--moe-shards` ride any engine, unifying it with `--ffn`.
+3. **CLI routing.** Route CPU `--moe-shards` (and `--ffn` on MoE models) through
+   the selected `--engine` instead of the standalone full-recompute path.
+4. **Parity + perf.** Tolerance parity vs the full-recompute path and vs local
+   CPU MoE; perf gate (KV-cached should be ≫0.4 tok/s on 26B).
+
+Exit criterion: `larql run --moe-shards … --engine standard` (no `--metal`)
+decodes KV-cached at parity with the full-recompute path, and the same works
+across the other engines. Decision recorded 2026-05-28: keep the full-recompute
+fix as the #146 correctness baseline; this item replaces it for performance.
+
+**Status (2026-05-28) — DONE, default path, parity verified.**
+Subtasks 1–3 + CLI wiring shipped: `moe_ffn_block_cpu` factored out of
+`run_moe_layer_cpu` (parity-preserving), `kv_dispatch` helpers MoE-aware
+(`ffn_or_moe_layer`), `RemoteMoeFfn` in larql-inference, and the CLI routes CPU
+`--moe-shards` through a `StandardEngine` via `generate_with_engine`. KV-cached
+is now the **default**; `LARQL_MOE_FULL_RECOMPUTE=1` and PLE archs fall back.
+
+Two bugs found + fixed during verification:
+1. **Wrong driver** — the CLI first used `generate_cached`, which runs the
+   *legacy* `kv_prefill_run` path (no `forward_moe_full_layer` hook → experts
+   never dispatched). Switched to `generate_with_engine`, which routes through
+   the MoE-aware `kv_*_via_dispatch` path.
+2. **Prefill RoPE** — `run_attention_with_kv_backend` (engine prefill) used
+   `apply_rope_partial` (position_divisor=1.0, llama3=None, raw base), silently
+   dropping Gemma 4's scaled global-layer RoPE. The decode-step path
+   (`decode.rs`) and full-recompute (`block.rs` core) already used the
+   forward-override-effective base + divisor + llama3 via
+   `apply_rope_partial_at_full`; prefill was the lone holdout. Fixed to match.
+   (NB: `run_attention_block_gpu` has the same unscaled-RoPE call but is
+   test-only — no live callers — left as-is.)
+
+Verified live on Gemma-4-26B-A4B (two expert shards, no `--metal`): output is
+**byte-identical** to full-recompute (24-token continuation matched exactly) at
+**~10× the speed** (4.2–4.4 tok/s vs 0.4–0.5). All suites green.
+
+**Regression guard added** (2026-05-28): `run_attention_with_kv_backend_matches_full_recompute_on_gemma3`
+(larql-compute `attention/gpu.rs`) asserts engine prefill == full-recompute
+attention on a 6-layer rope-scaled Gemma 3 fixture
+(`make_gemma3_rope_scaled_test_weights`, layer 5 global / divisor 8). Validated:
+it FAILS at L5 if the prefill-RoPE fix is reverted.
+
+### Which engines support remote MoE? (audit 2026-05-28)
+
+| Engine | FFN routing (driver = immutable `prefill`) | Remote MoE | Verified (26B) |
+|---|---|:--:|---|
+| **standard** | per-layer via `ffn` trait (`kv_*_via_dispatch`) | ✅ | "Paris", **4.4 tok/s** |
+| **markov_residual_codec** | per-layer `compute.rs` `run_ffn` → `layer_ffn_or_moe` | ✅ | "Paris", **3.4 tok/s** |
+| **turbo_quant** | per-layer `engine.rs` `run_ffn` → `layer_ffn_or_moe` | ✅ | "Paris", **3.4 tok/s** |
+| **markov_residual** | per-layer `compute.rs` `run_ffn` → `layer_ffn_or_moe` | ✅ | "Paris", **3.1 tok/s** |
+| **boundary_per_layer** | per-layer `walk::run_prefill`/`run_decode` (larql-kv) → `layer_ffn_or_moe` | ✅ | "Paris", **3.1 tok/s** |
+| **boundary_kv** | wraps `StandardEngine` + compressed-residual boundary frames | ✅ | "Paris", **2.9 tok/s** |
+| **unlimited_context** | per-layer `rs_extend_from_checkpoint_backend` → `layer_ffn_or_moe` | ✅ | "Paris", **1.7 tok/s** |
+| no_cache | legacy `kv_prefill_run` full re-forward | ✗ (by design) | full re-forward per step; not sensible for remote experts |
+| apollo | local re-forward (`forward_from_layer`) | ✗ (by design) | crystal re-forward *multiplies* per-step expert round-trips |
+
+**How it works (2026-05-28).** `generate_with_engine` drives the engine's
+*immutable* `KvEngine::prefill`/`decode_step`. For `standard`/`boundary_kv` that's
+the `kv_*_via_dispatch` path; for the per-layer/windowed engines it's their own
+larql-kv forward loop (`rs_extend_from_checkpoint_backend`, `compute.rs`,
+`turbo_quant/engine.rs`, …), which *can* call larql-inference. The shared helper
+**`engines::layer_ffn_or_moe`** does the per-layer choice: on hybrid-MoE with a
+`moe_ffn` hook, call `forward_moe_full_layer` (experts → shards); else dense
+`run_ffn`. Threading `ffn` from `prefill`/`decode_step` → the forward loop lights up
+an engine with a ~10-line change. **All in larql-kv — no `EngineBackend` trait
+change, no Metal-path risk.** **7 of 9 engines now verified for remote MoE** — the
+only exclusions (`no_cache`, `apollo`) are excluded *by design*, not by limitation.
+(Note: `boundary_per_layer`'s immutable driver path uses `walk::run_prefill`, a
+larql-kv loop — *not* the fused coarse path — so the deeper coarse-path hook I'd
+flagged turned out unnecessary; only the disused `prefill_quant`/coarse path would
+need it.)
+
+**Perf reality — they all *work*; see the bottleneck diagnosis**
+([`docs/diagnoses/remote-moe-bottlenecks.md`](../../docs/diagnoses/remote-moe-bottlenecks.md),
+2026-05-29). ⚠️ The per-engine tok/s below were the CLI's old `total/n` banner
+(model-load + prefill + decode averaged over n) — **load-dominated for short runs,
+not true decode**. True steady-state decode for `standard` is **~6 tok/s** (the
+banner now reports TTFT vs decode separately). The path is **compute-bound, not
+network-bound** (localhost RTT 0.35 ms × 30 layers ≈ 12 ms vs ~165 ms/token);
+**model load ~6.8 s** dominates one-shot latency. The figures still rank the
+engines correctly but understate absolute decode and compress the spread:
+standard **4.4** > markov_codec/turbo **3.4** > markov /
+boundary_per_layer **3.1** > boundary_kv **2.9** > unlimited **1.7** tok/s. The
+spread is each engine's per-step CPU mechanism *on top of* the shared per-layer
+expert network round-trip; the round-trip compresses the spread (4.4→1.7, ~2.6×, vs
+the dense-4B 28→19 CPU spread). `standard` stays fastest; `unlimited` is the slowest
+(O(window²) prior-KV clone + per-token re-attention). So "they should all run fast"
+lands as **true — all seven within ~2.6× and network-bound** — `standard` the pick.
+
+**Best engine for remote MoE:** `standard` for throughput; `boundary_kv` for
+wire-efficient cold-context residual frames; `markov`/`turbo`/`boundary_per_layer`
+for compressed KV memory at near-standard speed; `unlimited_context` for
+long-context windowed KV (slowest, bounded memory). `no_cache` / `apollo` are not a
+fit (re-forward multiplies round-trips).
+
+**Known limitation:** `unlimited_context`'s archived-window *replay*
+(`replay_window`, fires only on window eviction / long context) passes `None` for
+`moe_ffn` → dense FFN. Correct within a single window (the verified case); a
+long-context MoE run that evicts windows would need replay threaded too. This is the
+only remaining MoE-correctness gap. CLI guard allows the seven verified engines and
+rejects `no-cache` / `apollo` with a clear message.
+
+### ⏭ NEXT — Q4K-direct client decode path (remove the f32 tax) — top engineering lever
+
+**Why now:** the bottleneck diagnosis
+([`docs/diagnoses/remote-moe-bottlenecks.md`](../../docs/diagnoses/remote-moe-bottlenecks.md),
+2026-05-29) measured the remote-MoE decode split on the 26B: **~60% is client-side
+f32 compute** (attention + lm_head + dense FFN, on the dequant-to-f32 BLAS path),
+~40% is server expert compute, network negligible. The engine path currently
+**dequantizes all attn + dense-FFN weights to f32 up front** (the ~6.8 s model-load
+tax) and runs attention/FFN/lm_head on f32 BLAS — *not* the NEON **Q4K-direct
+matvec** kernels that already exist (the ones that took Gemma-3-4B CPU
+0.36 → 28 tok/s).
+
+**Measured client split** (`LARQL_DECODE_STAGES=1`, 26B, prefill+12 decode):
+attention **28%** · dense FFN **13%** · lm_head **12%** (≈53% recoverable client
+f32) · remote experts 41% (server) · misc 5%. **Attention is the #1 target.**
+
+**Work (ranked by win):**
+1. **Attention (28%)** — Q4K-direct path reading attn bytes from the index via
+   `q4_attention_proj` (`attention/gpu.rs`, CPU-tested), replacing the f32
+   `run_attention_with_kv_backend`. Parity-critical rework of the attention path;
+   verify byte-parity on the 26B before flipping.
+2. **dense FFN (13%)** — ⚠️ `WalkFfn` tried + reverted (its dense mode runs the
+   sparse-walk machinery → 8.5× slower than f32 BLAS). The right kernel is
+   `kquant_ffn_forward_layer_q8k` (NEON, no dequant) via a thin `FfnBackend`
+   wrapper. Low ROI (f32 BLAS already competitive, only ~13%) — below attention.
+3. **lm_head (12%)** — Q4K vocab projection from the loaded lm_head Q4K bytes.
+
+Doing all three also lets the CLI **drop the up-front "dequantize all layers to
+f32"** step (`run_with_moe_shards`) — removing most of the ~6.8 s model-load tax
+(nothing left to dequantize). Per-stage timers already in place (`decode_stages`).
+
+**Expected:** ~4× decode (measured 7.9 → **~20-25 tok/s** on the 26B, i.e. up to the
+DDR5 bandwidth ceiling) **and** much faster startup (no dequant-all). Pure
+engineering — depends on no unproven research. **Highest-leverage move fully in our
+control.**
+
+**Exit:** remote-MoE `--engine standard` decode within ~10% of the single-box A4B-Q4
+bandwidth ceiling (~22 tok/s on the 26B), byte-identical to the f32 path; CLI no
+longer dequantizes all layers up front.
+
+**After this** (to go past the ~22 tok/s wall, both out of pure-engineering scope):
+distribute expert bandwidth across more grid shards; the compounding stack
+(hash-routing 5× **FALSIFIED V1 2026-05-31** — doesn't compound; FP4 2× **confirmed V2**); and
+multi-layer expert **prefetch** to hide the 30 sequential layer round-trips on real
+LAN/WAN (free on localhost, fatal at 10 ms RTT). 80 tok/s on the 26B needs all
+three; for 4B-class it's already near.
 
 ### P0 — engine performance (the post-bypass optimization frontier)
 

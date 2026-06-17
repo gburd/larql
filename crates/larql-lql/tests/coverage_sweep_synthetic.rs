@@ -244,6 +244,74 @@ fn infer_with_top_synthetic() {
     let _ = try_run(&mut session, r#"INFER "[1]" TOP 3;"#);
 }
 
+// ── INFER ROUTE clause (FR1/FR2 KnnStore router selection) ─────────────
+// These drive the `match route { Some(r) => … }` arm of `exec_infer`,
+// which builds a `KnnRouteMode` from the parsed clause (the no-clause
+// path → `from_env` is covered by the smoke tests above). The synthetic
+// KnnStore is empty, so no override fires — coverage is on the route
+// resolution + the rest of the infer pipeline, not on a routed result.
+
+#[test]
+fn infer_route_verify_synthetic() {
+    // ROUTE VERIFY (no fallback, no topk) → KnnRouteMode::Verified default k.
+    let (mut session, _dir, _) = fresh_session();
+    let _ = try_run(&mut session, r#"INFER "[1]" ROUTE VERIFY TOP 3;"#);
+}
+
+#[test]
+fn infer_route_verify_topk_synthetic() {
+    // ROUTE VERIFY TOPK n → Verified with an explicit candidate count.
+    let (mut session, _dir, _) = fresh_session();
+    let _ = try_run(&mut session, r#"INFER "[1]" ROUTE VERIFY TOPK 8 TOP 3;"#);
+}
+
+#[test]
+fn infer_route_verify_fallback_synthetic() {
+    // ROUTE VERIFY FALLBACK [TOPK n] → KnnRouteMode::TwoTier.
+    let (mut session, _dir, _) = fresh_session();
+    let _ = try_run(
+        &mut session,
+        r#"INFER "[1]" ROUTE VERIFY FALLBACK TOPK 6 TOP 3;"#,
+    );
+}
+
+#[test]
+fn infer_route_verify_exit_synthetic() {
+    // ROUTE VERIFY EXIT → drives the early-exit branch of exec_infer
+    // (`infer_patched_early_exit`). The synthetic KnnStore is empty so no
+    // verified hit fires → it transparently completes the full forward; we
+    // assert only that the path runs.
+    let (mut session, _dir, _) = fresh_session();
+    let _ = try_run(&mut session, r#"INFER "[1]" ROUTE VERIFY EXIT TOP 3;"#);
+}
+
+#[test]
+fn infer_route_verify_fallback_exit_ignores_early_exit_synthetic() {
+    // FALLBACK + EXIT: early-exit is verified-only, so the fallback path
+    // disables it and the full TwoTier forward runs. Must still parse + run.
+    let (mut session, _dir, _) = fresh_session();
+    let _ = try_run(
+        &mut session,
+        r#"INFER "[1]" ROUTE VERIFY FALLBACK EXIT TOP 3;"#,
+    );
+}
+
+#[test]
+fn infer_errors_when_tokenizer_file_missing() {
+    // `exec_infer` reloads `tokenizer.json` from disk on every call (the
+    // vindex backend path). Removing it after USE drives the
+    // `load_vindex_tokenizer` error closure — a clean failure rather than
+    // a panic.
+    let (mut session, dir, _) = fresh_session();
+    std::fs::remove_file(dir.path().join("tokenizer.json")).expect("remove tokenizer.json");
+    let err = try_run(&mut session, r#"INFER "[1]" TOP 3;"#)
+        .expect_err("INFER without a tokenizer file must error");
+    assert!(
+        err.contains("tokenizer"),
+        "error should mention the tokenizer: {err}"
+    );
+}
+
 // ── Diff / Compact ─────────────────────────────────────────────────────
 
 #[test]

@@ -30,9 +30,27 @@ use ndarray::Array2;
 
 use super::{KvDispatch, KvHandle, KvHandleInner, ResidualHandle, ResidualHandleInner};
 use crate::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
+    run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
+    run_attention_with_kv_backend, SharedKV,
 };
 use larql_models::ModelWeights;
+
+/// Opt-in: route the CPU decode-step attention projections through the
+/// Q4K-direct kernels (`quant_matvec` straight from the index) instead of the
+/// f32-BLAS path on pre-dequantised `weights.tensors`. Gated while parity +
+/// end-to-end are validated on the 26B (task #16); falls back to f32 per layer
+/// when the index lacks Q4K attn bytes or a format is unsupported.
+///
+/// ⚠️ SIBLING PATH: `cached_decode_step_q4k` / `CpuQ4kCacheHandle` (below, in
+/// `crate::kquant_forward`) is a SECOND independent CPU Q4K attention decode.
+/// Any RoPE / softcap / QK-V-norm / GQA change here must mirror there (and vice
+/// versa) or the two silently diverge. Consolidate before either is load-bearing
+/// — see `docs/diagnoses/q4k-direct-attention.md` §"CONSOLIDATION HAZARD".
+fn q4k_direct_attn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LARQL_Q4K_DIRECT_ATTN").as_deref() == Ok("1"))
+}
 
 // ─── CpuKvHandle ────────────────────────────────────────────────────────────
 
@@ -278,25 +296,41 @@ impl KvDispatch for CpuBackend {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
-        _index: Option<&dyn crate::KvIndex>,
+        index: Option<&dyn crate::KvIndex>,
     ) -> Option<Array2<f32>> {
-        // CpuBackend reads f32 attention tensors out of `weights.tensors`.
-        // When the caller has a Q4K `VectorIndex`, it's expected to have
-        // already populated `weights.tensors` via
-        // `crate::kquant_forward::ensure_attn_tensors_dequantised` before
-        // dispatching here. Until phase-3 CPU Q4K matvec kernels land,
-        // the `index` parameter is accepted for trait-shape compatibility
-        // but not consumed.
+        // Default (f32) path: CpuBackend reads f32 attention tensors out of
+        // `weights.tensors`, which the caller pre-populates via
+        // `ensure_attn_tensors_dequantised` (the up-front dequant-to-f32 tax).
+        //
+        // Opt-in Q4K-direct path (`LARQL_Q4K_DIRECT_ATTN=1`, task #16): when the
+        // caller has a Q4K `index`, run the projections straight from its packed
+        // bytes via `quant_matvec` (no dequant), falling back per layer to the
+        // f32 path if the index lacks Q4K attn bytes / a format is unsupported.
         let h = cpu_handle_mut(kv);
         let prior_kv = h.as_shared_kv().cloned();
-        let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-            weights,
-            query,
-            layer,
-            prior_kv.as_ref(),
-            abs_position,
-            Some(self),
-        )?;
+        let f32_path = |prior: Option<&SharedKV>| {
+            run_attention_block_decode_step_backend(
+                weights,
+                query,
+                layer,
+                prior,
+                abs_position,
+                Some(self),
+            )
+        };
+        let (h_post_attn, new_kv) = match index.filter(|_| q4k_direct_attn_enabled()) {
+            Some(idx) => run_attention_block_decode_step_q4k_direct(
+                weights,
+                query,
+                layer,
+                prior_kv.as_ref(),
+                abs_position,
+                self,
+                idx,
+            )
+            .or_else(|| f32_path(prior_kv.as_ref()))?,
+            None => f32_path(prior_kv.as_ref())?,
+        };
         h.replace_state(new_kv);
         Some(h_post_attn)
     }
@@ -680,6 +714,10 @@ mod tests {
                 self
             }
         }
+        // Exercise the stub's own trait methods so they aren't dead — the
+        // `shape` accessor is otherwise never called (the panic fires in
+        // `cpu_residual` before `forward_from_layer` reads the shape).
+        assert_eq!(ResidualHandleInner::shape(&OtherResidual), (1, 4));
         let h = ResidualHandle::new(OtherResidual);
         let _ = b.forward_from_layer(&weights, 0, &h, &[0u32]);
     }
@@ -753,5 +791,151 @@ mod tests {
         let result = b.coarse_decode_step(&mut weights, 4u32, Some(&idx), &mut handle, 3);
         let h = result.expect("decode step succeeds with populated handle");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// `coarse_decode_step_with_state` happy path: prefill then decode one
+    /// step with per-layer state capture. The Q4K fixture supports the
+    /// direct-matvec decode, so this drives the
+    /// `predict_kquant_decode_step_direct_with_state` arm and the captured
+    /// state is complete for every layer.
+    #[test]
+    fn coarse_decode_step_with_state_captures_per_layer_state() {
+        use crate::test_fixtures::make_q4k_fixture_index;
+        use larql_models::test_fixtures::make_test_q4k_weights;
+        let b = backend();
+        let mut weights = make_test_q4k_weights();
+        let idx = make_q4k_fixture_index(&weights);
+        let (_h, mut handle) = b
+            .coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx))
+            .expect("prefill seeds the handle");
+        let mut state = crate::PerLayerDecodeState::with_capacity(weights.num_layers);
+        let result = b.coarse_decode_step_with_state(
+            &mut weights,
+            4u32,
+            Some(&idx),
+            &mut handle,
+            3,
+            Some(&mut state),
+        );
+        let h = result.expect("decode-step-with-state succeeds on direct-matvec fixture");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// `coarse_decode_step_with_state` returns None when no index is
+    /// provided — covers the `let index = index?;` early-return.
+    #[test]
+    fn coarse_decode_step_with_state_returns_none_without_index() {
+        let b = backend();
+        let mut weights = make_test_weights();
+        let mut handle = KvHandle::new(CpuQ4kCacheHandle { cache: vec![None] });
+        let result =
+            b.coarse_decode_step_with_state(&mut weights, 0u32, None, &mut handle, 0, None);
+        assert!(result.is_none());
+    }
+
+    /// `coarse_decode_step` returns None when no index is provided —
+    /// covers the `let index = index?;` early-return in the non-state
+    /// variant.
+    #[test]
+    fn coarse_decode_step_returns_none_without_index() {
+        let b = backend();
+        let mut weights = make_test_weights();
+        let mut handle = KvHandle::new(CpuQ4kCacheHandle { cache: vec![None] });
+        let result = b.coarse_decode_step(&mut weights, 0u32, None, &mut handle, 0);
+        assert!(result.is_none());
+    }
+
+    /// `coarse_prefill_with_state` returns None when the arch can't run
+    /// the cached-decode path (hybrid-MoE), even with an index + tokens —
+    /// covers the `!supports_cached_decode(weights)` early-return.
+    #[test]
+    fn coarse_prefill_with_state_returns_none_on_unsupported_arch() {
+        use crate::test_fixtures::make_q4k_fixture_index;
+        let b = backend();
+        let mut weights = larql_models::test_fixtures::make_test_gemma4_moe_weights();
+        assert!(
+            !crate::kquant_forward::supports_cached_decode(&weights),
+            "MoE arch must not support cached decode"
+        );
+        // A real index is supplied so the `index?` gate passes and the
+        // `supports_cached_decode` gate is the one that bites.
+        let idx = make_q4k_fixture_index(&weights);
+        let result = b.coarse_prefill_with_state(&mut weights, &[0u32, 1], Some(&idx), None);
+        assert!(result.is_none());
+    }
+
+    // ── Q4K-direct attention_step path (env-gated) ──────────────────────
+    //
+    // `attention_step`'s opt-in Q4K-direct branch fires only under
+    // `LARQL_Q4K_DIRECT_ATTN=1`. The flag is read once through a
+    // process-wide `OnceLock`, so this single test owns that
+    // initialisation (no other test in this binary reads the flag). It
+    // sets the var before the first `attention_step` call, which both
+    // seeds the `OnceLock` (covering `q4k_direct_attn_enabled`) and drives
+    // the `Some(idx)` q4k-direct dispatch arm.
+    #[test]
+    fn attention_step_q4k_direct_branch_fires_when_env_enabled() {
+        use crate::test_fixtures::make_q4k_fixture_index;
+        use larql_models::test_fixtures::make_test_q4k_weights;
+
+        std::env::set_var("LARQL_Q4K_DIRECT_ATTN", "1");
+        // Sanity: the gate now reads as enabled (first read seeds the
+        // OnceLock to `true` for the remainder of the test binary; nothing
+        // else here passes an index to `attention_step`, so leaving it set
+        // is harmless).
+        assert!(q4k_direct_attn_enabled());
+
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let idx = make_q4k_fixture_index(&weights);
+        let mut handle = b.alloc_kv_buffer(0, 8, weights.num_kv_heads * weights.head_dim);
+        let query = Array2::from_elem((1, weights.hidden_size), 0.1f32);
+
+        // Step 1 (empty prior KV) through the q4k-direct branch.
+        let h1 = b
+            .attention_step(&weights, &query, &mut handle, 0, 0, Some(&idx))
+            .expect("q4k-direct attention_step returns Some on the Q4K fixture");
+        assert_eq!(h1.shape(), &[1, weights.hidden_size]);
+        assert_eq!(handle.cached_len(), 1, "KV grew by 1");
+
+        // Step 2 (prior KV present) keeps using the q4k-direct branch.
+        let h2 = b
+            .attention_step(&weights, &query, &mut handle, 0, 1, Some(&idx))
+            .expect("second q4k-direct attention_step succeeds");
+        assert_eq!(h2.shape(), &[1, weights.hidden_size]);
+        assert_eq!(handle.cached_len(), 2, "KV grew to 2");
+    }
+
+    /// The q4k-direct branch falls back to the f32 path per layer when the
+    /// index lacks Q4K attn bytes. With the flag enabled but an empty
+    /// index, `run_attention_block_decode_step_q4k_direct` returns None and
+    /// `attention_step` takes the `.or_else(f32_path)` fallback — which
+    /// also returns None here because `make_test_weights` has no f32 attn
+    /// tensors for the q4k fixture's dimensions… so we use the Q4K weights
+    /// (which DO carry f32 attn tensors) and an empty index.
+    #[test]
+    fn attention_step_q4k_direct_falls_back_to_f32_on_empty_index() {
+        use larql_models::test_fixtures::make_test_q4k_weights;
+
+        // Flag is already (or will be) enabled process-wide by the sibling
+        // test; set it again defensively so this test is order-independent.
+        std::env::set_var("LARQL_Q4K_DIRECT_ATTN", "1");
+
+        struct EmptyIdx;
+        impl crate::KvIndex for EmptyIdx {}
+
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let mut handle = b.alloc_kv_buffer(0, 8, weights.num_kv_heads * weights.head_dim);
+        let query = Array2::from_elem((1, weights.hidden_size), 0.1f32);
+
+        // EmptyIdx → q4k-direct returns None → `.or_else(f32_path)` runs the
+        // f32-BLAS path on `weights.tensors` (the fixture carries f32 attn
+        // tensors), which succeeds.
+        let h = b
+            .attention_step(&weights, &query, &mut handle, 0, 0, Some(&EmptyIdx))
+            .expect("f32 fallback succeeds when the index lacks Q4K attn bytes");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(handle.cached_len(), 1);
     }
 }

@@ -15,7 +15,7 @@
 
 Frontier-scale models (100B–1T+ params) are physically incompatible with consumer hardware under naïve dense matmul: a 671B Q4 model touches ~336 GB per forward pass; consumer DDR5 is ~50 GB/s; that's 6.7 sec/token. The bandwidth wall cannot be beaten by faster compute. The *only* path through is **touching fewer weights per token** — sparse retrieval over a queryable weight database. Vindex was always for this.
 
-Combined sparse-retrieval techniques (hash routing 5× × FP4 2× × KV compression 10× = ~100×) make the same 671B model ~134 ms/token on consumer DDR5. **That's blazing.**
+Combined sparse-retrieval techniques were projected at ~100× (hash routing 5× × FP4 2× × KV compression 10×) → the same 671B model at ~134 ms/token on consumer DDR5. **Aim-validation has since revised this (2026-05-31):** the **hash-routing 5× is falsified** — per-layer FFN sparsity that individually clears KL ≤ 0.05 does *not* compound across depth (V1, three dense archs: +5–8 bits/token NLL, 78–95% argmax drift); **FP4 2× holds** (V2, confirmed cross-arch, near-lossless). So the realistic compound is smaller, and the dominant bandwidth lever is MoE **active-parameter** sparsity (37B of 671B), not within-FFN hash routing. Detail: [`docs/diagnoses/v1-hash-routing.md`](diagnoses/v1-hash-routing.md), [`v2-fp4-generality.md`](diagnoses/v2-fp4-generality.md).
 
 ### Two permanent tracks
 
@@ -41,20 +41,22 @@ The arithmetic on a 671B MoE with 37B active params:
 | Stack | Bytes touched/token | tok/s @ 50 GB/s consumer DDR5 |
 |---|---|---|
 | Naïve dense over active experts | 18.5 GB | 2.7 |
-| + hash-routed FFN within active experts (5×, exp 27) | 5 GB | 10 |
-| + FP4 (2×, exp 26) | 2.5 GB | 20 |
+| ~~+ hash-routed FFN within active experts (5×, exp 27)~~ — **FALSIFIED (V1)**: doesn't compound across depth | — | — |
+| + FP4 (2×, exp 26 → **confirmed V2**) | 9.3 GB | ~5.4 |
+
+(The 5× row is struck: V1 showed within-FFN hash routing doesn't compound. The realistic post-active-sparsity stack is FP4 2× alone unless a different bandwidth lever lands. MoE active-param sparsity — the 18.5 GB starting point — remains the dominant win.)
 
 Tier-by-tier honest confidence:
 
 | Acceptance tier | Confidence |
 |---|---|
 | Short-term (Gemma 3 4B CPU within 10% of `llama.cpp -ngl 0`) | ~95% — pure engineering |
-| Medium-term (Gemma 4 26B-A4B at ≥10 tok/s on 64 GB consumer, no GPU) | ~80% — gated on V1+V2 |
-| Long-term (100B-class MoE at ≥5 tok/s, no GPU) | ~60% — adds disk-locality bet (V3) |
-| Ultimate (671B-class via consumer multi-machine grid) | ~40% — integration risk dominates; gated on re-promoting C9 per ADR-019 (multi-machine grid demoted to P2 2026-05-09) |
-| Dense frontier (if field stays dense at 1T+) | ~15% — needs research breakthroughs outside engineering control |
+| Medium-term (Gemma 4 26B-A4B at ≥10 tok/s on 64 GB consumer, no GPU) | **~62%** (was ~80%→70%→62%, 2026-05-31) — V2 confirms FP4 & 26B fits RAM (+); but measured **~4.4 tok/s, ~2.3× short of 10**, easy lever gone, and Q4K-direct already washed out at representative context (GQA O(N²) is the real wall). Gated on C10 (match-vs-beat llama.cpp): rises to ~70 if "match," drops to ~55 if "beat" |
+| Long-term (100B-class MoE at ≥5 tok/s, no GPU) | **~52%** (was ~60%→55%→52%, 2026-05-31) — 100B@FP4 fits RAM so the disk bet is moot here (+); but a **two-probe hit** to the exploitable-structure prior (V1 + routing locality) trims it; 50 is defensible if you weight that over the disk-risk removal. Cross-MoE-router check would settle it |
+| Ultimate (671B-class via consumer multi-machine grid) | **~30%** (was ~40%, 2026-05-31) — 671B@FP4 (~335 GB) exceeds one machine and routing locality closes the disk-resident escape hatch → only the harder multi-machine grid (C9/P2) remains; integration risk dominates |
+| Dense frontier (if field stays dense at 1T+) | **~10%** (was ~15%, 2026-05-31) — hash-routing 5× falsified (1 TB Q4 → ~10 s/token); needs attention-sparsification breakthroughs |
 
-The "100× combined effect" assumes techniques compound multiplicatively. ADR-015 ("isolated kernel speedup ≠ end-to-end win") says they often don't — and D-RMS-FUSE Phase 1 (2026-05-09) gave us a concrete falsification: predicted ~0.2 ms/tok savings collapsed to zero. **Four** load-bearing assumptions need falsifying *before* committing years to the build that rests on them (three isolated + one compound) — see **"P0 — Aim-validation tests (V1–V4)"** in `ROADMAP.md`. Those tests are currently the highest-leverage items on the entire roadmap.
+The "100× combined effect" assumes techniques compound multiplicatively. ADR-015 ("isolated kernel speedup ≠ end-to-end win") said they often don't — and aim-validation (2026-05-31) bore that out: of the four load-bearing assumptions, **V1 (hash-routing compounding) is FALSIFIED**, **V2 (FP4 generality) is CONFIRMED**, and **V3 (disk-residency) is undermined** by poor MoE routing locality. V4 (full compound on a >RAM model) remains, blocked on hardware. Net: the compound is smaller than 100× and the ultimate-aim arithmetic now rests on MoE active-param sparsity + FP4, not within-FFN hash routing or disk-spill. See **"P0 — Aim-validation tests (V1–V4)"** in `ROADMAP.md` and `docs/diagnoses/`.
 
 #### Known unknowns (from ROADMAP.md § "Engine purpose")
 
@@ -62,11 +64,11 @@ The bandwidth math assumes the architecture cooperates with sparse retrieval. Fi
 
 - **KU1** — static-attention fraction at 31B scale (validated at 4B: 91.7%; if degrades, VID7 weakens and MTP acceptance drops).
 - **KU2** — softmax bottleneck above ~1,142-token RoPE distance (Q-side fixable; KV-side at last position not, with current architecture; BR4 is the workaround, not a fix).
-- **KU3** — FP4 friendliness across non-Gemma archs (V2 covers).
-- **KU4** — hash-routing compounding across all layers (V1 covers).
-- **KU5** — mmap thrash on disk-resident frontier models (V3 covers).
+- **KU3** — FP4 friendliness across non-Gemma archs. **RESOLVED 2026-05-31 (V2): CONFIRMED** — ≥99.8% per-feature R<16 on Gemma 3 / Granite, FP4 near-lossless, no QAT.
+- **KU4** — hash-routing compounding across all layers. **RESOLVED 2026-05-31 (V1): FALSIFIED** — doesn't compound on 3 dense archs.
+- **KU5** — mmap thrash on disk-resident frontier models. **RESOLVED 2026-05-31 (V3 + routing-locality): locality POOR** — no cacheable hot subset, >RAM MoE thrashes.
 
-KU3, KU4, KU5 are scheduled. KU1, KU2 are parked.
+KU3/KU4/KU5 now resolved (see `docs/diagnoses/`). KU1, KU2 are parked.
 
 #### ADR-019 resolved (2026-05-09)
 

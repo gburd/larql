@@ -48,7 +48,13 @@ retrieval-override (Architecture B): the residual at the install layer
 is stored as a key in the `KnnStore` alongside the target token, and
 `INFER` overrides the model's top-1 when a stored key matches at
 `cos > 0.75`. Scales freely (validated at 25K edges) with no cross-fact
-interference.
+interference. That fixed `cos > 0.75` gate is the *legacy* router; the
+`INFER … ROUTE VERIFY [FALLBACK] [TOPK n]` clause selects the FR1/FR2
+routers instead — `VERIFY` only overrides with a fact whose entity the
+prompt actually names (top-k + verify + abstain, fixing confident-wrong
+injection on open queries), and `FALLBACK` adds an activation-alias tier
+for paraphrases like "Persia" → Iran. Without a clause, the global
+default comes from the `LARQL_KNN_*` env vars (unset → legacy gate).
 
 **`COMPOSE`** is the FFN-overlay install — a single-layer slot written
 via the `install_compiled_slot` pipeline (gate × 30, up parallel,

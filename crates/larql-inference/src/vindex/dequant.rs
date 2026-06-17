@@ -161,4 +161,247 @@ mod tests {
             "no Q4K data → no insert"
         );
     }
+
+    /// Build an attn-only Q4K vindex from `make_test_q4k_weights()` with V
+    /// quantised as **Q6_K** (Q/K/O stay Q4_K) — mirroring the real
+    /// Gemma-4-26B-A4B manifest where V is the high-precision outlier. The
+    /// shared `make_test_q4k_vindex` makes everything Q4_K, so it never
+    /// exercises the Q6_K dispatch the real model hits; this does.
+    fn make_attn_vindex_v_as_q6k(weights: &ModelWeights) -> larql_vindex::VectorIndex {
+        use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+
+        let num_layers = weights.num_layers;
+        let arch = &*weights.arch;
+        let mut payload: Vec<u8> = Vec::new();
+        let mut manifest: Vec<(usize, usize, String)> = Vec::new();
+        for layer in 0..num_layers {
+            // Order MUST be [Q, K, V, O]; only V (index 2) is Q6_K.
+            let specs = [
+                (arch.attn_q_key(layer), false),
+                (arch.attn_k_key(layer), false),
+                (arch.attn_v_key(layer), true),
+                (arch.attn_o_key(layer), false),
+            ];
+            for (key, q6) in specs {
+                let slice = weights
+                    .tensors
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("missing tensor {key}"))
+                    .as_slice()
+                    .expect("contiguous row-major");
+                let (bytes, fmt) = if q6 {
+                    (quantize_q6_k(slice), "Q6_K".to_string())
+                } else {
+                    (quantize_q4_k(slice), "Q4_K".to_string())
+                };
+                manifest.push((payload.len(), bytes.len(), fmt));
+                payload.extend_from_slice(&bytes);
+            }
+        }
+
+        let mut index = larql_vindex::VectorIndex::new(
+            vec![None; num_layers],
+            vec![None; num_layers],
+            num_layers,
+            weights.hidden_size,
+        );
+        index.vocab_size = weights.vocab_size;
+        let mmap = crate::test_utils::arc_mmap_from_bytes(&payload);
+        {
+            let storage = std::sync::Arc::make_mut(&mut index.storage);
+            storage.set_attn_kquant(mmap, Some(manifest));
+        }
+        index
+    }
+
+    /// Shared body for the parity gate: the Q4K-direct decode-step attention
+    /// (`run_attention_block_decode_step_q4k_direct`, projections via
+    /// `quant_matvec` straight from `index`) must match the Q4K-DEQUANT path
+    /// (`run_attention_block_decode_step_backend` on tensors dequantised by
+    /// `ensure_attn_tensors_dequantised` from the SAME `index` bytes) within
+    /// float-summation noise — isolating exactly the dequant-tax removal (NOT
+    /// vs f32-from-f32, which would conflate weight-quant error). Per-matrix
+    /// format flows identically through both sides, so a Q6_K V is dequantised
+    /// as Q6_K on the reference and `q6k_matvec`'d on the candidate.
+    /// Reference (Q4K-dequant) weights: a fresh deterministic fixture with attn
+    /// tensors STRIPPED then re-inserted as `dequantise(index bytes)` — so the
+    /// f32 BLAS path reads `dequantise(quantise(original))`, carrying the same
+    /// weight-quant error the candidate does (NOT the pristine original, which
+    /// would hide it). Per-matrix format flows through `ensure_*` (Q6_K V stays
+    /// Q6_K), matching the candidate's `quant_matvec` dispatch.
+    fn dequant_reference_weights(index: &larql_vindex::VectorIndex) -> ModelWeights {
+        let mut deq_weights = make_test_q4k_weights();
+        let keys: Vec<(String, String, String, String)> = (0..deq_weights.num_layers)
+            .map(|l| {
+                let a = &*deq_weights.arch;
+                (
+                    a.attn_q_key(l),
+                    a.attn_k_key(l),
+                    a.attn_v_key(l),
+                    a.attn_o_key(l),
+                )
+            })
+            .collect();
+        for (q, k, v, o) in &keys {
+            deq_weights.tensors.remove(q);
+            deq_weights.tensors.remove(k);
+            deq_weights.tensors.remove(v);
+            deq_weights.tensors.remove(o);
+        }
+        ensure_attn_tensors_dequantised(&mut deq_weights, index);
+        deq_weights
+    }
+
+    fn assert_q4k_direct_matches_dequant(index: &larql_vindex::VectorIndex) {
+        use larql_compute::attention::{
+            run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
+        };
+        use larql_compute::CpuBackend;
+        use ndarray::Array2;
+
+        let weights = make_test_q4k_weights();
+        let backend = CpuBackend;
+        let deq_weights = dequant_reference_weights(index);
+
+        let h_new = Array2::from_shape_fn((1, weights.hidden_size), |(_, j)| {
+            ((j % 7) as f32 - 3.0) * 0.02
+        });
+
+        for layer in 0..weights.num_layers {
+            let (h_deq, (k_deq, v_deq)) = run_attention_block_decode_step_backend(
+                &deq_weights,
+                &h_new,
+                layer,
+                None,
+                0,
+                Some(&backend),
+            )
+            .expect("dequant decode step");
+            let (h_dir, (k_dir, v_dir)) = run_attention_block_decode_step_q4k_direct(
+                &weights, &h_new, layer, None, 0, &backend, index,
+            )
+            .expect("q4k-direct decode step");
+
+            let max_abs = |a: &Array2<f32>, b: &Array2<f32>| -> f32 {
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let dh = max_abs(&h_deq, &h_dir);
+            let dk = max_abs(&k_deq, &k_dir);
+            let dv = max_abs(&v_deq, &v_dir);
+            // Both kernels (q4k/q6k matvec) are parity-tested vs dequant→matmul;
+            // the residual is reduction-order float noise. 1e-3 is generous
+            // (real diffs ~1e-5–1e-4) yet catches a wrong stride/format/wiring.
+            assert!(
+                dh < 1e-3 && dk < 1e-3 && dv < 1e-3,
+                "layer {layer}: Q4K-direct vs Q4K-dequant exceeds float noise — \
+                 h={dh:.2e} k={dk:.2e} v={dv:.2e}"
+            );
+            // Guard against a degenerate all-zero match (would pass trivially).
+            assert!(
+                h_dir.iter().any(|x| x.abs() > 1e-6),
+                "layer {layer}: q4k-direct output is all-zero — kernel returned None-equivalent"
+            );
+        }
+    }
+
+    /// PARITY GATE (task #16, step 3) — all-Q4_K attn (Q/K/V/O).
+    #[test]
+    fn q4k_direct_decode_step_matches_q4k_dequant() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        assert_q4k_direct_matches_dequant(&index);
+    }
+
+    /// PARITY GATE (task #16, step 3) — **mixed format**, V = Q6_K (Q/K/O Q4_K),
+    /// matching the real 26B manifest. Exercises the `q6k_matvec` candidate
+    /// dispatch + Q6_K reference dequant that the all-Q4_K fixture never hits.
+    #[test]
+    fn q4k_direct_decode_step_matches_dequant_with_q6k_v() {
+        let weights = make_test_q4k_weights();
+        let index = make_attn_vindex_v_as_q6k(&weights);
+        assert_q4k_direct_matches_dequant(&index);
+    }
+
+    /// PARITY GATE (task #16, step 3) — **MULTI-STEP / compounding**. The
+    /// single-step tests above run `kv_entry = None` (one decode step); the real
+    /// 26B run accumulates a KV cache over many tokens, and the two paths' caches
+    /// drift cumulatively (each step's K/V differs by ~quant noise, gets cached,
+    /// and is attended by every later step). This drives N sequential steps with
+    /// each path carrying its OWN growing cache (as the real run does) and checks
+    /// the post-attention hidden stays within float noise at every step — so a
+    /// compounding divergence (the actual mechanism behind a late-token argmax
+    /// flip) is caught here, not first seen as a mysterious divergence on the 26B.
+    /// Mixed V=Q6_K index so Q6_K compounds through both sides too.
+    #[test]
+    fn q4k_direct_decode_multistep_parity_compounds_within_noise() {
+        use larql_compute::attention::{
+            run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
+            SharedKV,
+        };
+        use larql_compute::CpuBackend;
+        use ndarray::Array2;
+
+        let weights = make_test_q4k_weights();
+        let index = make_attn_vindex_v_as_q6k(&weights);
+        let deq_weights = dequant_reference_weights(&index);
+        let backend = CpuBackend;
+        let layer = 0;
+
+        // Independent caches, exactly as the autoregressive run keeps them.
+        let mut kv_deq: Option<SharedKV> = None;
+        let mut kv_dir: Option<SharedKV> = None;
+        let mut worst = 0.0f32;
+        const STEPS: usize = 8;
+        for step in 0..STEPS {
+            // Distinct per-step input so the cache grows with real content.
+            let h_new = Array2::from_shape_fn((1, weights.hidden_size), |(_, j)| {
+                (((j + step) % 11) as f32 - 5.0) * 0.03
+            });
+            let (h_deq, new_deq) = run_attention_block_decode_step_backend(
+                &deq_weights,
+                &h_new,
+                layer,
+                kv_deq.as_ref(),
+                step,
+                Some(&backend),
+            )
+            .expect("dequant step");
+            let (h_dir, new_dir) = run_attention_block_decode_step_q4k_direct(
+                &weights,
+                &h_new,
+                layer,
+                kv_dir.as_ref(),
+                step,
+                &backend,
+                &index,
+            )
+            .expect("q4k-direct step");
+
+            let dh = h_deq
+                .iter()
+                .zip(h_dir.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            worst = worst.max(dh);
+            // Allow a little headroom for accumulation, but stay far below any
+            // level that would risk an argmax flip. A blow-up (drift that grows
+            // unbounded with cache depth) trips this; bounded noise does not.
+            assert!(
+                dh < 5e-3,
+                "step {step}: compounding h drift {dh:.2e} exceeds bound — \
+                 KV-cache divergence is growing, not bounded"
+            );
+            kv_deq = Some(new_deq);
+            kv_dir = Some(new_dir);
+        }
+        // The drift must not be monotonically exploding — worst over 8 steps
+        // should still be float-noise scale. (Reported for the record.)
+        assert!(
+            worst < 5e-3,
+            "worst-step compounding drift over {STEPS} steps = {worst:.2e}"
+        );
+    }
 }

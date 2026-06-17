@@ -93,6 +93,10 @@ impl QuantizedFfnAccess for VectorIndex {
         VectorIndex::has_down_features_kquant(self)
     }
 
+    fn down_features_q4k_layer_data(&self, layer: usize) -> Option<(&[u8], &str, usize)> {
+        VectorIndex::down_features_q4k_layer_data(self, layer)
+    }
+
     fn kquant_down_feature_scaled_add(
         &self,
         layer: usize,

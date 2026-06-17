@@ -449,6 +449,7 @@ mod tests {
     /// hot loop never handles the strided source layout (see
     /// bitnet_writer.rs and BUG-infer-deadlock §5.4). Pins the kernel
     /// against its own `encode_row` helper.
+    #[test]
     fn matvec_agrees_with_contiguous_encoding() {
         let row = synth_ternary(64, 7);
         let bytes = encode_row(&row, 1.0);

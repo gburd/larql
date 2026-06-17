@@ -378,6 +378,39 @@ pub trait KvEngine: Send {
         self.decode_step(weights, ffn, token_id) // default: f32 fallback
     }
 
+    /// Resident-weights quant prefill. Unlike [`prefill_quant`] (which takes
+    /// `&mut weights` to lazily dequantise attn into `weights.tensors`), this
+    /// assumes the **caller has already made the client weights f32-resident**
+    /// — so it takes `&weights` and merely threads `index` to the backend. That
+    /// lets a Q4K-direct attention kernel (`LARQL_Q4K_DIRECT_ATTN`) read packed
+    /// bytes from the index while the FFN backend borrows the same `&weights`
+    /// immutably — no `&mut`/`&` borrow conflict (task #16). Default: f32
+    /// fallback (index ignored).
+    fn prefill_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_ids: &[u32],
+    ) -> Result<Array2<f32>, EngineError> {
+        let _ = index;
+        self.prefill(weights, ffn, token_ids)
+    }
+
+    /// One decode step against resident (pre-dequantised) weights, threading
+    /// `index` to the backend. Sibling of [`prefill_resident`]; same rationale.
+    /// Default: f32 fallback (index ignored).
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        let _ = index;
+        self.decode_step(weights, ffn, token_id)
+    }
+
     /// Prefill via a caller-supplied `LayerExecutor` (dense/f32 path).
     /// See [`docs/specs/engine-state-vs-execution.md`].
     ///
@@ -708,6 +741,37 @@ impl AnyEngine {
         match self {
             Self::Kv(e) => e.decode_step_quant(weights, ffn, index, token_id, backend),
             Self::Retrieval(e) => e.decode_step_quant(weights, index, token_id),
+        }
+    }
+
+    /// Resident-weights quant prefill (`&weights`, threads `index`). See
+    /// [`KvEngine::prefill_resident`]. Retrieval variants fall back to their
+    /// f32 prefill (index-aware retrieval isn't a moe-shards path).
+    pub fn prefill_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_ids: &[u32],
+    ) -> Result<Array2<f32>, EngineError> {
+        match self {
+            Self::Kv(e) => e.prefill_resident(weights, ffn, index, token_ids),
+            Self::Retrieval(e) => e.prefill(weights, token_ids),
+        }
+    }
+
+    /// Resident-weights quant decode step (`&weights`, threads `index`). See
+    /// [`KvEngine::decode_step_resident`].
+    pub fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        match self {
+            Self::Kv(e) => e.decode_step_resident(weights, ffn, index, token_id),
+            Self::Retrieval(e) => e.decode_step(weights, token_id),
         }
     }
 

@@ -1,0 +1,27 @@
+{
+  "test_id": "C10",
+  "model": "gemma3-4b (Q4_K)",
+  "machine": "M3 Max, 128GB, 8 threads",
+  "date": "2026-05-31",
+  "decode_tok_s": {
+    "larql_cpu": 23.6,
+    "llama_cpp_cpu_ngl0": 45.5,
+    "ratio_larql_over_llamacpp": 0.52,
+    "gap_x": 1.93
+  },
+  "method": "larql: `larql bench --cpu`; llama.cpp: ollama gemma3:4b via /api/generate options.num_gpu=0,num_thread=8 (ollama IS llama.cpp, same Q4_K_M GGUF). Homebrew llama-bench could not load the ollama blob.",
+  "discrepancy_vs_recorded_C10": "ROADMAP.md C10 records 1.50x (27.6 vs 41.4 tok/s, 2026-05-16, direct StandardEngine vs llama.cpp). This re-measure is 1.93x (23.6 vs 45.5) -- WORSE. Reconcile before trusting either: candidates = thermal, short-prompt/small-n, ollama-num_gpu=0 vs direct llama.cpp -ngl 0, or a real decode regression since May. Re-run with a longer multi-prompt corpus on a cool machine.",
+  "short_term_tier": "Target = within 10% of llama.cpp -ngl 0. NOT met (1.5-1.9x slower depending on measurement).",
+  "decode_stage_split_ms_per_tok": {
+    "dense_ffn": 22.95,
+    "attention": 17.54,
+    "lm_head": 5.42,
+    "shares": "FFN ~50% / attn ~38% / lm_head ~12% (raw timer sums slightly >100%: thread-local timers overlap rayon work)",
+    "source": "LARQL_DECODE_STAGES=1, 40-tok decode"
+  },
+  "bottleneck": "The existing C12 (hand-asm Q4K x Q8K kernel). VERIFIED from source: the production CPU decode path is `attention_decode_step_native` (larql-inference/src/vindex/kquant_forward/cached.rs:563), which quantizes the activation to Q8_K (ll.609/710) and runs Q/K/V/O through the int8 Q8_K SDOT kernel via `matvec_q4k_or_q6k_q8k` -- SAME kernel the FFN uses. So BOTH attention and FFN are already on int8 SDOT; the gap is that larql's SDOT kernel is Rust intrinsics lowered by LLVM vs llama.cpp's hand-written aarch64 asm (two-super-block interleaving + prefetch), ~1.73x per-core, ~63 vs ~95 GB/s effective. Decode is matvec-dominated (FFN ~50% + attn ~38% + lm_head ~12%, all the same kernel).",
+  "CORRECTION": "An earlier draft of this file claimed 'attention runs f32, wire it to the int8 kernel (new item C11)'. THAT WAS WRONG -- it came from reading larql-compute/src/attention/decode.rs, which is the f32 BLAS / LARQL_Q4K_DIRECT_ATTN opt-in path, NOT the production native decode path. There is no attention-wiring win; attention already uses int8 SDOT. The real lever is C12 (hand-asm kernel). C11 in ROADMAP.md already means 'architecture-rule CI' (unrelated).",
+  "fix": "C12 as already specced: hand-asm aarch64 Q4K x Q8K matvec on the FFN tile shapes (gate/up/down) + attention projections (same kernel), two-super-block interleaving + prefetch to match llama.cpp. Acceptance: >=9.5 tok/s single-core, >=39 tok/s 8-thread on Gemma 3 4B Q4K. Spec: crates/larql-compute/docs/q4k-decode-kernel.md.",
+  "caveats": "Small n (both early-stopped on a short prompt). lm_head CPU matvec path not separately traced. The 1.93x-vs-1.50x discrepancy is unresolved.",
+  "notes": "26B-A4B llama.cpp baseline (the medium-term pin) needs a 26B GGUF -- not local."
+}

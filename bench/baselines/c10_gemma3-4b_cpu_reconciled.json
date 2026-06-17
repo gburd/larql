@@ -1,0 +1,46 @@
+{
+  "test_id": "C10-reconcile",
+  "model": "gemma3-4b (Q4_K)",
+  "machine": "M3 Max, 128GB, 8 threads",
+  "date": "2026-06-02",
+  "purpose": "Resolve the 1.50x (2026-05-16) vs 1.93x (2026-05-31) C10 discrepancy by measuring all four cells in one controlled matrix: same prompt, same machine state, matched thread count (t=8), warm, n=128.",
+  "method": {
+    "prompt": "Write a long detailed essay about the history of the Roman empire, covering its founding, rise, and fall: (generation-friendly to avoid early EOS; n=128 decode steps, 5 warmup)",
+    "threads": 8,
+    "larql_legacy": "larql bench <vindex> --backends cpu  -> generate_via_cpu_q4k -> predict_kquant_decode_step",
+    "larql_standard": "larql bench <vindex> --backends cpu --engine standard -> StandardEngine -> kv_decode_step_via_dispatch -> attention_step (forces CpuBackend because args.backends='cpu' so contains('metal')==false)",
+    "llama_bench": "llama-bench -m /tmp/gemma-3-4b-Q4_K_M.gguf -dev BLAS -ngl 0 -p 64 -n 128 -r 3 -t 8 (Q4_K_M quantized from the same output/larql-gemma-3-4b-it.gguf the vindex was built from)",
+    "ollama_cpu": "curl /api/generate options.num_gpu=0,num_thread=8,num_predict=128 -- WARMED first (one discarded CPU-mode call) then 3 reps",
+    "ollama_gpu_ref": "same curl without num_gpu=0 (Metal) -- reference only, NOT a CPU baseline"
+  },
+  "decode_tok_s_t8": {
+    "larql_cpu_legacy": 23.5,
+    "larql_standard_engine_cpu": 26.4,
+    "llama_bench_ngl0": 42.99,
+    "ollama_num_gpu0_warm": [42.8, 42.9, 43.0],
+    "ollama_gpu_default_ref": 94.1
+  },
+  "decode_ms_per_tok_t8": {
+    "larql_cpu_legacy": 42.62,
+    "larql_standard_engine_cpu": 37.84,
+    "llama_bench_ngl0": 23.26
+  },
+  "reconciled_gap_x": {
+    "larql_legacy_vs_llamacpp": 1.83,
+    "larql_standard_vs_llamacpp": 1.63,
+    "note": "True CPU decode gap is ~1.6x (StandardEngine, the production run/walk default) to ~1.8x (legacy bench --cpu path) -- NOT 1.93x and NOT 1.50x."
+  },
+  "resolution": {
+    "verdict": "NO regression. The 1.50x-vs-1.93x discrepancy was two stacked measurement confounds, not a real change in larql or llama.cpp.",
+    "confound_1_larql_path_mismatch": "27.6 (2026-05-16) was the StandardEngine path; 23.6 (2026-05-31) was the legacy `larql bench --cpu` path (predict_kquant_decode_step). These are DIFFERENT decode hot-paths with a stable ~12-15% delta (today: 26.4 vs 23.5 = 1.12x; matches the documented 27.6 vs 24.0 = 1.15x). Comparing one date's StandardEngine to the other date's legacy path manufactured a phantom 17% 'regression'.",
+    "confound_2_llamacpp_harness_artifact": "41.4 (2026-05-16, llama-bench -ngl0 -t12) vs 45.5 (2026-05-31, ollama num_gpu=0) was NOT a real llama.cpp speedup. The 45.5 was an unwarmed / short-n (eval_count=31, early EOS) ollama artifact. Warmed + n=128, ollama num_gpu=0 converges to 42.8-43.0, identical to llama-bench's 42.99. (A cold ollama num_gpu=0 call this session gave 21.9 -- the metric is unstable until warm.) The real llama.cpp CPU decode number is ~43 tok/s, stable across both harnesses and both dates.",
+    "residual_contention": "Today's larql numbers (23.5/26.4) sit marginally below 2026-05-16's (24.5/27.6), consistent with live Spotlight indexing + load avg ~1.8 during measurement. Small (~4%), does not affect the conclusion."
+  },
+  "secondary_findings": [
+    "`larql bench --cpu` measures the SLOWER legacy path (23.5), not the production StandardEngine default (26.4) that `larql run`/`larql walk` use. The headline C10 number undersells larql by ~12%. Fix: bench --cpu should default to StandardEngine, or report both.",
+    "The bench tool's `--ollama` flag sets only num_predict -- NOT num_gpu=0 -- so it runs ollama on Metal GPU (~94 tok/s). It is NOT a CPU baseline; it silently compares CPU-larql to GPU-ollama. The c10_cpu.json '97.7 tok/s ollama' row is this GPU leak. Fix: expose num_gpu/num_thread on --ollama, or label it GPU.",
+    "ollama num_gpu=0 needs a warmup call after any GPU-mode use (mode switch forces a model reload); short unwarmed measurements are unreliable for a CPU baseline."
+  ],
+  "mechanism_confirms_C12": "The reconciled ~1.6-1.8x gap is the same kernel-quality gap the C12 diagnosis identified: 1.73x per-core, larql's NEON intrinsics (LLVM-lowered) vs llama.cpp's hand-asm Q4K x Q8K SDOT (two-super-block interleave + prefetch). Both attention and FFN already run the int8 Q8_K SDOT kernel. The lever remains C12 (hand-asm kernel), unchanged.",
+  "still_owed": "26B-A4B llama.cpp CPU baseline (needs a 26B GGUF, not local) -- that is the number that actually pins the medium-term tier."
+}

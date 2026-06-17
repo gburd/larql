@@ -86,13 +86,19 @@ impl KvEngine for MarkovResidualEngine {
     fn prefill(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_ids: &[u32],
     ) -> Result<Array2<f32>, EngineError> {
         if token_ids.is_empty() {
             return Err(EngineError::EmptyPrompt);
         }
-        let result = rs_prefill(weights, token_ids, self.window_size, self.backend.as_ref());
+        let result = rs_prefill(
+            weights,
+            token_ids,
+            self.window_size,
+            self.backend.as_ref(),
+            Some(ffn),
+        );
         let hidden = result.hidden.clone();
         self.store = Some(result.store);
         Ok(hidden)
@@ -101,7 +107,7 @@ impl KvEngine for MarkovResidualEngine {
     fn decode_step(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
         let rs = self
@@ -117,16 +123,17 @@ impl KvEngine for MarkovResidualEngine {
                 rs,
                 self.backend.as_ref(),
                 &mut self.profile,
+                Some(ffn),
             )
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "rs_decode_step_profiled returned None".into(),
             })?
         } else {
-            rs_decode_step(weights, token_id, rs, self.backend.as_ref()).ok_or_else(|| {
-                EngineError::BackendFailure {
+            rs_decode_step(weights, token_id, rs, self.backend.as_ref(), Some(ffn)).ok_or_else(
+                || EngineError::BackendFailure {
                     details: "rs_decode_step returned None".into(),
-                }
-            })?
+                },
+            )?
         };
         self.store = Some(new_rs);
         Ok(hidden)

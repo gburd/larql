@@ -57,13 +57,16 @@ mod tests {
     // ── generate_with_remote_moe — error path ────────────────────────────────
 
     #[test]
-    fn errors_when_vindex_has_no_q4k_mmap() {
+    fn errors_when_vindex_has_no_attn_weights() {
         let weights = make_test_weights();
         let idx = make_test_vindex(&weights);
         let tokenizer = make_test_tokenizer(weights.vocab_size);
 
-        // make_test_vindex has no interleaved Q4K or Q4 mmap.
-        // The function should fail at the mmap guard, before any GPU or shard call.
+        // make_test_vindex has no attention (or FFN) weights. Pure-MoE models
+        // legitimately drop the dense FFN tensor (PR #152), so the FFN-mmap
+        // guard was removed; a vindex with no attention must still fail cleanly
+        // at the setup guard rather than panic inside build_pipeline_layers'
+        // resolve_attn_weights `.expect(...)`.
         let remote = RemoteMoeBackend::new_disconnected();
         let result = generate_with_remote_moe(
             &weights,
@@ -78,7 +81,7 @@ mod tests {
         match result {
             Err(RemoteMoeError::BadResponse(msg)) => {
                 assert!(
-                    msg.contains("no interleaved Q4 FFN mmap"),
+                    msg.contains("no attention weights"),
                     "unexpected error message: {msg}"
                 );
             }

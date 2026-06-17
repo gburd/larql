@@ -330,7 +330,7 @@ impl KvEngine for TurboQuantEngine {
     fn prefill(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_ids: &[u32],
     ) -> Result<Array2<f32>, EngineError> {
         if token_ids.is_empty() {
@@ -353,7 +353,8 @@ impl KvEngine for TurboQuantEngine {
                 weights,
                 backend: self.backend.as_ref(),
             };
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
+            let h_out =
+                crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, &bffn, Some(ffn));
             h = h_out;
         }
 
@@ -364,7 +365,7 @@ impl KvEngine for TurboQuantEngine {
     fn decode_step(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
         let num_layers = weights.num_layers;
@@ -423,7 +424,8 @@ impl KvEngine for TurboQuantEngine {
                 weights,
                 backend: self.backend.as_ref(),
             };
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
+            let h_out =
+                crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, &bffn, Some(ffn));
             h = h_out;
         }
 

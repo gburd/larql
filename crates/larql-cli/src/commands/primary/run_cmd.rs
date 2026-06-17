@@ -334,6 +334,8 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.moe_dispatch,
             args.moe_predispatch_iters,
+            args.metal,
+            args.engine.as_deref(),
         );
     }
 
@@ -463,9 +465,45 @@ fn run_with_moe_shards(
     max_tokens: usize,
     dispatch: &str,
     predispatch_iters: usize,
+    metal: bool,
+    engine_spec: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Remote MoE needs an engine that dispatches FFN per-layer through the
+    // `ffn` trait (where `RemoteMoeFfn` hooks the experts): `standard` and
+    // `boundary_kv` (which wraps a StandardEngine and adds compressed-residual
+    // boundary frames — same dispatch, wire-efficient cold-context). The
+    // compression engines (markov_residual / turbo_quant / unlimited_context /
+    // boundary_per_layer) route FFN through the backend's fused coarse path, and
+    // apollo/no_cache re-forward — none have a remote-expert hook, so they'd
+    // silently drop experts. Reject them clearly.
+    if let Some(spec) = engine_spec {
+        let kind = larql_kv::EngineKind::from_name(spec)
+            .ok_or_else(|| format!("unknown --engine `{spec}`"))?;
+        if !matches!(
+            kind,
+            larql_kv::EngineKind::Standard { .. }
+                | larql_kv::EngineKind::BoundaryKv { .. }
+                | larql_kv::EngineKind::UnlimitedContext { .. }
+                | larql_kv::EngineKind::MarkovResidual { .. }
+                | larql_kv::EngineKind::MarkovResidualCodec { .. }
+                | larql_kv::EngineKind::TurboQuant { .. }
+                | larql_kv::EngineKind::BoundaryPerLayer { .. }
+        ) {
+            return Err(format!(
+                "`--engine {}` is not supported with remote MoE (--moe-shards). Supported: \
+                 standard, boundary, unlimited-context, markov-rs, markov-residual-codec, \
+                 turbo-quant, boundary-per-layer (they dispatch FFN per-layer through the ffn \
+                 trait where experts hook in). `no-cache` / `apollo` re-forward and would \
+                 multiply expert round-trips. See larql-kv ROADMAP §\"MoE-aware KV engines (C1)\".",
+                kind.display_name()
+            )
+            .into());
+        }
+    }
     use larql_inference::ffn::moe_remote::{parse_unit_manifest, RemoteMoeBackend, ShardConfig};
-    use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
+    use larql_inference::{
+        generate_kquant_cpu_remote, generate_with_remote_moe, generate_with_remote_moe_batch,
+    };
 
     // Pick ownership mode: legacy `--moe-shards` (layer-uniform ranges) or
     // `--moe-units-manifest` (fine-grained per-(layer, expert) sets).  The
@@ -510,7 +548,22 @@ fn run_with_moe_shards(
 
     let num_shards = configs.len();
     // Initialise compute backend early so we can report it in the topology banner.
-    let backend = larql_compute::default_backend();
+    // Mirrors the `--metal` wiring in `run_with_remote_ffn` (PR #122): explicit
+    // opt-in via the CLI flag, with Metal-init failure falling back to CPU.
+    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
+        #[cfg(all(feature = "gpu", target_os = "macos"))]
+        {
+            larql_compute_metal::metal_backend()
+                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
+                .unwrap_or_else(larql_compute::cpu_backend)
+        }
+        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
+        {
+            return Err("`--metal` requires the `gpu` feature on macOS".into());
+        }
+    } else {
+        larql_compute::cpu_backend()
+    };
     eprintln!("Connecting to {} MoE shard(s)…", num_shards);
     let remote = RemoteMoeBackend::connect(configs)
         .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
@@ -524,7 +577,7 @@ fn run_with_moe_shards(
 
     // Client loads attn + dense FFN + norms + router weights — no expert bytes.
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let weights = larql_vindex::load_model_weights_kquant(vindex_path, &mut cb)
+    let mut weights = larql_vindex::load_model_weights_kquant(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load client weights: {e}"))?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
         .map_err(|e| format!("failed to load tokenizer: {e}"))?;
@@ -562,37 +615,159 @@ fn run_with_moe_shards(
         .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
     eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
 
-    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
-    let result = if dispatch == "batch" {
-        generate_with_remote_moe_batch(
-            &weights,
-            &tokenizer,
-            prompt_ids,
-            max_tokens,
-            &index,
-            &remote,
-            &*backend,
-            &eos,
-            predispatch_iters,
-        )
+    // Backend-aware dispatch. The Metal backend implements the fused
+    // `DecodeBackend::decode_token_with_moe` trait method; the CPU backend
+    // does not (it is a GPU-only trait method that returns `None`), which
+    // previously surfaced as "decode_token_with_moe returned None during
+    // prefill" whenever `--metal` was omitted (#146). On CPU we route through
+    // the CPU remote-MoE forward instead: per-token
+    // `predict_kquant_hidden(Some(remote))` → `run_moe_layer_cpu` →
+    // `forward_moe_seq`, which dispatches each MoE layer's experts to the
+    // shards over HTTP.
+    let (tokens, decode_ms): (Vec<String>, Vec<f64>) = if metal {
+        let eos =
+            larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
+        let result = if dispatch == "batch" {
+            generate_with_remote_moe_batch(
+                &weights,
+                &tokenizer,
+                prompt_ids,
+                max_tokens,
+                &index,
+                &remote,
+                &*backend,
+                &eos,
+                predispatch_iters,
+            )
+        } else {
+            generate_with_remote_moe(
+                &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend, &eos,
+            )
+        }
+        .map_err(|e| format!("grid generate failed ({dispatch}): {e}"))?;
+        (result.tokens, result.decode_ms)
     } else {
-        generate_with_remote_moe(
-            &weights, &tokenizer, prompt_ids, max_tokens, &index, &remote, &*backend, &eos,
-        )
-    }
-    .map_err(|e| format!("grid generate failed ({dispatch}): {e}"))?;
+        if dispatch == "batch" {
+            eprintln!(
+                "  note: --moe-dispatch batch is GPU-only; using sequential CPU expert dispatch"
+            );
+        }
+        // CPU remote-MoE. Default: the KV-cached engine path — dequantize the
+        // client weights (attn + dense FFN; experts stay remote) to f32 once,
+        // then drive a StandardEngine with `RemoteMoeFfn` so attention is
+        // KV-cached and only MoE experts round-trip to the shards. ~10× faster
+        // than full-recompute and byte-identical output (verified on
+        // Gemma-4-26B-A4B, 2 shards).
+        //
+        // Falls back to the standalone full-recompute path (closes #146) for
+        // Per-Layer-Embedding archs (the engine path doesn't apply PLE) or when
+        // `LARQL_MOE_FULL_RECOMPUTE=1` is set as an escape hatch.
+        let uses_ple = weights.arch.per_layer_input_gate_key(0).is_some();
+        let force_recompute = std::env::var("LARQL_MOE_FULL_RECOMPUTE").is_ok();
+        if uses_ple || force_recompute {
+            if uses_ple {
+                eprintln!(
+                    "  note: model uses Per-Layer Embeddings — full-recompute CPU path (no KV cache)"
+                );
+            }
+            let started = std::time::Instant::now();
+            let toks = generate_kquant_cpu_remote(
+                &mut weights,
+                &tokenizer,
+                &prompt_ids,
+                max_tokens,
+                &index,
+                &remote,
+            );
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let strings: Vec<String> = toks.into_iter().map(|(s, _)| s).collect();
+            let n = strings.len();
+            let per = if n == 0 { 0.0 } else { total_ms / n as f64 };
+            (strings, vec![per; n])
+        } else {
+            // Dequantize attn + dense FFN to f32 for every layer, kept resident
+            // for the whole generation (experts are not loaded on the client).
+            for layer in 0..weights.num_layers {
+                larql_inference::vindex::insert_q4k_layer_tensors(&mut weights, &index, layer)
+                    .map_err(|e| format!("failed to dequantize layer {layer} to f32: {e}"))?;
+            }
+            let moe_ffn = larql_inference::ffn::RemoteMoeFfn {
+                weights: &weights,
+                remote: &remote,
+            };
+            // Build the chosen MoE-capable engine (validated above): `standard`
+            // or `boundary_kv`. Drive through `generate_with_engine` (not
+            // `generate_cached`): it routes prefill/decode through
+            // `engine.prefill/decode_step` → the MoE-aware `kv_*_via_dispatch`
+            // path. `generate_cached` uses the legacy `kv_prefill_run` path,
+            // which has no MoE hook (experts never dispatched).
+            let kind = engine_spec
+                .and_then(larql_kv::EngineKind::from_name)
+                .unwrap_or(larql_kv::EngineKind::Standard { window_size: None });
+            eprintln!("  Engine:     {} (CPU, KV-cached)", kind.display_name());
+            let mut engine = kind.build(larql_inference::cpu_engine_backend());
+            let mut strings: Vec<String> = Vec::new();
+            // Capture a timestamp per emitted token so the banner reports TRUE
+            // steady-state decode (inter-token intervals), not total/n which
+            // conflates model-load + prefill into the per-token number.
+            let mut tok_times: Vec<std::time::Instant> = Vec::new();
+            let started = std::time::Instant::now();
+            // Resident-weights quant path: weights were dequantised f32-resident
+            // above, so this threads the `index` to the backend (no `&mut`, so
+            // `moe_ffn` can borrow `&weights` concurrently) — letting the
+            // Q4K-direct attention kernel fire under `LARQL_Q4K_DIRECT_ATTN`.
+            // With the flag unset the backend ignores the index → identical f32.
+            let _ids = larql_kv::generation::generate_with_engine_resident(
+                &mut engine,
+                &weights,
+                &tokenizer,
+                &moe_ffn,
+                &index,
+                &prompt_ids,
+                max_tokens,
+                |_id, tok| {
+                    strings.push(tok.to_string());
+                    tok_times.push(std::time::Instant::now());
+                },
+            );
+            // Time-to-first-token (prefill) is the gap start→first emit; decode
+            // is the gap between consecutive emits.
+            if let Some(first) = tok_times.first() {
+                eprintln!(
+                    "  prefill (TTFT):  {:.0} ms",
+                    first.duration_since(started).as_secs_f64() * 1000.0
+                );
+            }
+            let decode_ms: Vec<f64> = tok_times
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.0)
+                .collect();
+            if larql_inference::decode_stages::is_enabled() {
+                let (attn_ms, dense_ms, expert_ms, lmhead_ms) =
+                    larql_inference::decode_stages::snapshot_ms();
+                // Accumulated over prefill + decode. attn/dense/lm_head are
+                // client-side; experts are server-side. "Everything else"
+                // (router, combine, embed) is the remainder of wall-time.
+                eprintln!(
+                    "  [stages] attn: {attn_ms:.0} ms | dense FFN: {dense_ms:.0} ms | \
+                     lm_head: {lmhead_ms:.0} ms | remote experts: {expert_ms:.0} ms"
+                );
+            }
+            (strings, decode_ms)
+        }
+    };
 
-    for tok in &result.tokens {
+    for tok in &tokens {
         print!("{tok}");
     }
-    if !result.tokens.is_empty() {
+    if !tokens.is_empty() {
         println!();
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    let n = result.decode_ms.len();
+    let n = decode_ms.len();
     if n > 0 {
-        let avg = result.decode_ms.iter().sum::<f64>() / n as f64;
+        let avg = decode_ms.iter().sum::<f64>() / n as f64;
         let tok_s = 1000.0 / avg;
         let num_layers = weights.num_layers;
         let hidden = weights.hidden_size;

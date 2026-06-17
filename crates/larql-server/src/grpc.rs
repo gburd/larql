@@ -492,6 +492,7 @@ fn grpc_infer(
                 Some(&patched.knn_store),
                 &token_ids,
                 top_k,
+                &larql_inference::KnnRouteMode::from_env(),
             );
             let walk_ms = walk_pred.walk_ms as f32;
 
@@ -532,6 +533,7 @@ fn grpc_infer(
                 Some(&patched.knn_store),
                 &token_ids,
                 top_k,
+                &larql_inference::KnnRouteMode::from_env(),
             );
             Ok(InferResponse {
                 prompt: req.prompt.clone(),

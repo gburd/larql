@@ -14,6 +14,13 @@
 //!
 //! See `crates/larql-cli/ROADMAP.md` P0 → "`larql parity`" for the full design.
 
+// Without the `gpu`+macOS feature the real `run` (and everything it calls —
+// the naive reference impls, MoE helpers, dump utilities) is `#[cfg]`'d out,
+// leaving only the stub `run` below. That code is live in the gpu build, so
+// it is not truly dead — silence dead-code only in the gpu-off config rather
+// than gating every helper individually.
+#![cfg_attr(not(all(feature = "gpu", target_os = "macos")), allow(dead_code))]
+
 use clap::Args;
 
 #[cfg(all(feature = "gpu", target_os = "macos"))]

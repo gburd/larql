@@ -106,6 +106,7 @@ impl Session {
                 Some(&patched.knn_store),
                 &token_ids,
                 top_k,
+                &larql_inference::KnnRouteMode::from_env(),
             );
             predictions = infer.predictions;
             knn_override = infer.knn_override;

@@ -141,6 +141,18 @@ fn main() {
         "INFER (with compare)",
         r#"INFER "The capital of France is" TOP 5 COMPARE;"#,
     );
+    demo(
+        "INFER ROUTE VERIFY (FR1 verified KNN router)",
+        r#"INFER "The capital of Atlantis is" ROUTE VERIFY TOP 3;"#,
+    );
+    demo(
+        "INFER ROUTE VERIFY FALLBACK TOPK (FR2 two-tier router)",
+        r#"INFER "The capital of Persia is" ROUTE VERIFY FALLBACK TOPK 8 TOP 3;"#,
+    );
+    demo(
+        "SELECT EDGES (FR3 synonym-robust relation)",
+        r#"SELECT * FROM EDGES WHERE relation = "seat" LIMIT 5;"#,
+    );
 
     // ── Mutation Statements ──
     section("Mutation");

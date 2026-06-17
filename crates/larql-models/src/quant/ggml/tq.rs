@@ -28,8 +28,8 @@
 use crate::ModelError;
 
 use super::{
-    check_block_input, I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMS, K_QUANT_BLOCK_ELEMS,
-    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
+    check_block_input, I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMS, K_QUANT_BLOCK_ELEMS, TQ1_0_BLOCK_BYTES,
+    TQ2_0_BLOCK_BYTES,
 };
 
 // ── f16 helpers ────────────────────────────────────────────────────────────────
@@ -269,8 +269,8 @@ pub fn dequantize_tq1_0(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Mode
 
         // qh: 16 elements via 4 digits × 4 bytes.
         for &p3 in &TQ1_POW3[..4] {
-            for m in 0..TQ1_QH_BYTES {
-                let q = qh[m].wrapping_mul(p3) as u16;
+            for &byte in &qh[..TQ1_QH_BYTES] {
+                let q = byte.wrapping_mul(p3) as u16;
                 let xi = ((q * 3) >> 8) as i32;
                 out.push((xi - 1) as f32 * d);
             }
@@ -639,13 +639,15 @@ mod tests {
         // A 256-element zero block decoded via the public dispatch.
         let bytes = vec![0u8; TQ2_0_BLOCK_BYTES];
         let result =
-            super::super::dequantize(&bytes, super::super::TYPE_TQ2_0, K_QUANT_BLOCK_ELEMS).unwrap();
+            super::super::dequantize(&bytes, super::super::TYPE_TQ2_0, K_QUANT_BLOCK_ELEMS)
+                .unwrap();
         // Stored 0 → -1 with d=0 → still 0.
         assert!(result.iter().all(|&v| v == 0.0));
 
         let bytes = vec![0u8; TQ1_0_BLOCK_BYTES];
         let result =
-            super::super::dequantize(&bytes, super::super::TYPE_TQ1_0, K_QUANT_BLOCK_ELEMS).unwrap();
+            super::super::dequantize(&bytes, super::super::TYPE_TQ1_0, K_QUANT_BLOCK_ELEMS)
+                .unwrap();
         assert!(result.iter().all(|&v| v == 0.0));
     }
 
@@ -765,5 +767,145 @@ mod tests {
             super::super::tensor_data_size(super::super::TYPE_TQ1_0, 512).unwrap(),
             TQ1_0_BLOCK_BYTES * 2
         );
+    }
+
+    // ── f16 conversion edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn f16_decode_smallest_subnormal() {
+        // bits 0x0001 is the smallest positive f16 subnormal == 2^-24.
+        // Exercises the `exp == 0 && mant != 0` normalisation branch.
+        let v = f16_le_to_f32(0x01, 0x00);
+        assert!((v - 2f32.powi(-24)).abs() < 1e-12, "got {v}");
+        assert!(v > 0.0);
+    }
+
+    #[test]
+    fn f16_decode_larger_subnormal() {
+        // bits 0x0200 has the top mantissa bit set (mant == 0x200, exp == 0).
+        // One normalisation shift → value == 2^-15.
+        let v = f16_le_to_f32(0x00, 0x02);
+        assert!((v - 2f32.powi(-15)).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn f16_decode_signed_subnormal() {
+        // Sign bit set on a subnormal (bits 0x8001) → negative 2^-24.
+        let v = f16_le_to_f32(0x01, 0x80);
+        assert!((v + 2f32.powi(-24)).abs() < 1e-12, "got {v}");
+        assert!(v < 0.0);
+    }
+
+    #[test]
+    fn f16_decode_inf_and_nan() {
+        // bits 0x7C00 → +inf; 0xFC00 → -inf (exp == 0x1f, mant == 0).
+        assert_eq!(f16_le_to_f32(0x00, 0x7C), f32::INFINITY);
+        assert_eq!(f16_le_to_f32(0x00, 0xFC), f32::NEG_INFINITY);
+        // bits 0x7E00 → NaN (exp == 0x1f, mant != 0).
+        assert!(f16_le_to_f32(0x00, 0x7E).is_nan());
+    }
+
+    #[test]
+    fn f16_encode_inf_and_nan() {
+        // f32 +inf/-inf (exp32 == 0xff, mant32 == 0) → f16 inf.
+        assert_eq!(f32_to_f16_le(f32::INFINITY), [0x00, 0x7C]);
+        assert_eq!(f32_to_f16_le(f32::NEG_INFINITY), [0x00, 0xFC]);
+        // f32 NaN (exp32 == 0xff, mant32 != 0) → f16 NaN; round-trips to NaN.
+        let nan_bytes = f32_to_f16_le(f32::NAN);
+        assert!(f16_le_to_f32(nan_bytes[0], nan_bytes[1]).is_nan());
+    }
+
+    #[test]
+    fn f16_encode_overflow_to_inf() {
+        // A finite f32 whose exponent exceeds the f16 range overflows to inf
+        // (new_exp >= 0x1f branch).
+        assert_eq!(f32_to_f16_le(1e30), [0x00, 0x7C]);
+        assert_eq!(f32_to_f16_le(-1e30), [0x00, 0xFC]);
+    }
+
+    #[test]
+    fn f16_encode_underflow_to_zero() {
+        // A finite f32 too small for the smallest f16 subnormal flushes to
+        // signed zero (new_exp <= 0 branch).
+        assert_eq!(f32_to_f16_le(1e-30), [0x00, 0x00]);
+        assert_eq!(f32_to_f16_le(-1e-30), [0x00, 0x80]);
+        assert_eq!(f16_le_to_f32(0x00, 0x00), 0.0);
+    }
+
+    #[test]
+    fn tq2_0_decode_with_inf_scale_poisons_block() {
+        // A block whose stored f16 scale is +inf should poison every non-zero
+        // trit, exercising dequant against the inf decode path. qs all 0x00 →
+        // trit 0 → (0 - 1) * inf = -inf for every element.
+        let mut bytes = vec![0u8; TQ2_0_BLOCK_BYTES];
+        bytes[64] = 0x00;
+        bytes[65] = 0x7C; // +inf
+        let decoded = dequantize_tq2_0(&bytes, K_QUANT_BLOCK_ELEMS).unwrap();
+        assert_eq!(decoded.len(), K_QUANT_BLOCK_ELEMS);
+        assert!(decoded.iter().all(|&v| v == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn tq2_0_decode_with_subnormal_scale() {
+        // Stored scale = smallest subnormal f16 (0x0001). qs byte 0 = 0b10 in
+        // its lowest 2-bit slot → trit 2 → (+1) * 2^-24 for that element.
+        let mut bytes = vec![0u8; TQ2_0_BLOCK_BYTES];
+        bytes[0] = 0b10; // first slot of qs[0]: stored 2 → +1 after bias
+        bytes[64] = 0x01;
+        bytes[65] = 0x00; // subnormal scale 2^-24
+        let decoded = dequantize_tq2_0(&bytes, K_QUANT_BLOCK_ELEMS).unwrap();
+        assert!(
+            (decoded[0] - 2f32.powi(-24)).abs() < 1e-12,
+            "got {}",
+            decoded[0]
+        );
+    }
+
+    #[test]
+    fn tq2_0_quantize_huge_scale_round_trips_via_inf() {
+        // A block whose absmax overflows f16 stores an inf scale; decode then
+        // multiplies trits by inf. Drives the encode-overflow + decode-inf
+        // paths together. Sign of the trit determines +inf / -inf / 0.
+        let mut input = vec![0.0f32; K_QUANT_BLOCK_ELEMS];
+        input[0] = 1e30; // +1 trit, absmax overflows f16
+        input[1] = -1e30; // -1 trit
+        let bytes = quantize_tq2_0(&input).unwrap();
+        let decoded = dequantize_tq2_0(&bytes, K_QUANT_BLOCK_ELEMS).unwrap();
+        assert_eq!(decoded[0], f32::INFINITY);
+        assert_eq!(decoded[1], f32::NEG_INFINITY);
+        // A zero trit stays zero (0 - 1 + 1 bias... trit 1 → 0 * inf = NaN
+        // only if scale is inf; here element 2 quantises to 0 trit → -inf).
+        // The first 128 elements are interleaved; just confirm finiteness mix.
+        assert!(decoded.iter().any(|&v| v.is_infinite()));
+    }
+
+    #[test]
+    fn tq2_0_quantize_tiny_scale_flushes_to_zero() {
+        // absmax below f16's smallest subnormal flushes the stored scale to
+        // zero, so the whole block decodes to zero (encode-underflow path).
+        let mut input = vec![0.0f32; K_QUANT_BLOCK_ELEMS];
+        input[0] = 1e-30;
+        input[5] = -1e-30;
+        let bytes = quantize_tq2_0(&input).unwrap();
+        let decoded = dequantize_tq2_0(&bytes, K_QUANT_BLOCK_ELEMS).unwrap();
+        assert!(decoded.iter().all(|&v| v == 0.0));
+    }
+
+    // ── quantize length guards ──────────────────────────────────────────────
+
+    #[test]
+    fn tq2_0_quantize_non_multiple_errors() {
+        // Length not a multiple of 256 → Parse error (input-guard branch).
+        let err = quantize_tq2_0(&vec![0.0f32; K_QUANT_BLOCK_ELEMS + 1]).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(quantize_tq2_0(&[1.0, 0.0, -1.0]).is_err());
+    }
+
+    #[test]
+    fn tq1_0_quantize_non_multiple_errors() {
+        // Length not a multiple of 256 → Parse error (input-guard branch).
+        let err = quantize_tq1_0(&vec![0.0f32; K_QUANT_BLOCK_ELEMS - 1]).unwrap_err();
+        assert!(matches!(err, ModelError::Parse(_)));
+        assert!(quantize_tq1_0(&[1.0, 0.0, -1.0]).is_err());
     }
 }

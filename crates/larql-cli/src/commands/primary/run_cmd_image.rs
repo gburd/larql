@@ -36,7 +36,7 @@ use std::path::Path;
 use larql_compute::connectors::projector::VisionProjector;
 use larql_compute::encoders::vision_tower::VisionEncoder;
 use larql_compute::forward::{embed_plan, EmbeddingChunk, EmbeddingPlan, PositionScheme};
-use larql_models::connectors::projector::{load_projector_from_safetensors, ProjectorWeights};
+use larql_models::connectors::projector::load_projector_from_safetensors;
 use larql_models::encoders::vision_tower::{load_vision_tower_from_safetensors, VisionConfig};
 use larql_models::{MmConnector, ModalEncoder, ModalInput, Modality, ModelArchitecture};
 
@@ -375,6 +375,7 @@ fn load_vindex_tokenizer(
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb};
+    use larql_models::connectors::projector::ProjectorWeights;
     use larql_models::encoders::vision_tower::{
         LayerNormWeights, ProjWithBias, VisionLayerWeights, VisionWeights,
     };

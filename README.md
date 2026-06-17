@@ -607,6 +607,7 @@ extraction-only flows (DESCRIBE, KNN, vindex publish) work today.
 | Operation | Latency | tok/s |
 |---|---|---|
 | **GPU Q4K decode (Metal, 34L, KV cache)** | **11.4ms** | **88.1** |
+| **CPU Q4K decode (StandardEngine, KV cache, 8 threads)** | **~38ms** | **~26.4** |
 | Walk prediction (CPU, no attention) | 33ms | 30 |
 | INFER walk (CPU, with attention, mmap FFN) | 517ms | 1.9 |
 | INFER dense (CPU, all matmul) | 535ms | 1.9 |
@@ -621,6 +622,8 @@ GPU decode per-stage breakdown (post 2026-05-09 QKV defuse, ADR-016):
 | Embed + norm + detokenize | <0.1ms | <1% |
 
 vs ollama gemma3:4b on the same machine: ~103 tok/s steady → **gap 1.17×**, was 1.18× pre QKV defuse, 1.30× pre 2026-05-02 dispatch fix. Acceptance criterion (~85 tok/s, ~1.16×) effectively met.
+
+**CPU vs llama.cpp** (reconciled 2026-06-02, M3 Max, 8 threads, warm): larql **26.4** (StandardEngine) / 23.5 (legacy `bench --cpu`) vs **llama.cpp `-ngl 0` 43.0** tok/s → **gap ~1.6–1.8×**. The gap is per-core kernel quality — both attention and FFN already run the int8 Q8_K SDOT kernel; closing it is C12 (hand-asm; an opt-in `LARQL_Q4K_ASM=1` v1 lands +~4% isolated). `larql bench --cpu` now reports both the legacy and production-StandardEngine rows; `--ollama-cpu` forces a true CPU ollama baseline (default `--ollama` runs on Metal GPU). The earlier 1.5×/1.9× spread was two measurement confounds (path mismatch + an unwarmed-ollama artifact), not a regression — see `bench/baselines/c10_gemma3-4b_cpu_reconciled.json`.
 
 **Cross-arch coverage (2026-05-09)**: Gemma 3, Gemma 4 31B dense, Llama 2 7B, Mistral 7B all dispatch correctly through Metal. Gemma 4 E2B currently falls back to CPU (Per-Layer Embeddings not yet in Metal — ROADMAP D-METAL-PLE). See [crates/larql-compute/docs/architecture-shader-map.md](crates/larql-compute/docs/architecture-shader-map.md) for the per-architecture shader dispatch table.
 

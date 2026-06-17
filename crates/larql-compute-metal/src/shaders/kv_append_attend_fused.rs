@@ -101,6 +101,14 @@ kernel void kv_append_attend_fused(
     }
 
     float sg_sum = simd_sum(local_sum);
+    // tg_sg_vals is reused from the max-reduction above. Without this barrier a
+    // fast simdgroup overwrites its slot with sg_sum while a slow simdgroup is
+    // still reading that slot for global_max (line above) — corrupting the max
+    // non-deterministically per dispatch. This is the DEFAULT decode-attention
+    // kernel (LARQL_FUSED_KV_APPEND_ATTEND), so this race is the dominant
+    // source of the per-dispatch logit drift that desyncs the Shannon coder.
+    // See docs/replay/shannon-transformers-the-same.md.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) tg_sg_vals[sg_id] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float global_sum = tg_sg_vals[0];

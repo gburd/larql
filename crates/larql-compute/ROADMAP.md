@@ -1,5 +1,14 @@
 # Roadmap — larql-compute
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P0 — MoE forward panics on served paths.** `src/moe/forward.rs:191,211` use `unwrap_or_else(panic!)` — same fail-loud class as the inference paths; convert to `?` once `FfnBackend::forward` is fallible (tracked in larql-inference roadmap).
+- **Medium — `embed_tokens_pub`** skips the vocab bound that `vocab_proj` applies; OOV/unbounded token id → panic. Route through a bounds-checked helper.
+- **Low — debug-only FFI bounds check** at `q4_matvec.rs:29` (no check in release).
+- Note: the Metal KV-cache OOB bug lives in `larql-compute-metal` (no crate roadmap) — tracked at workspace [`ROADMAP.md`](../../../ROADMAP.md) §"Codebase hardening" item 2.
+
 ## Multi-modal substrate — Phase 1 (landed 2026-05-24, PR #143)
 
 - **forward/embedding_plan.rs**: `EmbeddingChunk` (Tokens / Precomputed),

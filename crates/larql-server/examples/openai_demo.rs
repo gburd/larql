@@ -14,7 +14,7 @@
 //! ```bash
 //! # f16 (fastest, KV-cached):
 //! cargo run --release -p larql-server --example openai_demo -- \
-//!   output/gemma3-4b-f16.vindex
+//!   output/gemma3-4b-fresh.vindex
 //!
 //! # Q4_K (correct output; CPU per-step Q4_K decode is O(N²) so
 //! # high `max_tokens` runs are slow):

@@ -121,6 +121,27 @@ impl RelationClassifier {
         Some((label, count, tops))
     }
 
+    /// Distinct known relation labels (cluster labels + probe labels), with
+    /// empty / `unknown` filtered out. The candidate set the FR3 relation
+    /// resolver builds residual keys for. Order is unspecified.
+    pub fn relation_labels(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(clusters) = self.clusters.as_ref() {
+            for l in &clusters.labels {
+                seen.insert(l.clone());
+            }
+        }
+        for l in self.probe_labels.values() {
+            seen.insert(l.clone());
+        }
+        seen.into_iter()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.eq_ignore_ascii_case("unknown")
+            })
+            .collect()
+    }
+
     /// Check whether a feature's label is probe-confirmed (vs cluster-assigned).
     pub fn is_probe_label(&self, layer: usize, feature: usize) -> bool {
         self.probe_labels.contains_key(&(layer, feature))
@@ -324,6 +345,51 @@ mod tests {
         let rc = make_test_classifier();
         assert_eq!(rc.num_clusters(), 3);
         assert!(rc.has_clusters());
+    }
+
+    // ── relation_labels (FR3 candidate set) ──
+
+    #[test]
+    fn relation_labels_merges_clusters_and_probes_deduped() {
+        // Cluster labels (capital/language/continent) + a probe label that
+        // duplicates one of them ("capital") and one fresh ("currency").
+        let mut rc = make_test_classifier();
+        rc.probe_labels.insert((10, 5), "capital".into()); // dup → collapses
+        rc.probe_labels.insert((11, 6), "currency".into()); // new
+        rc.probe_count = rc.probe_labels.len();
+        let mut got = rc.relation_labels();
+        got.sort(); // order is unspecified
+        assert_eq!(got, vec!["capital", "continent", "currency", "language"]);
+    }
+
+    #[test]
+    fn relation_labels_filters_empty_and_unknown() {
+        // Empty / whitespace / "unknown" (any case) labels are dropped so
+        // the resolver never trains a class on a non-relation.
+        let mut rc = make_test_classifier();
+        if let Some(c) = rc.clusters.as_mut() {
+            c.labels = vec![
+                "capital".into(),
+                "".into(),
+                "  ".into(),
+                "unknown".into(),
+                "UNKNOWN".into(),
+            ];
+        }
+        let mut got = rc.relation_labels();
+        got.sort();
+        assert_eq!(got, vec!["capital"]);
+    }
+
+    #[test]
+    fn relation_labels_empty_without_clusters_or_probes() {
+        let rc = RelationClassifier {
+            clusters: None,
+            feature_assignments: std::collections::HashMap::new(),
+            probe_labels: std::collections::HashMap::new(),
+            probe_count: 0,
+        };
+        assert!(rc.relation_labels().is_empty());
     }
 
     #[test]

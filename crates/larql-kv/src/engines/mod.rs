@@ -85,6 +85,35 @@ pub(crate) fn w10_enabled() -> bool {
     }
 }
 
+/// Per-layer FFN dispatch for engine forward loops, MoE-aware.
+///
+/// On a hybrid-MoE arch, when a `moe_ffn` hook is supplied (e.g.
+/// `RemoteMoeFfn` for `--moe-shards`), call its
+/// [`FfnBackend::forward_moe_full_layer`] — it returns the full layer output
+/// (dense `h1` + experts `h2` + combine), dispatching experts to the shards.
+/// Otherwise fall back to the engine's own dense FFN (`dense_ffn`), preserving
+/// prior behaviour for dense models and the no-hook path exactly.
+///
+/// Lets the per-layer / windowed engines (unlimited_context, markov_residual,
+/// turbo_quant, …) ride remote MoE without touching their KV state policy —
+/// only the FFN step changes.
+pub(crate) fn layer_ffn_or_moe(
+    weights: &larql_inference::ModelWeights,
+    h_post_attn: &ndarray::Array2<f32>,
+    layer: usize,
+    dense_ffn: &dyn larql_inference::ffn::FfnBackend,
+    moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+) -> ndarray::Array2<f32> {
+    if weights.arch.is_hybrid_moe() {
+        if let Some(mf) = moe_ffn {
+            if let Some(h_out) = mf.forward_moe_full_layer(layer, h_post_attn) {
+                return h_out;
+            }
+        }
+    }
+    larql_inference::forward::run_ffn(weights, h_post_attn, layer, dense_ffn, false).0
+}
+
 std::thread_local! {
     /// Per-thread override for [`w10_enabled`]. `Some(true)` simulates
     /// `LARQL_W10_DISABLE=1` (cascade off); `Some(false)` simulates the
@@ -98,4 +127,77 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn set_w10_disabled_override(disabled: Option<bool>) {
     W10_DISABLED_OVERRIDE.with(|o| *o.borrow_mut() = disabled);
+}
+
+#[cfg(test)]
+mod layer_ffn_or_moe_tests {
+    use super::layer_ffn_or_moe;
+    use larql_inference::ffn::FfnBackend;
+    use larql_inference::test_utils::make_test_gemma4_moe_weights;
+    use ndarray::Array2;
+
+    /// FfnBackend whose MoE hook returns a sentinel (all 7.0) so we can tell
+    /// the MoE branch from the dense `run_ffn` fallback.
+    struct SentinelFfn;
+    impl FfnBackend for SentinelFfn {
+        fn forward(&self, _layer: usize, x: &Array2<f32>) -> Array2<f32> {
+            Array2::zeros(x.raw_dim())
+        }
+        fn forward_with_activation(
+            &self,
+            _layer: usize,
+            x: &Array2<f32>,
+        ) -> (Array2<f32>, Array2<f32>) {
+            (Array2::zeros(x.raw_dim()), Array2::zeros((x.nrows(), 1)))
+        }
+        fn name(&self) -> &str {
+            "sentinel"
+        }
+        fn forward_moe_full_layer(
+            &self,
+            _layer: usize,
+            h_post_attn: &Array2<f32>,
+        ) -> Option<Array2<f32>> {
+            Some(Array2::from_elem(h_post_attn.raw_dim(), 7.0))
+        }
+    }
+
+    #[test]
+    fn uses_moe_hook_on_hybrid_moe_arch() {
+        let weights = make_test_gemma4_moe_weights();
+        assert!(weights.arch.is_hybrid_moe());
+        let h = Array2::<f32>::zeros((2, weights.hidden_size));
+        let out = layer_ffn_or_moe(&weights, &h, 0, &SentinelFfn, Some(&SentinelFfn));
+        // Took the MoE hook → sentinel output, not the dense run_ffn path.
+        assert!(
+            out.iter().all(|&v| v == 7.0),
+            "expected MoE-hook sentinel output"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_dense_when_no_hook() {
+        let weights = make_test_gemma4_moe_weights();
+        let h = Array2::<f32>::zeros((2, weights.hidden_size));
+        // No moe_ffn → dense run_ffn even on a MoE arch (no experts dispatched).
+        let out = layer_ffn_or_moe(&weights, &h, 0, &SentinelFfn, None);
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(
+            out.iter().any(|&v| v != 7.0),
+            "must NOT be the MoE-hook sentinel"
+        );
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sentinel_ffn_trait_surface() {
+        // Exercise the FfnBackend methods `layer_ffn_or_moe` doesn't call.
+        let s = SentinelFfn;
+        let x = Array2::<f32>::zeros((2, 4));
+        assert_eq!(s.name(), "sentinel");
+        assert_eq!(s.forward(0, &x).shape(), &[2, 4]);
+        let (o, a) = s.forward_with_activation(0, &x);
+        assert_eq!(o.shape(), &[2, 4]);
+        assert_eq!(a.shape(), &[2, 1]);
+    }
 }

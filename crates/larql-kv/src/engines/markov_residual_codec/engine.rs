@@ -115,7 +115,7 @@ impl KvEngine for MarkovResidualCodecEngine {
     fn prefill(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_ids: &[u32],
     ) -> Result<Array2<f32>, EngineError> {
         if token_ids.is_empty() {
@@ -127,6 +127,7 @@ impl KvEngine for MarkovResidualCodecEngine {
             self.window_size,
             self.codec,
             self.backend.as_ref(),
+            Some(ffn),
         );
         let hidden = result.hidden.clone();
         self.store = Some(result.store);
@@ -136,7 +137,7 @@ impl KvEngine for MarkovResidualCodecEngine {
     fn decode_step(
         &mut self,
         weights: &ModelWeights,
-        _ffn: &dyn FfnBackend,
+        ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
         let rs = self
@@ -145,10 +146,11 @@ impl KvEngine for MarkovResidualCodecEngine {
             .ok_or_else(|| EngineError::InvariantViolation {
                 what: "decode_step called before prefill (store missing)".into(),
             })?;
-        let (hidden, new_rs) = rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref())
-            .ok_or_else(|| EngineError::BackendFailure {
-            details: "rs_decode_step_codec returned None".into(),
-        })?;
+        let (hidden, new_rs) =
+            rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref(), Some(ffn))
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "rs_decode_step_codec returned None".into(),
+                })?;
         self.store = Some(new_rs);
         Ok(hidden)
     }

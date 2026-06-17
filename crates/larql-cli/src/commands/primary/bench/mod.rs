@@ -44,6 +44,7 @@ pub(super) mod engine_runtime;
 pub(super) mod grid_lan;
 pub(super) mod grid_lan_runtime;
 pub(super) mod local;
+pub(super) mod local_moe_runtime;
 pub(super) mod local_runtime;
 pub(super) mod ollama;
 pub(super) mod output;

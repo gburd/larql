@@ -112,6 +112,7 @@ impl super::Session {
                     Some(store),
                     &token_ids,
                     1,
+                    &larql_inference::KnnRouteMode::from_env(),
                 );
                 infer
                     .knn_override

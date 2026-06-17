@@ -1,5 +1,11 @@
 # Roadmap — larql-server / larql-router
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — unbounded in-memory growth with dead eviction logic.** The session map (`src/session.rs:184`) and rate-limit buckets (`src/ratelimit.rs:83`) never evict. Memory/DoS class — wire up the eviction that already exists but isn't called.
+
 ## Current state (as of 2026-05-07)
 
 ### 2026-05-07 — Wire format evolution + WebSocket streaming + Criterion benchmarks

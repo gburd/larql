@@ -1,5 +1,13 @@
 # Roadmap — larql-cli
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — user-facing panic** on multimodal input against a non-multimodal model (lone reachable unwrap in the crate).
+- **P2 — NaN `partial_cmp().unwrap()`** at `parity.rs:1119` → shared NaN-safe helper.
+- **Hygiene** — ✅ clippy clean (2026-06-03): the 2 default-build nits (unused `ProjectorWeights` import, dead `total_tiles` field) fixed, plus the 41 `--no-default-features` (gpu-off) warnings — `diagnostics/parity.rs` gets a gpu-off `#![cfg_attr(.., allow(dead_code))]`, and the `walk_cmd`/`shannon_cmd` `--metal`-requires-gpu stubs route through a cfg-split `metal_backend_box()?` helper instead of a diverging `let` (which had poisoned downstream as unreachable). `make lint` (`cargo clippy --workspace --tests -- -D warnings`) is green. Coverage: per the crate `coverage-policy.json` the enforced total floor is **7%** (binary crate, mostly command wiring; most files excluded) — currently ~12–14%, passing; the per-file 90% default applies only to the non-excluded modules (e.g. `bench/ollama.rs` at 91%).
+
 For shipped work, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Current state

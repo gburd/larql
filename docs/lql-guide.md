@@ -74,6 +74,12 @@ EXPLAIN WALK "The capital of France is" LAYERS 24-33;
 
 -- SQL-style edge queries
 SELECT entity, target FROM EDGES WHERE relation = "capital" LIMIT 10;
+
+-- Synonym-robust relation filter (FR3): if "seat" matches no stored relation
+-- exactly, it is resolved to a known relation by meaning ("seat" → capital,
+-- "money" → currency) via a trained residual probe, then re-run against the
+-- canonical relation. Needs a vindex with model weights + relation labels.
+SELECT * FROM EDGES WHERE relation = "seat" LIMIT 5;
 ```
 
 ### 4. Run inference
@@ -91,6 +97,34 @@ INFER "The capital of France is" TOP 5 COMPARE;
 -- Full inference trace
 EXPLAIN INFER "The capital of France is" TOP 5;
 ```
+
+For facts installed with `INSERT … MODE KNN`, the `ROUTE` clause selects how the
+KNN side-channel decides whether to override the model's answer:
+
+```sql
+-- FR1 verified router: among the top-k activation candidates, override only
+-- with a fact whose entity the prompt actually names — otherwise abstain and
+-- let the model answer. Fixes the legacy "confident-wrong" injection. The safe
+-- default for open queries. TOPK sets the candidate pool (default 5).
+INFER "The capital of Atlantis is" ROUTE VERIFY TOP 3;
+
+-- FR2 two-tier router: VERIFY first, then an activation-alias fallback for when
+-- the prompt names an alias rather than the stored entity (e.g. "Persia" → Iran).
+-- WARNING: the fallback has no entity-name guard, so on a query about a
+-- non-stored entity it can confident-wrong like the legacy gate — use FALLBACK
+-- only for queries known to be aliases of stored entities.
+INFER "The capital of Persia is" ROUTE VERIFY FALLBACK TOPK 8 TOP 3;
+
+-- EXIT: retrieval-augmented early exit. When the verified hit fires, the forward
+-- short-circuits at the resolved layer — the stored target is emitted and the
+-- remaining layers + lm_head are skipped (parity-exact, ~1.4× faster on
+-- fact-lookup answer tokens). Verified-only; ignored with FALLBACK.
+INFER "The capital of Atlantis is" ROUTE VERIFY EXIT TOP 3;
+```
+
+With no `ROUTE` clause, INFER inherits the global default from the `LARQL_KNN_*`
+env vars (`LARQL_KNN_VERIFY` → verified, `+ LARQL_KNN_FALLBACK` → two-tier;
+`LARQL_KNN_TOPK`, `LARQL_KNN_MIN_COS` tune the knobs). Unset → legacy top-1 gate.
 
 ### 5. Edit knowledge
 
@@ -265,4 +299,4 @@ Bands are model-specific — computed automatically during EXTRACT from known ar
 | Introspection | SHOW RELATIONS/LAYERS/FEATURES/MODELS/PATCHES, STATS |
 | Pipe | `\|>` chains two statements |
 
-See [lql-spec.md](lql-spec.md) for the full language specification.
+See [the LQL specification](../crates/larql-lql/docs/spec.md) for the full language specification.

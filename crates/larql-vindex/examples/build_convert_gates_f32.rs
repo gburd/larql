@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   cargo run --release -p larql-vindex --example convert_gates_f32 -- \
-//!     /path/to/gemma3-4b-f16.vindex
+//!     /path/to/gemma3-4b-fresh.vindex
 //!
 //! This modifies the vindex in-place (overwrites gate_vectors.bin and index.json).
 //! Back up first if needed.

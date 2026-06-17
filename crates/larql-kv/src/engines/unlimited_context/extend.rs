@@ -38,6 +38,7 @@ pub fn rs_extend_from_checkpoint(
         prior_kv,
         abs_start,
         &larql_compute::CpuBackend,
+        None,
     )
 }
 
@@ -46,12 +47,14 @@ pub fn rs_extend_from_checkpoint(
 /// Takes `prior_kv` by value so the per-token extend loop can mutate it
 /// in place. Cloning the prior K/V per step is O(window²) total over a
 /// full window — a real overhead on growing caches.
+#[allow(clippy::too_many_arguments)]
 pub fn rs_extend_from_checkpoint_backend(
     weights: &ModelWeights,
     token_ids: &[u32],
     prior_kv: Vec<SharedKV>,
     abs_start: usize,
     backend: &dyn ComputeBackend,
+    moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
@@ -86,7 +89,8 @@ pub fn rs_extend_from_checkpoint_backend(
             )?;
 
             let bffn = BackendFfn { weights, backend };
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &bffn, false);
+            let h_out =
+                crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, &bffn, moe_ffn);
             h = h_out;
             *kv_slot = new_kv;
         }

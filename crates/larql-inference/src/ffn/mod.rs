@@ -14,6 +14,7 @@
 //! backends) stay here because they pull in inference-side topology.
 
 pub mod graph_backend;
+pub mod local_moe;
 pub mod moe_remote;
 pub mod remote;
 pub mod sparse;
@@ -28,7 +29,10 @@ pub use larql_compute::ffn::{
 
 // ── Re-exports ──
 
-pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
+pub use local_moe::LocalMoeFfn;
+pub use moe_remote::{
+    MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, RemoteMoeFfn, ShardConfig,
+};
 pub use remote::{
     LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
     WirePreference,

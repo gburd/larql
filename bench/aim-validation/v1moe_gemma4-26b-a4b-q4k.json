@@ -1,0 +1,20 @@
+{
+  "test_id": "V1-moe-within-expert",
+  "model": "gemma4-26b-a4b-q4k",
+  "prompt_set": "baseline_fact_prompts (KL) + held narrative (NLL)",
+  "git_rev": "2ddd0bad",
+  "expert_inter": 704,
+  "n_expert_layers": 30,
+  "metrics": {
+    "topk": [{"layer":0,"frac":1.00000,"k":704,"kl":0.00000},{"layer":1,"frac":1.00000,"k":704,"kl":0.00000},{"layer":2,"frac":1.00000,"k":704,"kl":0.00000},{"layer":3,"frac":1.00000,"k":704,"kl":0.00000},{"layer":4,"frac":1.00000,"k":704,"kl":0.00000},{"layer":5,"frac":1.00000,"k":704,"kl":0.00000},{"layer":6,"frac":1.00000,"k":704,"kl":0.00000},{"layer":7,"frac":1.00000,"k":704,"kl":0.00000},{"layer":8,"frac":1.00000,"k":704,"kl":0.00000},{"layer":9,"frac":1.00000,"k":704,"kl":0.00000},{"layer":10,"frac":1.00000,"k":704,"kl":0.00000},{"layer":11,"frac":1.00000,"k":704,"kl":0.00000},{"layer":12,"frac":1.00000,"k":704,"kl":0.00000},{"layer":13,"frac":1.00000,"k":704,"kl":0.00000},{"layer":14,"frac":0.25000,"k":176,"kl":0.01570},{"layer":15,"frac":0.25000,"k":176,"kl":0.03056},{"layer":16,"frac":0.25000,"k":176,"kl":0.02999},{"layer":17,"frac":0.06250,"k":44,"kl":0.04416},{"layer":18,"frac":0.12500,"k":88,"kl":0.01505},{"layer":19,"frac":0.01562,"k":11,"kl":0.04345},{"layer":20,"frac":0.03125,"k":22,"kl":0.03482},{"layer":21,"frac":0.01562,"k":11,"kl":0.03814},{"layer":22,"frac":0.25000,"k":176,"kl":0.01175},{"layer":23,"frac":0.01562,"k":11,"kl":0.01962},{"layer":24,"frac":0.06250,"k":44,"kl":0.04340},{"layer":25,"frac":0.01562,"k":11,"kl":0.01889},{"layer":26,"frac":0.01562,"k":11,"kl":0.04862},{"layer":27,"frac":0.01562,"k":11,"kl":0.03558},{"layer":28,"frac":0.06250,"k":44,"kl":0.03079},{"layer":29,"frac":0.25000,"k":176,"kl":0.01828}],
+    "kl_divergence": {"threshold": 0.05, "n_prompts": 4},
+    "perplexity_delta_pct": -9.8789,
+    "nll_bits_dense_mean": 12.4433,
+    "nll_bits_comp_mean": 12.2932,
+    "argmax_drift_pct": 50.0000,
+    "first_divergence_pos": 2,
+    "bytes_touched_per_token": {"cheap_frac": 0.52292, "cheap_factor": 1.9124, "oracle_frac": 0.84097, "oracle_factor": 1.1891},
+    "cheap_route": {"strided_realizable_pct": 6.25, "by_layer": [{"layer":14,"frac":0.25000,"oracle_kl":0.01570,"strided_kl":0.40887},{"layer":15,"frac":0.25000,"oracle_kl":0.03056,"strided_kl":1.59063},{"layer":16,"frac":0.25000,"oracle_kl":0.02999,"strided_kl":0.31253},{"layer":17,"frac":0.06250,"oracle_kl":0.04416,"strided_kl":1.29793},{"layer":18,"frac":0.12500,"oracle_kl":0.01505,"strided_kl":0.56587},{"layer":19,"frac":0.01562,"oracle_kl":0.04345,"strided_kl":0.19726},{"layer":20,"frac":0.03125,"oracle_kl":0.03482,"strided_kl":0.34837},{"layer":21,"frac":0.01562,"oracle_kl":0.03814,"strided_kl":0.41167},{"layer":22,"frac":0.25000,"oracle_kl":0.01175,"strided_kl":0.04126},{"layer":23,"frac":0.01562,"oracle_kl":0.01962,"strided_kl":0.06913},{"layer":24,"frac":0.06250,"oracle_kl":0.04340,"strided_kl":0.12835},{"layer":25,"frac":0.01562,"oracle_kl":0.01889,"strided_kl":0.11863},{"layer":26,"frac":0.01562,"oracle_kl":0.04862,"strided_kl":0.16210},{"layer":27,"frac":0.01562,"oracle_kl":0.03558,"strided_kl":0.08686},{"layer":28,"frac":0.06250,"oracle_kl":0.03079,"strided_kl":0.38467},{"layer":29,"frac":0.25000,"oracle_kl":0.01828,"strided_kl":1.19011}]}
+  },
+  "notes": "within-expert feature routing on MoE experts; ActMagnitude oracle (gate+up still paid); Phase B is the claim gate (held-text NLL + drift); selector ActMagnitude vs Strided for cheap-route realizability"
+}

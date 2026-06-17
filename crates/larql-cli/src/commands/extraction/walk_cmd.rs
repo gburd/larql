@@ -453,6 +453,25 @@ fn run_with_vindex_weights(
     run_predict_inner(&weights, &tokenizer, args, index)
 }
 
+/// Build the Metal compute backend for `--metal`, or a clear error when the
+/// crate was built without the `gpu` feature (or off macOS). Split by `cfg`
+/// so the gpu-off build rejects through a normal `Result` — a diverging
+/// `let backend = { … return Err … }` binding would otherwise mark all
+/// downstream code unreachable and its locals unused in the gpu-off compile.
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
+{
+    let b = larql_compute_metal::MetalBackend::new()
+        .ok_or("Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac.")?;
+    Ok(Box::new(b))
+}
+
+#[cfg(not(all(feature = "gpu", target_os = "macos")))]
+fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
+{
+    Err("`--metal` requires the `gpu` feature on macOS".into())
+}
+
 /// Predict against a Q4_K / Q6_K vindex: dequantise each layer's attn + FFN
 /// weights just-in-time, run the standard f32 forward block, drop, repeat.
 /// Same observable output as [`run_predict_inner`] — just a different memory
@@ -539,20 +558,7 @@ fn run_predict_q4k(
         // through to CPU's `generate_via_cpu_q4k` fallback which
         // produces degenerate output ("ikea ikea ikea…"), masquerading
         // as a Granite/Gemma forward-path regression.
-        let backend: Box<dyn larql_compute::ComputeBackend> = {
-            #[cfg(all(feature = "gpu", target_os = "macos"))]
-            {
-                let b = larql_compute_metal::MetalBackend::new().ok_or(
-                    "Metal backend unavailable — rebuild with `--features gpu` \
-                     on an M-series Mac.",
-                )?;
-                Box::new(b)
-            }
-            #[cfg(not(all(feature = "gpu", target_os = "macos")))]
-            {
-                return Err("`--metal` requires the `gpu` feature on macOS".into());
-            }
-        };
+        let backend: Box<dyn larql_compute::ComputeBackend> = metal_backend_box()?;
         if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
             return Err("Metal backend doesn't report Q4_K support — \
                  check `larql diag <vindex>` for backend capabilities."

@@ -588,6 +588,191 @@ pub fn q4k_q8k_matvec_neon_2row(
     }
 }
 
+/// Hand-asm inner loop (C12 Phase 1): the per-super-block scaled integer dot
+/// `sum1 = Σ_sb scale[sb] · Σ_i nibble[sb][i]·y[sb][i]`, computed in one
+/// `asm!` block so the schedule is ours, not LLVM's.
+///
+/// Returns the same i32 `sum1` as the intrinsic / scalar paths (integer math
+/// is exact regardless of order), so the f32 epilogue and `sum2` stay in Rust
+/// and bit-parity reduces to "does this produce the same `sum1`".
+///
+/// vs `q4k_q8k_matvec_neon`'s inner loop it kills the 8 scalar `ldrb` scale
+/// loads + scalar→vector broadcast: the 8 6-bit scales arrive as two i32x4
+/// vectors and the per-sub-block scale is applied with `mul (by element)`.
+/// The roofline microbench (`benches/q4k_q8k_matvec.rs`) showed the kernel is
+/// compute/issue-bound (~33 cyc/super-block), not DRAM-bound, so cutting
+/// issue-port pressure is the lever — see `docs/q4k-decode-kernel.md`
+/// §"2026-06-02 roofline measurement".
+///
+/// Layout (matches `q4k_q8k_matvec_neon` exactly): the 128 nibble bytes walk
+/// in 4 groups of 32; group `g` low nibbles → sub-block `2g`, high nibbles →
+/// `2g+1`. Activation walks in 4 groups of 64 i8 (two sub-blocks each). Both
+/// pointers post-increment through the super-block.
+///
+/// SAFETY: `quants` must point to ≥128 readable bytes, `act` to ≥256, and
+/// `scales` to an 8-element i32 array. Requires the `dotprod` extension (SDOT),
+/// baseline on `aarch64-apple-darwin` — same assumption as `sdot_acc`.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+unsafe fn q4k_sb_sum1_asm(quants: *const u8, act: *const i8, scales: *const i32) -> i32 {
+    let sum1: i32;
+    // One group of the unrolled body, parameterised by the two scale lanes
+    // (`$sv` = scale vector, `$l0`/`$l1` = lane indices for sub-blocks 2g/2g+1).
+    // Single running accumulator `v17`: a 4-private-accumulator variant was
+    // tried 2026-06-02 to break the per-super-block RAW chain but showed no
+    // reliable gain — the asm/neon ratio swings ±1.5% run-to-run (observed
+    // +3.7%..+4.9% for THIS form), larger than any v1↔4-acc difference. The
+    // row loop inlines this fn, so the OoO core already overlaps the next
+    // super-block's compute with this accumulator chain; the chain isn't the
+    // bottleneck. See `docs/q4k-decode-kernel.md` §"Finding — latency-hiding
+    // has low headroom".
+    macro_rules! grp {
+        ($sv:literal, $l0:literal, $l1:literal) => {
+            concat!(
+                "ld1 {{v0.16b, v1.16b}}, [{q}], #32\n",
+                "ld1 {{v20.16b, v21.16b, v22.16b, v23.16b}}, [{a}], #64\n",
+                "and  v2.16b, v0.16b, v16.16b\n", // lo0 (sub-block 2g, lanes 0..16)
+                "and  v3.16b, v1.16b, v16.16b\n", // lo1 (sub-block 2g, lanes 16..32)
+                "ushr v4.16b, v0.16b, #4\n",      // hi0 (sub-block 2g+1)
+                "ushr v5.16b, v1.16b, #4\n",      // hi1
+                "movi v6.4s, #0\n",
+                "movi v7.4s, #0\n",
+                "sdot v6.4s, v2.16b, v20.16b\n", // dot[2g]   lanes += lo0·y
+                "sdot v6.4s, v3.16b, v21.16b\n", //            += lo1·y
+                "sdot v7.4s, v4.16b, v22.16b\n", // dot[2g+1] += hi0·y
+                "sdot v7.4s, v5.16b, v23.16b\n", //            += hi1·y
+                "mul  v6.4s, v6.4s, ",
+                $sv,
+                ".s[",
+                $l0,
+                "]\n", // × scale[2g]
+                "mul  v7.4s, v7.4s, ",
+                $sv,
+                ".s[",
+                $l1,
+                "]\n", // × scale[2g+1]
+                "add  v17.4s, v17.4s, v6.4s\n",
+                "add  v17.4s, v17.4s, v7.4s\n",
+            )
+        };
+    }
+    unsafe {
+        core::arch::asm!(
+            "movi v16.16b, #0x0f",                  // nibble mask
+            "movi v17.4s, #0",                      // sum1 accumulator (i32x4)
+            "ld1 {{v18.4s, v19.4s}}, [{scales}]",   // scales[0..4], scales[4..8]
+            grp!("v18", "0", "1"),                  // group 0 → sub-blocks 0,1
+            grp!("v18", "2", "3"),                  // group 1 → sub-blocks 2,3
+            grp!("v19", "0", "1"),                  // group 2 → sub-blocks 4,5
+            grp!("v19", "2", "3"),                  // group 3 → sub-blocks 6,7
+            "addv s17, v17.4s",                     // horizontal sum of the 4 lanes
+            "fmov {sum1:w}, s17",
+            q = inout(reg) quants => _,
+            a = inout(reg) act => _,
+            scales = in(reg) scales,
+            sum1 = out(reg) sum1,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            options(nostack, readonly),
+        );
+    }
+    sum1
+}
+
+/// Hand-asm Q4_K × Q8_K matvec (C12 Phase 1). Identical interface and output
+/// to [`q4k_q8k_matvec_neon`] — `sum1` comes from [`q4k_sb_sum1_asm`], the
+/// `sum2` term and f32 epilogue are the same Rust code, so it is bit-exact
+/// with the scalar reference (`q8k_matvec_asm_matches_scalar_bit_exact`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn q4k_q8k_matvec_asm(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(out.len(), rows);
+    debug_assert_eq!(q8k_x.qs.len(), cols);
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    if rows == 0 || cols == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    if w.len() < rows * row_bytes {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+        for sb in 0..n_blocks {
+            let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+            let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let (scales, mins) = unpack_scales_mins(&block[4..16]);
+            let quants_ptr = block[16..].as_ptr();
+
+            // Scales as i32 for the `ld1 {v18,v19}` load inside the asm.
+            let sc = [
+                scales[0] as i32,
+                scales[1] as i32,
+                scales[2] as i32,
+                scales[3] as i32,
+                scales[4] as i32,
+                scales[5] as i32,
+                scales[6] as i32,
+                scales[7] as i32,
+            ];
+
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_qs_ptr = q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK].as_ptr();
+            let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
+            let d_y = q8k_x.d[sb];
+
+            // SAFETY: a Q4_K super-block is 144 bytes (16 header + 128 quants),
+            // `q8_qs_ptr` spans a full 256-i8 super-block, `sc` is 8 i32.
+            let sum1 = unsafe { q4k_sb_sum1_asm(quants_ptr, q8_qs_ptr, sc.as_ptr()) };
+
+            // sum2 stays scalar (precomputed Q8_K sums; no SDOT) — identical
+            // to the neon path so the f32 epilogue is bit-for-bit the same.
+            let mut sum2_acc: i32 = 0;
+            for s in 0..SUBBLOCKS_PER_BLOCK {
+                sum2_acc += mins[s] as i32 * q8_sums[s] as i32;
+            }
+            acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2_acc as f32;
+        }
+        *out_slot = acc;
+    }
+}
+
+/// C12 opt-in: route Q4_K × Q8_K matvecs through the hand-asm kernel
+/// (`q4k_q8k_matvec_asm`) instead of the intrinsic path when `LARQL_Q4K_ASM`
+/// is `1`/`true`. Read once and cached — the env lookup must not land in the
+/// per-token hot loop. Default off; both paths are bit-exact.
+/// Pure parse of the `LARQL_Q4K_ASM` opt-in value (`1`/`true` → on).
+/// Split out so the truth table is unit-testable without touching the
+/// process environment or the `OnceLock` cache below.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn q4k_asm_flag_enabled(val: Option<&str>) -> bool {
+    matches!(val, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn use_asm_kernel() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| q4k_asm_flag_enabled(std::env::var("LARQL_Q4K_ASM").ok().as_deref()))
+}
+
 /// Public entry point: dispatches to NEON on aarch64, scalar elsewhere.
 /// Caller pre-quantises `x` once via `quantize_x_to_q8k` (cost is amortised
 /// across all rows of the same matvec, and across all K active experts that
@@ -607,7 +792,18 @@ pub fn q4k_q8k_matvec_into(
         // sharing the small activation Q8K (256 B) across 2 rows didn't
         // free real DRAM bandwidth.  Kept as `q4k_q8k_matvec_neon_2row`
         // for future hardware where ILP may dominate over BW.
-        q4k_q8k_matvec_neon(out, q8k_x, w, rows, cols);
+        // (NB: the "BW-bound" read was overturned 2026-06-02 — the kernel
+        // is compute/issue-bound, see `docs/q4k-decode-kernel.md`.)
+        //
+        // C12: opt-in hand-asm kernel (`LARQL_Q4K_ASM=1`). Bit-exact with
+        // the intrinsic path; ~+2.5% isolated. Default off until the
+        // two-super-block-interleaved version closes more of the gap and
+        // the gate_up fused path gets the same treatment.
+        if use_asm_kernel() {
+            q4k_q8k_matvec_asm(out, q8k_x, w, rows, cols);
+        } else {
+            q4k_q8k_matvec_neon(out, q8k_x, w, rows, cols);
+        }
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -1243,6 +1439,93 @@ mod tests {
                 (out_scalar[r] - out_neon[r]).abs()
             );
         }
+    }
+
+    /// C12 hand-asm kernel must be bit-identical to the scalar reference —
+    /// it computes the same i32 `sum1`, same `sum2`, same f32 epilogue.
+    /// Exercises several shapes: odd rows (tail-free in this kernel), a
+    /// production attention width (2560), and a multi-super-block FFN width.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q8k_matvec_asm_matches_scalar_bit_exact() {
+        for &(rows, cols) in &[(7usize, 1024usize), (8, 2560), (3, 2560), (16, 512)] {
+            // Non-symmetric, non-monotonic inputs so a lane/byte-swap bug
+            // can't accidentally produce the right sum.
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+                })
+                .collect();
+            let w_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+                })
+                .collect();
+            let w_q4 = quantize_q4_k(&w_f32);
+            let q8 = quantize_x_to_q8k(&x);
+
+            let mut out_scalar = vec![0.0f32; rows];
+            let mut out_asm = vec![0.0f32; rows];
+            q4k_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q4, rows, cols);
+            q4k_q8k_matvec_asm(&mut out_asm, &q8, &w_q4, rows, cols);
+
+            for r in 0..rows {
+                assert_eq!(
+                    out_scalar[r].to_bits(),
+                    out_asm[r].to_bits(),
+                    "rows={rows} cols={cols} row {r}: scalar={} asm={} diff={}",
+                    out_scalar[r],
+                    out_asm[r],
+                    (out_scalar[r] - out_asm[r]).abs()
+                );
+            }
+        }
+    }
+
+    /// Asm kernel's early-return guards (zero dims, short weight buffer)
+    /// must zero the output, same as the scalar/neon paths.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q8k_matvec_asm_zero_dims_and_short_weights_zero_output() {
+        // cols == 0 → early return.
+        let empty = Q8KActivation {
+            qs: vec![],
+            d: vec![],
+            sums: vec![],
+        };
+        let mut out = vec![1.0f32; 4];
+        q4k_q8k_matvec_asm(&mut out, &empty, &[], 4, 0);
+        assert!(out.iter().all(|&v| v == 0.0), "zero-dims must zero output");
+
+        // w shorter than rows * row_bytes → early return.
+        let cols = 256;
+        let rows = 2;
+        let q = quantize_x_to_q8k(&vec![0.5f32; cols]);
+        let w = vec![0u8; BLOCK_BYTES]; // one row's worth, but rows == 2
+        let mut out = vec![1.0f32; rows];
+        q4k_q8k_matvec_asm(&mut out, &q, &w, rows, cols);
+        assert!(
+            out.iter().all(|&v| v == 0.0),
+            "short buffer must zero output"
+        );
+    }
+
+    /// `LARQL_Q4K_ASM` opt-in truth table (the pure parse behind the
+    /// `OnceLock`-cached `use_asm_kernel`).
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q4k_asm_flag_truth_table() {
+        assert!(q4k_asm_flag_enabled(Some("1")));
+        assert!(q4k_asm_flag_enabled(Some("true")));
+        assert!(q4k_asm_flag_enabled(Some("TRUE")));
+        assert!(q4k_asm_flag_enabled(Some("True")));
+        assert!(!q4k_asm_flag_enabled(Some("0")));
+        assert!(!q4k_asm_flag_enabled(Some("false")));
+        assert!(!q4k_asm_flag_enabled(Some("yes")));
+        assert!(!q4k_asm_flag_enabled(Some("")));
+        assert!(!q4k_asm_flag_enabled(None));
     }
 
     /// `quantize_x_to_q8k_into` must produce the same `qs`, `d`, `sums` as

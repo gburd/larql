@@ -4,7 +4,7 @@
 //! Primary use: exp 26 Q2 (FP4 end-to-end correctness) via
 //!
 //!     cargo run --release -p larql-kv --example vindex_compare -- \
-//!         --reference output/gemma3-4b-f16.vindex \
+//!         --reference output/gemma3-4b-fresh.vindex \
 //!         --candidate output/gemma3-4b-fp4.vindex \
 //!         --prompts   ~/chris-source/chris-experiments/routing/26_fp4_quantisation/prompts.txt \
 //!         --out       ~/chris-source/chris-experiments/routing/26_fp4_quantisation/results/q2_fp4.json

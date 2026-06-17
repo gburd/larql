@@ -1,5 +1,11 @@
 # larql-core Roadmap
 
+## Hardening — codebase review 2026-05-28
+
+From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
+
+- **P1 — NaN confidence panics a walk.** `partial_cmp().unwrap()` at `graph.rs:278`, `walk.rs:35`, `pagerank.rs:19` panics on NaN confidence loaded from packed/msgpack files. Route through the shared NaN-safe helper (workspace-wide cleanup).
+
 `larql-core` owns the in-memory graph model, graph algorithms, lightweight
 model-provider extraction helpers, and portable graph serialization formats.
 It should stay independent of vindex storage and inference internals: higher

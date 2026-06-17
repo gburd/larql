@@ -4,7 +4,7 @@
 //! Also includes Q4 quantized attention projection and KV-capture attention.
 
 use super::gqa::gqa_attention_with_weights;
-use super::rope::apply_rope_partial;
+use super::rope::{apply_rope_partial, apply_rope_partial_at_full};
 use super::AttentionWeights;
 use ndarray::Array2;
 
@@ -227,10 +227,31 @@ pub fn run_attention_with_kv_backend(
         None => k,
     };
 
-    let rb = arch.rope_base_for_layer(layer);
+    // RoPE must match the full-recompute path (block.rs core) and the
+    // decode-step path (decode.rs): use the forward-override-effective base,
+    // the per-layer-type position divisor, and llama3 scaling. The old
+    // `apply_rope_partial` hardcoded position_divisor=1.0 / llama3=None, which
+    // silently dropped Gemma 4's scaled global-layer RoPE — garbling decode
+    // through the KvEngine prefill path while the decode-step path was correct.
+    // RoPE must match the full-recompute path (block.rs core) and the
+    // decode-step path (decode.rs): use the forward-override-effective base,
+    // the per-layer-type position divisor, and llama3 scaling. The old
+    // `apply_rope_partial` hardcoded position_divisor=1.0 / llama3=None, which
+    // silently dropped Gemma 4's scaled global-layer RoPE — garbling decode
+    // through the KvEngine prefill path while the decode-step path was correct.
+    // RoPE must match the full-recompute path (block.rs core) and the
+    // decode-step path (decode.rs): use the forward-override-effective base,
+    // the per-layer-type position divisor, and llama3 scaling. The old
+    // `apply_rope_partial` hardcoded position_divisor=1.0 / llama3=None, which
+    // silently dropped Gemma 4's scaled global-layer RoPE — garbling decode
+    // through the KvEngine prefill path while the decode-step path was correct.
+    let rb = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rf = arch.rotary_fraction_for_layer(layer);
-    let q_r = apply_rope_partial(&q, nq, hd, rb, rf);
-    let k_r = apply_rope_partial(&k, nkv, hd, rb, rf);
+    let pos_divisor =
+        crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
+    let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
+    let q_r = apply_rope_partial_at_full(&q, nq, hd, rb, rf, 0, pos_divisor, llama3);
+    let k_r = apply_rope_partial_at_full(&k, nkv, hd, rb, rf, 0, pos_divisor, llama3);
 
     let (attn_out, _) = gqa_attention_with_weights(
         &q_r,
@@ -419,6 +440,38 @@ mod tests {
         assert_eq!(k.shape(), &[2, kv_dim]);
         assert_eq!(v.shape(), &[2, kv_dim]);
         assert!(h_out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_attention_with_kv_backend_matches_full_recompute_on_gemma3() {
+        // Regression guard for the prefill-RoPE divergence (2026-05-28): the
+        // engine prefill (`run_attention_with_kv_backend`, used by the
+        // KvEngine dispatch path) must produce the same post-attention hidden
+        // as the validated full-recompute path
+        // (`run_attention_block_with_kv_out`). The bug: engine prefill used
+        // unscaled `apply_rope_partial` (position_divisor=1.0, llama3=None),
+        // dropping Gemma 3/4's scaled RoPE on global-attention layers. Gemma 3
+        // exercises a scaled-RoPE layer type, so this diverges if the engine
+        // ever stops using the forward-override-effective RoPE params.
+        // Rope-scaled fixture: 6 layers, layer 5 is global (position_divisor=8),
+        // sliding layers stay at 1.0 — so the scaled-RoPE path is exercised.
+        let weights = larql_models::test_fixtures::make_gemma3_rope_scaled_test_weights();
+        let input = h(5, weights.hidden_size);
+        for layer in 0..weights.num_layers {
+            let engine =
+                run_attention_with_kv_backend(&weights, &input, layer, Some(&crate::CpuBackend))
+                    .expect("engine attention");
+            let recompute = crate::attention::block::run_attention_block_with_kv_out(
+                &weights, &input, layer, false, None,
+            )
+            .expect("full-recompute attention");
+            for (a, b) in engine.0.iter().zip(recompute.0.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "L{layer} post-attention hidden diverged: engine {a} vs recompute {b}"
+                );
+            }
+        }
     }
 
     #[test]

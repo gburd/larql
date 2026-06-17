@@ -59,6 +59,10 @@ def parse_args():
     p.add_argument("--offline", action="store_true", default=True)
     p.add_argument("--limit-subjects", type=int, default=None,
                    help="Cap subjects per relation for fast smoke-test")
+    p.add_argument("--scan-end-layer", type=int, default=None,
+                   help="Override scan range to L0..scan_end_layer-1.")
+    p.add_argument("--output-suffix", type=str, default="",
+                   help="Suffix appended to output filenames (e.g., '_l20')")
     return p.parse_args()
 
 
@@ -88,8 +92,9 @@ def main():
     num_layers = config["num_layers"]
     print(f"  {num_layers} layers, {config['hidden_size']} hidden, {len(down_meta)} features")
 
-    # Use vindex layer_bands if available
-    if "layer_bands" in config and config["layer_bands"]:
+    if args.scan_end_layer is not None:
+        syntax_end = min(args.scan_end_layer, num_layers)
+    elif "layer_bands" in config and config["layer_bands"]:
         bands = config["layer_bands"]
         syntax_end = bands.get("knowledge_start", num_layers * 2 // 5)
     else:
@@ -194,11 +199,11 @@ def main():
                     continue
                 r = residuals[layer]
                 scores = gates[layer] @ r
-                top_indices = np.argsort(-np.abs(scores))[:args.top_k]
+                top_indices = np.argsort(-scores)[:args.top_k]
 
                 for feat_idx in top_indices:
                     score = float(scores[feat_idx])
-                    if abs(score) < args.min_gate_score:
+                    if score < args.min_gate_score:
                         continue
                     tokens = down_meta.get((layer, int(feat_idx)), [])
                     if not tokens:
@@ -257,12 +262,13 @@ def main():
             print(f"  {rel:<25s} {count:4d}")
 
     # ── Save (separate file — does NOT merge into canonical) ──
-    pilot_path = Path(vindex_path) / "feature_labels_multilingual_pilot.json"
+    suffix = getattr(args, 'output_suffix', '')
+    pilot_path = Path(vindex_path) / f"feature_labels_multilingual_pilot{suffix}.json"
     with open(pilot_path, "w") as f:
         json.dump(pilot_labels, f, indent=2, ensure_ascii=False)
     print(f"\nPilot labels -> {pilot_path}")
 
-    details_path = Path(vindex_path) / "feature_labels_multilingual_pilot_rich.json"
+    details_path = Path(vindex_path) / f"feature_labels_multilingual_pilot{suffix}_rich.json"
     with open(details_path, "w") as f:
         json.dump(label_details, f, indent=2, ensure_ascii=False)
     print(f"Pilot details -> {details_path}")
@@ -319,7 +325,7 @@ def main():
         print("  Read the branch with caution; antonym source pairs carry ~17% noise.")
 
     # Persist decision record for the writeup
-    decision_path = Path(vindex_path) / "feature_labels_multilingual_pilot_decision.json"
+    decision_path = Path(vindex_path) / f"feature_labels_multilingual_pilot{suffix}_decision.json"
     with open(decision_path, "w") as f:
         json.dump({
             "pilot_status": "PILOT_RESULT — NOT MERGED INTO CANONICAL",

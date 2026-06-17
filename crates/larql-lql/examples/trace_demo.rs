@@ -22,26 +22,43 @@
 use larql_lql::{parse, Session};
 use std::path::Path;
 
-const SOURCE_VINDEX: &str = "output/gemma3-4b-f16.vindex";
+/// Source vindexes the demo tries, in preference order — first existing
+/// wins. Override with `LARQL_DEMO_VINDEX=path/to.vindex`. All need model
+/// weights (TRACE runs a full forward pass with capture).
+const SOURCE_CANDIDATES: &[&str] = &[
+    "output/gemma3-4b-fresh.vindex",
+    "output/gemma3-4b-f16.vindex",
+];
+
+/// First existing candidate (or `$LARQL_DEMO_VINDEX`), else `None`.
+fn resolve_source_vindex() -> Option<String> {
+    if let Ok(p) = std::env::var("LARQL_DEMO_VINDEX") {
+        return Path::new(&p).exists().then_some(p);
+    }
+    SOURCE_CANDIDATES
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|s| (*s).to_string())
+}
 
 fn main() {
     println!("=== LQL TRACE demo (residual stream decomposition) ===\n");
 
-    if !Path::new(SOURCE_VINDEX).exists() {
-        println!("  skipped: source vindex not found at {SOURCE_VINDEX}");
+    let Some(source_vindex) = resolve_source_vindex() else {
+        println!("  skipped: no source vindex found (looked for {SOURCE_CANDIDATES:?})");
         println!();
-        println!("  To run this demo, extract a vindex with model weights:");
-        println!("    larql extract-index google/gemma-3-4b-it -o {SOURCE_VINDEX} --level inference --f16");
+        println!("  Set LARQL_DEMO_VINDEX, or extract a vindex with model weights:");
+        println!("    larql extract-index google/gemma-3-4b-it -o output/gemma3-4b-fresh.vindex --level inference --f16");
         println!();
         println!("  This is intentional — the example still compiles in CI");
         println!("  without the multi-GB vindex on disk.");
         return;
-    }
+    };
 
     let mut session = Session::new();
     run(
         &mut session,
-        &format!(r#"USE "{SOURCE_VINDEX}";"#),
+        &format!(r#"USE "{source_vindex}";"#),
         "USE source vindex",
     );
 

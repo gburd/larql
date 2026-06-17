@@ -1208,6 +1208,7 @@ impl PyVindex {
                 self.knn_store.as_ref(),
                 &token_ids,
                 top_k_predictions,
+                &larql_inference::KnnRouteMode::from_env(),
             );
             Ok(result.predictions)
         })
@@ -1358,6 +1359,7 @@ impl PyVindex {
                 self.knn_store.as_ref(),
                 &token_ids,
                 top_k_predictions,
+                &larql_inference::KnnRouteMode::from_env(),
             );
 
             let residuals: Vec<(usize, Bound<'py, PyArray1<f32>>)> = result

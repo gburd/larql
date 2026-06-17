@@ -5,7 +5,8 @@
 //! fact survives the bake without the patch overlay being present.
 //!
 //! Flow:
-//!   1. USE an existing vindex (looks for output/gemma3-4b-f16.vindex).
+//!   1. USE an existing vindex (the first of SOURCE_CANDIDATES that exists,
+//!      e.g. output/gemma3-4b-fresh.vindex; override with LARQL_DEMO_VINDEX).
 //!   2. INFER baseline (gives a "before" snapshot).
 //!   3. BEGIN PATCH + INSERT Atlantis → Poseidon (multi-layer constellation).
 //!   4. INFER → expect "Pose" at #1 (with patch active).
@@ -24,23 +25,40 @@ use larql_lql::{parse, Session};
 use std::path::Path;
 use std::time::Instant;
 
-const SOURCE_VINDEX: &str = "output/gemma3-4b-f16.vindex";
+/// Source vindexes the demo tries, in preference order — first existing
+/// wins. Override with `LARQL_DEMO_VINDEX=path/to.vindex`. All need model
+/// weights (COMPILE bakes them into the output `down_weights.bin`).
+const SOURCE_CANDIDATES: &[&str] = &[
+    "output/gemma3-4b-fresh.vindex",
+    "output/gemma3-4b-f16.vindex",
+];
+
+/// First existing candidate (or `$LARQL_DEMO_VINDEX`), else `None`.
+fn resolve_source_vindex() -> Option<String> {
+    if let Ok(p) = std::env::var("LARQL_DEMO_VINDEX") {
+        return Path::new(&p).exists().then_some(p);
+    }
+    SOURCE_CANDIDATES
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|s| (*s).to_string())
+}
 
 fn main() {
     println!("=== LQL COMPILE Demo (end-to-end against real vindex) ===\n");
 
-    if !Path::new(SOURCE_VINDEX).exists() {
-        println!("  skipped: source vindex not found at {SOURCE_VINDEX}");
+    let Some(source_vindex) = resolve_source_vindex() else {
+        println!("  skipped: no source vindex found (looked for {SOURCE_CANDIDATES:?})");
         println!();
-        println!("  To run this demo, first extract a vindex with model weights:");
+        println!("  Set LARQL_DEMO_VINDEX, or first extract a vindex with model weights:");
         println!("    cargo run -p larql-cli --release -- repl");
         println!("    > EXTRACT MODEL \"google/gemma-3-4b-it\"");
-        println!("           INTO \"{SOURCE_VINDEX}\" WITH ALL;");
+        println!("           INTO \"output/gemma3-4b-fresh.vindex\" WITH ALL;");
         println!();
         println!("  This is intentional — the example still compiles in CI");
         println!("  without the multi-GB vindex on disk.");
         return;
-    }
+    };
 
     let compiled_path = std::env::temp_dir()
         .join("larql_compile_demo.vindex")
@@ -58,7 +76,7 @@ fn main() {
 
     run(
         &mut session,
-        &format!(r#"USE "{SOURCE_VINDEX}";"#),
+        &format!(r#"USE "{source_vindex}";"#),
         "USE source",
     );
 
@@ -213,7 +231,7 @@ fn main() {
 
     // ── Summary ──
     section("Summary");
-    println!("  Source vindex:   {SOURCE_VINDEX}");
+    println!("  Source vindex:   {source_vindex}");
     println!("  Compiled vindex: {compiled_path}");
     println!();
     println!("  Baseline (no patch):");
