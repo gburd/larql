@@ -13,7 +13,7 @@ pub mod moe_svd;
 pub mod stage_labels;
 pub mod streaming;
 
-pub use build::build_vindex;
+pub use build::{build_vindex, build_vindex_dense_only};
 pub use build_from_vectors::build_vindex_from_vectors;
 pub use callbacks::{IndexBuildCallbacks, SilentBuildCallbacks};
 pub use checkpoint::{Checkpoint, ExtractPhase, CHECKPOINT_FILE};

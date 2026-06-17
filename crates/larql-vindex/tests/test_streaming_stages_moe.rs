@@ -947,6 +947,8 @@ fn streaming_extract_mixtral_with_drop_gate_vectors_removes_zero_byte_file() {
         WriteWeightsOptions {
             level: ExtractLevel::Browse,
             ffn_compact: false,
+            skip_attn: false,
+            skip_ffn: false,
         },
         KquantWriteOptions::default(),
         true, // drop_gate_vectors

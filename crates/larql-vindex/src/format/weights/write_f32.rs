@@ -246,6 +246,20 @@ pub struct WriteWeightsOptions {
     /// not reconstruct hidden-major tensors from compact feature-major
     /// files and will reject compact vindexes with a clear error.
     pub ffn_compact: bool,
+
+    /// Skip the attention projection tensors entirely (no
+    /// `attn_weights.bin`).  Used by the dense-only BitNet build:
+    /// the I2_S attention projections live in the `bitnet/`
+    /// artifacts, so expanding them to dense f32 here would write
+    /// ~2 GB of duplicate weights the BitNet forward pass never
+    /// reads.  Norms are still written (they are not attention
+    /// *projections* and the BitNet forward pass needs them).
+    pub skip_attn: bool,
+
+    /// Skip the FFN projection tensors entirely (no
+    /// `up_weights.bin` / `down_weights.bin`).  Companion to
+    /// `skip_attn` for the dense-only BitNet build.
+    pub skip_ffn: bool,
 }
 
 impl Default for WriteWeightsOptions {
@@ -253,6 +267,8 @@ impl Default for WriteWeightsOptions {
         Self {
             level: crate::ExtractLevel::All,
             ffn_compact: false,
+            skip_attn: false,
+            skip_ffn: false,
         }
     }
 }
@@ -314,9 +330,15 @@ pub fn write_model_weights_with_opts(
     let mut entries: Vec<WeightEntry> = Vec::new();
 
     // ── Attention weights ── (skipped when level < Attention)
-    let write_attn = opts.level.writes_attn();
-    let write_ffn = opts.level.writes_ffn() && !opts.ffn_compact;
+    let write_attn = opts.level.writes_attn() && !opts.skip_attn;
+    let write_ffn = opts.level.writes_ffn() && !opts.ffn_compact && !opts.skip_ffn;
     let write_lm_head = opts.level.writes_lm_head();
+    // Norms are written whenever the level includes attention, even
+    // if the attention *projections* are skipped (`skip_attn`): the
+    // BitNet dense-only build skips the I2_S-backed projections but
+    // still needs every RMSNorm (input/post-attention/sub-norms),
+    // since the forward pass normalises activations with them.
+    let write_norms = opts.level.writes_attn();
 
     if write_attn {
         let attn_path = dir.join(ATTN_WEIGHTS_BIN);
@@ -570,8 +592,9 @@ pub fn write_model_weights_with_opts(
         down_file.flush()?;
     } // end if write_ffn
 
-    // ── Norms ── (paired with attention; skipped when level < Attention)
-    if write_attn {
+    // ── Norms ── (written whenever the level includes attention;
+    // independent of `skip_attn`, which only drops projections)
+    if write_norms {
         let norms_path = dir.join(NORMS_BIN);
         let mut norms_file = BufWriter::new(std::fs::File::create(&norms_path)?);
         let mut norms_offset: u64 = 0;
