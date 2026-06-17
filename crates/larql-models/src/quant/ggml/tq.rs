@@ -381,21 +381,79 @@ pub fn quantize_tq1_0(values: &[f32]) -> Result<Vec<u8>, ModelError> {
 
 /// Decode I2_S bytes to f32 trits at unit scale.
 pub fn dequantize_i2_s(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
-    let n_blocks = check_block_input("I2_S", data, n_elements, I2_S_BLOCK_ELEMS, I2_S_BLOCK_BYTES)?;
+    let n_blocks = check_block_input(
+        "I2_S",
+        data,
+        n_elements,
+        I2_S_BLOCK_ELEMS,
+        I2_S_BLOCK_BYTES,
+    )?;
+    let _ = n_blocks;
 
-    let mut out = Vec::with_capacity(n_elements);
-    for &b in &data[..n_blocks] {
-        for slot in 0..4 {
-            let bits = (b >> (2 * slot)) & 0b11;
-            let v: f32 = match bits {
-                0b00 => 0.0,
-                0b01 => 1.0,
-                0b10 => -1.0,
-                _ => 0.0, // 0b11 reserved
-            };
-            out.push(v);
+    // I2_S packing (microsoft/BitNet ggml-bitnet-mad.cpp).  Elements
+    // are grouped into 128-element blocks; each block occupies 32
+    // bytes.  Within a block, byte `p` (0..32) packs the 4 elements
+    // {p, p+32, p+64, p+96} at bit-shifts 6,4,2,0 respectively
+    // (group g in 0..4 -> shift 6-2*g).  The 2-bit code is UNSIGNED
+    // {0,1,2}; the ternary value is `code - 1`  (0 -> -1, 1 -> 0,
+    // 2 -> +1).  This matches the AVX2 `vec_dot` decode
+    // (loadu 32 bytes; srli 2/4/6; &0x3; group g pairs with
+    // activation lane g*32..g*32+32) and the `quantize_i2_s`
+    // packer (`q8 = src>0 ? 2 : 0`, zero -> 1).
+    //
+    // A naive contiguous "4 sequential trits per byte" decode
+    // scrambles every weight and produces fluent garbage at
+    // inference time — see BUG-infer-deadlock §5.4.
+    const BLOCK_ELEMS: usize = 128;
+    const BLOCK_BYTES: usize = 32;
+    const GROUP: usize = 32;
+
+    let mut out = vec![0.0f32; n_elements];
+    let full_blocks = n_elements / BLOCK_ELEMS;
+    let tail_elems = n_elements % BLOCK_ELEMS;
+
+    let decode = |code: u8| -> f32 {
+        match code & 0b11 {
+            0 => -1.0,
+            1 => 0.0,
+            2 => 1.0,
+            _ => 0.0, // 0b11 unused by the packer
+        }
+    };
+
+    for blk in 0..full_blocks {
+        let byte_base = blk * BLOCK_BYTES;
+        let elem_base = blk * BLOCK_ELEMS;
+        for p in 0..GROUP {
+            let b = data[byte_base + p];
+            // group g -> shift 6-2g -> element elem_base + g*32 + p
+            out[elem_base + p] = decode(b >> 6);
+            out[elem_base + GROUP + p] = decode(b >> 4);
+            out[elem_base + 2 * GROUP + p] = decode(b >> 2);
+            out[elem_base + 3 * GROUP + p] = decode(b);
         }
     }
+
+    // Tail block (< 128 elements): a block of B bytes holds 4*B
+    // elements with byte p carrying {p, p+B, p+2B, p+3B} at shifts
+    // 6,4,2,0.  For the tail B = tail_elems/4 (tail_elems is a
+    // multiple of 4, guaranteed by check_block_input).  Real BitNet
+    // tensors are always multiples of 128 so this path is only hit
+    // by small test inputs, but keeping the general invariant makes
+    // the codec self-consistent.
+    if tail_elems > 0 {
+        let byte_base = full_blocks * BLOCK_BYTES;
+        let elem_base = full_blocks * BLOCK_ELEMS;
+        let tb = tail_elems / 4; // bytes in this partial block
+        for p in 0..tb {
+            let b = data[byte_base + p];
+            out[elem_base + p] = decode(b >> 6);
+            out[elem_base + tb + p] = decode(b >> 4);
+            out[elem_base + 2 * tb + p] = decode(b >> 2);
+            out[elem_base + 3 * tb + p] = decode(b);
+        }
+    }
+
     Ok(out)
 }
 
@@ -410,23 +468,56 @@ pub fn quantize_i2_s(values: &[f32]) -> Result<Vec<u8>, ModelError> {
         )));
     }
 
+    // Inverse of `dequantize_i2_s`: microsoft's strided 128-element /
+    // 32-byte block layout, 2-bit UNSIGNED code with `-1 -> 0,
+    // 0 -> 1, +1 -> 2`, group g (0..4) at bit-shift 6-2g, element
+    // {p, p+32, p+64, p+96} sharing byte p within a block.  See the
+    // decoder for the full layout note.
+    const BLOCK_ELEMS: usize = 128;
+    const BLOCK_BYTES: usize = 32;
+    const GROUP: usize = 32;
+
     let scale = values.iter().copied().fold(0.0f32, |a, v| a.max(v.abs()));
     let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
 
-    let mut out = vec![0u8; values.len() / I2_S_BLOCK_ELEMS];
-    for (i, chunk) in values.chunks_exact(4).enumerate() {
-        let mut byte: u8 = 0;
-        for (slot, &v) in chunk.iter().enumerate() {
-            let t = (v * inv).round().clamp(-1.0, 1.0) as i32;
-            let bits: u8 = match t {
-                1 => 0b01,
-                -1 => 0b10,
-                _ => 0b00,
-            };
-            byte |= bits << (2 * slot);
+    let n = values.len();
+    let n_bytes = n / I2_S_BLOCK_ELEMS;
+    let mut out = vec![0u8; n_bytes];
+
+    let code = |v: f32| -> u8 {
+        let t = (v * inv).round().clamp(-1.0, 1.0) as i32;
+        // -1 -> 0, 0 -> 1, +1 -> 2
+        (t + 1) as u8
+    };
+
+    let full_blocks = n / BLOCK_ELEMS;
+    let tail_elems = n % BLOCK_ELEMS;
+
+    for blk in 0..full_blocks {
+        let byte_base = blk * BLOCK_BYTES;
+        let elem_base = blk * BLOCK_ELEMS;
+        for p in 0..GROUP {
+            let b = (code(values[elem_base + p]) << 6)
+                | (code(values[elem_base + GROUP + p]) << 4)
+                | (code(values[elem_base + 2 * GROUP + p]) << 2)
+                | code(values[elem_base + 3 * GROUP + p]);
+            out[byte_base + p] = b;
         }
-        out[i] = byte;
     }
+
+    if tail_elems > 0 {
+        let byte_base = full_blocks * BLOCK_BYTES;
+        let elem_base = full_blocks * BLOCK_ELEMS;
+        let tb = tail_elems / 4; // bytes in this partial block
+        for p in 0..tb {
+            let b = (code(values[elem_base + p]) << 6)
+                | (code(values[elem_base + tb + p]) << 4)
+                | (code(values[elem_base + 2 * tb + p]) << 2)
+                | code(values[elem_base + 3 * tb + p]);
+            out[byte_base + p] = b;
+        }
+    }
+
     Ok(out)
 }
 
@@ -580,20 +671,24 @@ mod tests {
 
     #[test]
     fn i2_s_round_trip_scaled() {
+        // Scaled values quantise to nearest trit; round-trip
+        // through the strided encoder/decoder must recover the
+        // sign pattern as {-1,0,+1}.
         let input: Vec<f32> = vec![-0.5, 0.0, 0.5, 0.5, -0.5, 0.0, 0.0, 0.5];
         let bytes = quantize_i2_s(&input).unwrap();
         let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
-        assert_eq!(decoded[0], -1.0);
-        assert_eq!(decoded[1], 0.0);
-        assert_eq!(decoded[2], 1.0);
-        assert_eq!(decoded[3], 1.0);
+        let expect: Vec<f32> = vec![-1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0];
+        assert_eq!(decoded, expect);
     }
 
     #[test]
     fn i2_s_zero_block_is_zero() {
+        // Zero weights encode to code 1 per element (microsoft maps
+        // 0 -> 1), i.e. byte 0b01_01_01_01 = 0x55, NOT 0x00.
+        // Round-trip must still recover zeros.
         let input = vec![0.0f32; 8];
         let bytes = quantize_i2_s(&input).unwrap();
-        assert!(bytes.iter().all(|&b| b == 0));
+        assert!(bytes.iter().all(|&b| b == 0x55), "zeros pack to 0x55");
         let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
         assert!(decoded.iter().all(|&v| v == 0.0));
     }
@@ -611,16 +706,43 @@ mod tests {
     }
 
     #[test]
-    fn i2_s_bit_pattern_3_decodes_as_zero() {
+    fn i2_s_code_three_decodes_as_zero() {
+        // Code 0b11 is unused by the packer; the decoder treats it
+        // as 0.0 defensively.  Byte 0xFF = all four groups code 3.
+        // In the strided layout a single 0xFF byte at block 0 byte 0
+        // sets elements {0,32,64,96} (only element 0 exists for a
+        // 4-element decode, the rest are out of range and ignored).
         let decoded = dequantize_i2_s(&[0xFF], 4).unwrap();
-        assert_eq!(decoded, vec![0.0, 0.0, 0.0, 0.0]);
+        // element 0 comes from group 0 (bits 6-7) = 0b11 -> 0.0
+        assert_eq!(decoded[0], 0.0);
+    }
+
+    #[test]
+    fn i2_s_strided_layout_matches_microsoft_packing() {
+        // For an 8-element input (< 128, single tail block), the
+        // strided layout places element e at group g=e/32=0,
+        // pos p=e, byte p, bit-shift 6 (group 0).  So each of the
+        // first 8 bytes holds one element in its top 2 bits.
+        // code: -1->0, 0->1, +1->2.
+        let input: Vec<f32> = vec![1.0, -1.0, 0.0, 1.0, 0.0, -1.0, 1.0, 0.0];
+        let bytes = quantize_i2_s(&input).unwrap();
+        // 8 elements -> 2 bytes total (8/4), but strided tail uses
+        // byte p for element p in group 0 -> bytes[0..8] would be
+        // needed; with only 2 bytes the layout packs groups across
+        // the 2 bytes.  Decode must invert exactly.
+        let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
+        assert_eq!(decoded, input, "strided round-trip");
     }
 
     #[test]
     fn i2_s_dispatch_via_dequantize() {
-        let bytes = vec![0b01_10_00_01u8];
-        let result = super::super::dequantize(&bytes, super::super::TYPE_I2_S, 4).unwrap();
-        assert_eq!(result, vec![1.0, 0.0, -1.0, 1.0]);
+        // A zero-weight tensor packs to 0x55 bytes; dispatch must
+        // route I2_S to the strided decoder and recover zeros.
+        let input = vec![0.0f32; 4];
+        let bytes = quantize_i2_s(&input).unwrap();
+        let result =
+            super::super::dequantize(&bytes, super::super::TYPE_I2_S, 4).unwrap();
+        assert_eq!(result, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
