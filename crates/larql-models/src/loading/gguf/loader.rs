@@ -14,6 +14,14 @@ use super::orient::{
 };
 use super::types::{GgufFile, GgufValue};
 
+/// Sentinel suffix appended to a BitNet I2_S tensor's key under which
+/// its per-tensor scale f32 is stashed in `ModelWeights::raw_bytes`
+/// during a keep-quant load.  The packed-trit bytes live under the
+/// bare key; the 4-byte little-endian scale lives under
+/// `"{key}{I2S_SCALE_SUFFIX}"`.  The NUL byte guarantees the sentinel
+/// can never collide with a real GGUF tensor name.
+pub const I2S_SCALE_SUFFIX: &str = "\0i2s_scale";
+
 impl GgufFile {
     /// Load all tensors, dequantizing to f32.
     #[allow(clippy::type_complexity)]
@@ -214,6 +222,29 @@ impl GgufFile {
             let raw = &mmap[abs_offset_usize..end];
             if keep_raw_for_types.contains(&info.tensor_type) {
                 raw_bytes.insert(key.clone(), raw.to_vec());
+                // BitNet I2_S stores a single per-tensor scale f32
+                // (= max|W| at quant time) immediately AFTER the n/4
+                // packed-trit bytes (microsoft/BitNet
+                // ggml-bitnet-mad.cpp::quantize_i2_s writes
+                // `scale_ptr[0]` at byte offset n/4).  tensor_data_size
+                // returns only n/4, so the scale lives in the
+                // 32-byte-aligned padding at [end, end+4).  Capture it
+                // under a sentinel key so the keep-quant writer can set
+                // BitLinearWeight.channel_scales without re-reading the
+                // GGUF.  Reconstruction convention: W = trit * scale.
+                if info.tensor_type == crate::quant::ggml::TYPE_I2_S {
+                    if let Some(se) = end.checked_add(4) {
+                        if se <= mmap.len() {
+                            let sb = &mmap[end..se];
+                            let scale =
+                                f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+                            raw_bytes.insert(
+                                format!("{key}{I2S_SCALE_SUFFIX}"),
+                                scale.to_le_bytes().to_vec(),
+                            );
+                        }
+                    }
+                }
             }
             let floats = dequantize(raw, info.tensor_type, n_elements as usize)?;
 
