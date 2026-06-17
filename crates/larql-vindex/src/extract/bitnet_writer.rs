@@ -195,10 +195,45 @@ pub fn write_bitnet_artifacts(
         let scales: Vec<f32> = vec![scale; rows];
         debug_assert_eq!(scales.len(), rows);
 
-        // Write the I2_S bytes.
+        // Re-pack the trits into the kernel's contiguous per-row
+        // layout.  The source GGUF I2_S bytes use microsoft's
+        // strided 128-element/32-byte block layout, which the
+        // dequantiser (`larql_models::quant::ggml::tq::
+        // dequantize_i2_s`) already unscrambled into the row-major
+        // f32 `arr`.  The runtime ternary kernel
+        // (`matvec_i2s_f32`) expects a SIMPLE contiguous layout:
+        // per row, 4 trits per byte at bit slots 0,2,4,6 with
+        // `+1 -> 0b01, -1 -> 0b10, 0 -> 0b00`.  We re-encode from
+        // `arr` here so the on-disk `.i2s` matches the kernel and
+        // we never have to teach the hot loop the strided source
+        // layout.  (The verbatim byte-copy that used to live here
+        // shipped the strided bytes straight to a contiguous
+        // decoder and produced fluent garbage — BUG-infer-deadlock
+        // §5.4.)
+        let _ = bytes; // sized-check only; we re-encode from `arr`
+        let view = arr.view();
+        let mut packed = vec![0u8; rows * cols / 4];
+        for r in 0..rows {
+            let row_off = r * (cols / 4);
+            for c in 0..cols {
+                let t = view[[r, c]];
+                let code: u8 = if t > 0.5 {
+                    0b01
+                } else if t < -0.5 {
+                    0b10
+                } else {
+                    0b00
+                };
+                let byte = row_off + c / 4;
+                let slot = (c % 4) as u8;
+                packed[byte] |= code << (2 * slot);
+            }
+        }
+
+        // Write the re-packed I2_S bytes.
         let path = out_dir.join(bitnet_tensor_filename(key));
         let mut f = File::create(&path)?;
-        f.write_all(bytes)?;
+        f.write_all(&packed)?;
 
         // Append scale to the concat buffer.
         let scale_offset = all_scales.len();

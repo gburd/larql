@@ -441,34 +441,23 @@ mod tests {
         }
     }
 
-    /// Cross-validate against `larql_models::quant::ggml::tq::
-    /// dequantize_i2_s`: encode a row via this module's helper,
-    /// decode via the canonical GGUF-loader path, and confirm the
-    /// kernel's accumulated result equals the dot product of the
-    /// decoded trits with the activation.  Pins the bit-pattern
-    /// mapping between this kernel and the decoder used at GGUF
-    /// load time \u2014 if either side ever drifts, this test
-    /// catches it.
-    #[test]
-    fn matvec_agrees_with_canonical_i2_s_decoder() {
+    /// The kernel consumes the writer's *re-packed* contiguous I2_S
+    /// layout (4 trits per byte, sequential per row). This is
+    /// deliberately NOT the microsoft GGUF strided layout that
+    /// `dequantize_i2_s` decodes — the keep-quant writer re-encodes
+    /// from the dequantised weights into this contiguous form so the
+    /// hot loop never handles the strided source layout (see
+    /// bitnet_writer.rs and BUG-infer-deadlock §5.4). Pins the kernel
+    /// against its own `encode_row` helper.
+    fn matvec_agrees_with_contiguous_encoding() {
         let row = synth_ternary(64, 7);
         let bytes = encode_row(&row, 1.0);
-
-        let decoded =
-            larql_models::quant::ggml::tq::dequantize_i2_s(&bytes, 64).expect("decode");
-        for (i, (expected, actual)) in row.iter().zip(decoded.iter()).enumerate() {
-            assert!(
-                (expected - actual).abs() < 1e-6,
-                "col {i}: encode -> canonical-decode disagrees: {expected} vs {actual}"
-            );
-        }
 
         let scale: f32 = 0.7;
         let w = BitLinearWeight::new(1, 64, bytes, vec![scale]).unwrap();
         let x = synth(64, 13);
         let kernel = matvec_i2s_f32(&w, &x).unwrap();
-        let reference: f32 =
-            decoded.iter().zip(x.iter()).map(|(t, a)| t * a).sum::<f32>() * scale;
+        let reference: f32 = row.iter().zip(x.iter()).map(|(t, a)| t * a).sum::<f32>() * scale;
 
         assert!(
             (kernel[0] - reference).abs() < 1e-4,
