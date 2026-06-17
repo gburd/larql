@@ -78,8 +78,8 @@ pub use describe::{DescribeEdge, LabelSource};
 
 // Extract
 pub use extract::{
-    build_vindex, build_vindex_from_vectors, build_vindex_streaming, snapshot_hf_metadata,
-    IndexBuildCallbacks, SilentBuildCallbacks, SNAPSHOT_FILES,
+    build_vindex, build_vindex_dense_only, build_vindex_from_vectors, build_vindex_streaming,
+    snapshot_hf_metadata, IndexBuildCallbacks, SilentBuildCallbacks, SNAPSHOT_FILES,
 };
 
 // Format

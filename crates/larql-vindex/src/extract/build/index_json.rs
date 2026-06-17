@@ -90,10 +90,20 @@ impl<'a> BuildContext<'a> {
         std::fs::write(self.output_dir.join(INDEX_JSON), config_json)?;
 
         if extract_level != crate::ExtractLevel::Browse {
-            crate::format::weights::write_model_weights(
+            let opts = crate::format::weights::WriteWeightsOptions {
+                level: crate::ExtractLevel::All,
+                ffn_compact: false,
+                // Dense-only BitNet: skip the attn + FFN projection
+                // tensors (they live in the bitnet/ I2_S artifacts);
+                // write only norms + embed + lm_head.
+                skip_attn: self.dense_only,
+                skip_ffn: self.dense_only,
+            };
+            crate::format::weights::write_model_weights_with_opts(
                 self.weights,
                 self.output_dir,
                 self.callbacks,
+                opts,
             )?;
             config.has_model_weights = true;
         }

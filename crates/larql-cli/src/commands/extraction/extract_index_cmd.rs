@@ -244,6 +244,8 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             let weight_opts = larql_vindex::WriteWeightsOptions {
                 level,
                 ffn_compact: args.compact,
+                skip_attn: false,
+                skip_ffn: false,
             };
             larql_vindex::write_model_weights_with_opts(
                 model.weights(),
@@ -339,6 +341,8 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         let weight_opts = larql_vindex::WriteWeightsOptions {
             level,
             ffn_compact: args.compact,
+            skip_attn: false,
+            skip_ffn: false,
         };
         if args.drop_gate_vectors && args.quant != larql_vindex::QuantFormat::Q4K {
             return Err(

@@ -40,6 +40,17 @@ enum ConvertCommand {
         /// non-BitNet GGUFs.  Closes BUG-infer-deadlock §5.4.
         #[arg(long)]
         keep_quant: bool,
+
+        /// Dense-only build: skip the gate-vector + clustering
+        /// stages (walk / browse).  Only valid with `--keep-quant`
+        /// on a BitNet GGUF.  Produces a vindex that supports
+        /// native-ternary `/v1/infer` (dense mode) at the ~1.4 GB
+        /// resident footprint, without the ~2 GB f32 gate matrix or
+        /// the 20-30 min HNSW clustering build.  Walk / browse /
+        /// describe endpoints will return nothing useful on the
+        /// resulting vindex.
+        #[arg(long)]
+        dense_only: bool,
     },
 
     /// Convert a safetensors model to a vindex (alias for extract-index).
@@ -195,7 +206,8 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             level,
             f16,
             keep_quant,
-        } => run_gguf_to_vindex(&input, &output, &level, f16, keep_quant),
+            dense_only,
+        } => run_gguf_to_vindex(&input, &output, &level, f16, keep_quant, dense_only),
         ConvertCommand::SafetensorsToVindex {
             input,
             output,
@@ -441,6 +453,7 @@ fn run_gguf_to_vindex(
     level: &str,
     use_f16: bool,
     keep_quant: bool,
+    dense_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Loading GGUF: {}", input.display());
 
@@ -470,6 +483,13 @@ fn run_gguf_to_vindex(
              tensors to retain)"
         );
     }
+    if dense_only && !do_keep_quant {
+        return Err("--dense-only is only valid with --keep-quant on a BitNet \
+             GGUF (it skips the gate-vector + clustering stages that only \
+             walk / browse use; native-ternary BitNet /v1/infer does not \
+             need them)."
+            .into());
+    }
 
     eprintln!("  Loading and dequantizing tensors...");
     let weights = if do_keep_quant {
@@ -496,8 +516,10 @@ fn run_gguf_to_vindex(
     // only inference/all levels extract; load_bitnet_model fails at
     // serve time on a browse-level vindex with "vindex does not
     // contain model weights".  Reject up front rather than producing
-    // an unusable vindex after a multi-minute extract.
-    if do_keep_quant && extract_level == larql_vindex::ExtractLevel::Browse {
+    // an unusable vindex after a multi-minute extract.  (Skipped for
+    // --dense-only, which runs its own inference-equivalent build
+    // regardless of --level.)
+    if do_keep_quant && !dense_only && extract_level == larql_vindex::ExtractLevel::Browse {
         return Err("--keep-quant requires --level inference (or all): BitNet \
              inference needs the dense norm/embed/lm_head tensors that browse \
              level does not extract. Re-run with --level inference."
@@ -534,16 +556,31 @@ fn run_gguf_to_vindex(
     eprintln!("\nExtracting to {}", output.display());
 
     let mut callbacks = SilentCallbacks;
-    larql_vindex::build_vindex(
-        &weights,
-        tokenizer_ref,
-        &model_name,
-        output,
-        10,
-        extract_level,
-        dtype,
-        &mut callbacks,
-    )?;
+    if dense_only {
+        eprintln!(
+            "  Dense-only build: skipping gate-vector + clustering stages \
+             (walk / browse disabled; native-ternary /v1/infer only)"
+        );
+        larql_vindex::build_vindex_dense_only(
+            &weights,
+            tokenizer_ref,
+            &model_name,
+            output,
+            dtype,
+            &mut callbacks,
+        )?;
+    } else {
+        larql_vindex::build_vindex(
+            &weights,
+            tokenizer_ref,
+            &model_name,
+            output,
+            10,
+            extract_level,
+            dtype,
+            &mut callbacks,
+        )?;
+    }
 
     // BitNet --keep-quant: write the I2_S bytes + per-channel scales
     // and stamp `bitnet_layout` into index.json.

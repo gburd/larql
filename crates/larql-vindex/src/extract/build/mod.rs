@@ -79,6 +79,12 @@ pub(super) struct BuildContext<'a> {
     pub(super) cluster_top_tokens: Vec<String>,
     pub(super) cluster_input_tokens: Vec<String>,
     pub(super) cluster_output_tokens: Vec<String>,
+
+    /// Dense-only BitNet build: when set, `write_index_json` writes
+    /// the weight manifest with attention + FFN projections skipped
+    /// (only norms + embed + lm_head), since the I2_S projections
+    /// live in the `bitnet/` artifacts.
+    pub(super) dense_only: bool,
 }
 
 impl<'a> BuildContext<'a> {
@@ -110,6 +116,7 @@ impl<'a> BuildContext<'a> {
             cluster_top_tokens: Vec::new(),
             cluster_input_tokens: Vec::new(),
             cluster_output_tokens: Vec::new(),
+            dense_only: false,
         }
     }
 
@@ -281,6 +288,58 @@ pub fn build_vindex(
     Ok(())
 }
 
+/// Build a *dense-only* BitNet vindex: embeddings + norms + lm_head +
+/// tokenizer + index.json, skipping the gate-vector and clustering
+/// stages entirely.
+///
+/// The walk-mode FFN (`write_gate_vectors`) and the
+/// HNSW + Wikidata clustering (`run_clustering`) are the two
+/// expensive stages of a normal inference-level build (they write
+/// ~2 GB of f32 gate vectors and spend 20-30 min building per-layer
+/// HNSW indices on a 2 B model).  Native-ternary BitNet inference
+/// (`predict_bitnet`) does not use any of that: its forward pass
+/// reads only the dense norms / embeddings / lm_head plus the
+/// `bitnet/` I2_S artifacts (written separately by
+/// `bitnet_writer::write_bitnet_artifacts`).  So for the
+/// edge-deployable BitNet case we skip both stages.
+///
+/// The resulting vindex has **no** `gate_vectors.bin`; the server's
+/// `VectorIndex::load_vindex_with_range` tolerates that (it loads a
+/// degenerate empty gate index), and `load_bitnet_model` reads the
+/// manifested dense weights with `skip_ffn = true`, so walk / browse
+/// endpoints simply return nothing useful while `/v1/infer` (dense
+/// mode) works at the native-ternary footprint (~1.4 GB resident:
+/// embeddings F32 + I2_S BitLinears, no 2 GB gate matrix).
+///
+/// `--keep-quant` callers pass this for `--dense-only`; the BitNet
+/// artifacts are stamped into index.json by the convert command
+/// after this returns (same as the full path).
+pub fn build_vindex_dense_only(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    model_name: &str,
+    output_dir: &Path,
+    dtype: StorageDtype,
+    callbacks: &mut dyn IndexBuildCallbacks,
+) -> Result<(), VindexError> {
+    // Inference level so `write_index_json` calls `write_model_weights`
+    // (norms + embed + lm_head into the manifest) and stamps
+    // `has_model_weights = true`.
+    let extract_level = crate::ExtractLevel::Inference;
+    crate::format::weights::ensure_extract_level_supported(&*weights.arch, extract_level)?;
+
+    std::fs::create_dir_all(output_dir)?;
+    let mut ctx = BuildContext::new(weights, tokenizer, output_dir, callbacks, dtype, 0);
+    ctx.dense_only = true;
+    // Deliberately NO write_gate_vectors / write_down_meta_and_clusters
+    // / run_clustering — leaves `layer_infos` empty, so index.json
+    // carries zero gate layers and no gate_vectors.bin is produced.
+    ctx.write_embeddings()?;
+    ctx.write_tokenizer()?;
+    ctx.write_index_json(model_name, extract_level)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::ArcArray2;
@@ -411,6 +470,88 @@ mod tests {
         let tok = tokenizer();
         let mut cb = SilentBuildCallbacks;
         build_vindex(&weights, &tok, "test/unit", dir, 3, level, dtype, &mut cb).unwrap();
+    }
+
+    /// Dense-only build: embeddings + norms + lm_head + tokenizer +
+    /// index.json, and crucially NO gate_vectors.bin and NO
+    /// down_meta clustering.  `has_model_weights` must still be
+    /// true (the loader needs the manifested norms/embed/lm_head),
+    /// and `layers` must be empty (no gate features).
+    #[test]
+    fn build_dense_only_skips_gate_and_clustering() {
+        let dir = TempDir::new().unwrap();
+        let weights = make_weights();
+        let tok = tokenizer();
+        let mut cb = SilentBuildCallbacks;
+        super::build_vindex_dense_only(&weights, &tok, "test/unit", dir.path(), StorageDtype::F32, &mut cb)
+            .unwrap();
+
+        // Present: the dense pieces the BitNet loader needs.
+        assert!(
+            dir.path().join("embeddings.bin").exists(),
+            "embeddings.bin missing"
+        );
+        assert!(
+            dir.path().join("norms.bin").exists(),
+            "norms.bin missing — dense-only must still write norms (decoupled \
+             from the skipped attention projections)"
+        );
+        assert!(dir.path().join("index.json").exists(), "index.json missing");
+        assert!(
+            dir.path().join("tokenizer.json").exists(),
+            "tokenizer.json missing"
+        );
+
+        // Absent: the expensive walk-mode artifacts.
+        assert!(
+            !dir.path().join("gate_vectors.bin").exists(),
+            "dense-only must NOT write gate_vectors.bin"
+        );
+        // Absent: the dense f32 attention/FFN projections (they live
+        // in the bitnet/ I2_S artifacts; writing them dense would be
+        // ~6 GB of duplicate weights the BitNet path never reads).
+        assert!(
+            !dir.path().join("attn_weights.bin").exists(),
+            "dense-only must NOT write attn_weights.bin"
+        );
+        assert!(
+            !dir.path().join("up_weights.bin").exists(),
+            "dense-only must NOT write up_weights.bin"
+        );
+        assert!(
+            !dir.path().join("down_weights.bin").exists(),
+            "dense-only must NOT write down_weights.bin"
+        );
+
+        // index.json: has_model_weights true (manifest written),
+        // zero gate layers.
+        let cfg = crate::load_vindex_config(dir.path()).unwrap();
+        assert!(
+            cfg.has_model_weights,
+            "dense-only must set has_model_weights=true"
+        );
+        assert!(
+            cfg.layers.is_empty(),
+            "dense-only must carry zero gate layers, got {}",
+            cfg.layers.len()
+        );
+    }
+
+    /// A dense-only vindex must load as a degenerate VectorIndex
+    /// (empty gate) without erroring on the missing gate_vectors.bin
+    /// — this is what lets larql-server boot a dense-only BitNet
+    /// vindex.
+    #[test]
+    fn dense_only_vindex_loads_without_gate_vectors() {
+        let dir = TempDir::new().unwrap();
+        let weights = make_weights();
+        let tok = tokenizer();
+        let mut cb = SilentBuildCallbacks;
+        super::build_vindex_dense_only(&weights, &tok, "test/unit", dir.path(), StorageDtype::F32, &mut cb)
+            .unwrap();
+        let mut lcb = SilentLoadCallbacks;
+        let idx = VectorIndex::load_vindex_with_range(dir.path(), &mut lcb, None);
+        assert!(idx.is_ok(), "dense-only vindex failed to load: {:?}", idx.err());
     }
 
     // ── build output file inventory ──────────────────────────────────────
