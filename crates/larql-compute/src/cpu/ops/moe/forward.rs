@@ -242,7 +242,10 @@ pub fn cpu_moe_forward(
         });
         let mut acc = vec![0.0f32; hidden];
         for ci in 0..active.len() {
-            for (a, &v) in acc.iter_mut().zip(contribs[ci * hidden..(ci + 1) * hidden].iter()) {
+            for (a, &v) in acc
+                .iter_mut()
+                .zip(contribs[ci * hidden..(ci + 1) * hidden].iter())
+            {
                 *a += v;
             }
         }

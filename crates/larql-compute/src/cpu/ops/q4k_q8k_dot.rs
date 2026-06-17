@@ -1211,11 +1211,18 @@ pub fn q4k_q8k_matvec_parallel(
     cols: usize,
     format: &str,
 ) {
-    let bytes_per_row = match format {
-        "Q4_K" => (cols / ELEMS_PER_BLOCK) * 144,
-        "Q6_K" => (cols / ELEMS_PER_BLOCK) * 210,
+    // Only Q4_K / Q6_K have a kernel below; gate on those, but take the
+    // packed super-block geometry from the format helper rather than
+    // re-spelling `(cols/256)*144`/`*210`. The truncating `cols / block_elems`
+    // is preserved (k-quant cols are always a 256-multiple in practice).
+    let fmt = match crate::QuantFormat::from_registry_tag(format) {
+        Some(f @ (crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K)) => f,
         _ => return,
     };
+    let (block_elems, block_bytes) = fmt
+        .packed_block_layout()
+        .expect("Q4_K/Q6_K always have a packed block layout");
+    let bytes_per_row = (cols / block_elems) * block_bytes;
     if rows == 0 || cols == 0 || bytes.len() < rows * bytes_per_row {
         return;
     }
@@ -1227,9 +1234,13 @@ pub fn q4k_q8k_matvec_parallel(
             return;
         }
         let w_chunk = &bytes[row_start * bytes_per_row..(row_start + chunk_len) * bytes_per_row];
-        match format {
-            "Q4_K" => q4k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols),
-            "Q6_K" => q6k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols),
+        match fmt {
+            crate::QuantFormat::Q4_K => {
+                q4k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols)
+            }
+            crate::QuantFormat::Q6_K => {
+                q6k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols)
+            }
             _ => {}
         }
     });
@@ -1949,12 +1960,7 @@ static Q6K_SHIFT_RIGHT: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6,
 /// result is bit-exact with the neon/scalar forms.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
-unsafe fn q6k_sb_sum1_asm(
-    ql: *const u8,
-    qh: *const u8,
-    act: *const i8,
-    scales: *const i32,
-) -> i32 {
+unsafe fn q6k_sb_sum1_asm(ql: *const u8, qh: *const u8, act: *const i8, scales: *const i32) -> i32 {
     let sum1: i32;
     // One 16-element group: `$qh` = the loaded qh vector for this group's
     // quad (v8-v11), `$idx` = the TBL replicate index vector for the group's
@@ -1968,15 +1974,23 @@ unsafe fn q6k_sb_sum1_asm(
                 "and  v1.16b, v0.16b, v29.16b\n", // lo4 of even elements
                 "ushr v2.16b, v0.16b, #4\n",      // lo4 of odd elements
                 "zip1 v3.16b, v1.16b, v2.16b\n",  // restore element order
-                "tbl  v4.16b, {{", $qh, ".16b}}, ", $idx, ".16b\n",
+                "tbl  v4.16b, {{",
+                $qh,
+                ".16b}}, ",
+                $idx,
+                ".16b\n",
                 "sshl v4.16b, v4.16b, v28.16b\n",
                 "and  v4.16b, v4.16b, v30.16b\n",
                 "shl  v4.16b, v4.16b, #4\n",
-                "orr  v3.16b, v3.16b, v4.16b\n",  // raw6 = lo4 | hi2<<4
+                "orr  v3.16b, v3.16b, v4.16b\n", // raw6 = lo4 | hi2<<4
                 "sub  v3.16b, v3.16b, v31.16b\n", // signed: raw6 - 32
                 "movi v6.4s, #0\n",
                 "sdot v6.4s, v3.16b, v5.16b\n",
-                "mul  v6.4s, v6.4s, ", $sv, ".s[", $lane, "]\n",
+                "mul  v6.4s, v6.4s, ",
+                $sv,
+                ".s[",
+                $lane,
+                "]\n",
                 "add  v16.4s, v16.4s, v6.4s\n",
             )
         };
@@ -2073,12 +2087,7 @@ pub fn q6k_q8k_matvec_asm(
             // scales + 2 d); `q8_ptr` spans a full 256-i8 super-block; `sc`
             // is 16 i32; the static TBL/shift tables are 64/16 bytes.
             let sum1 = unsafe {
-                q6k_sb_sum1_asm(
-                    block.as_ptr(),
-                    block.as_ptr().add(128),
-                    q8_ptr,
-                    sc.as_ptr(),
-                )
+                q6k_sb_sum1_asm(block.as_ptr(), block.as_ptr().add(128), q8_ptr, sc.as_ptr())
             };
             acc += d_w * d_y * sum1 as f32;
         }
@@ -2562,7 +2571,6 @@ mod tests {
         q6k_q8k_matvec_asm(&mut out, &q, &w, rows, cols);
         assert!(out.iter().all(|&v| v == 0.0));
     }
-
 
     /// `quantize_x_to_q8k_into` must produce the same `qs`, `d`, `sums` as
     /// the allocating `quantize_x_to_q8k` for any well-sized input — both

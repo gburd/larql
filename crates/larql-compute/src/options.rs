@@ -491,11 +491,14 @@ mod tests {
 
     #[test]
     fn env_flag_any_and_debug_helpers_cover_absent_and_present_cases() {
-        with_env_vars(&[(ENV_SKIP_OUTER_NORM, None), (ENV_MOE_DEBUG, None)], || {
-            assert!(!env_flag(ENV_SKIP_OUTER_NORM));
-            assert!(!env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG]));
-            assert!(!moe_debug_enabled());
-        });
+        with_env_vars(
+            &[(ENV_SKIP_OUTER_NORM, None), (ENV_MOE_DEBUG, None)],
+            || {
+                assert!(!env_flag(ENV_SKIP_OUTER_NORM));
+                assert!(!env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG]));
+                assert!(!moe_debug_enabled());
+            },
+        );
 
         with_env_vars(
             &[(ENV_SKIP_OUTER_NORM, Some("1")), (ENV_MOE_DEBUG, Some("1"))],

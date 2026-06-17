@@ -407,6 +407,48 @@ fn build_text_completion_chunk(
 
 /// Generate completions for every prompt. Returns
 /// `(choices, prompt_tokens_sum, completion_tokens_sum)`.
+/// Post-process a generated token stream into `(completion_text,
+/// completion_tokens, finish_reason)`.
+///
+/// Pure — depends only on the tokens and stop strings, not on the model or
+/// platform — so the EOS-break and stop-trim branches are unit-testable
+/// deterministically. (Driving them through real generation is
+/// non-deterministic across platforms: the synthetic CI model emits
+/// different tokens on Ubuntu vs macOS, which is exactly what made
+/// `completions.rs` coverage flap. Keeping this logic pure pins it.)
+fn finalize_completion(
+    tokens: &[(String, f64)],
+    stop_strings: &[String],
+) -> (String, Vec<(String, f64)>, &'static str) {
+    let mut completion_text = String::new();
+    let mut completion_tokens: Vec<(String, f64)> = Vec::new();
+    let mut finish_reason = "length";
+    for (text, prob) in tokens {
+        completion_text.push_str(text);
+        completion_tokens.push((text.clone(), *prob));
+        if larql_inference::vindex::is_end_of_turn(text) {
+            finish_reason = "stop";
+            break;
+        }
+    }
+    if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
+        completion_text = trim_at_stop(&completion_text, stop_strings);
+        finish_reason = "stop";
+        // Drop tokens past the byte boundary so logprobs and text stay
+        // length-aligned.
+        let target = completion_text.len();
+        let mut acc = 0usize;
+        completion_tokens.retain(|(t, _)| {
+            if acc >= target {
+                return false;
+            }
+            acc += t.len();
+            true
+        });
+    }
+    (completion_text, completion_tokens, finish_reason)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_completions_loop(
     model: &LoadedModel,
@@ -467,32 +509,8 @@ fn run_completions_loop(
             &eos,
         );
 
-        let mut completion_text = String::new();
-        let mut completion_tokens: Vec<(String, f64)> = Vec::new();
-        let mut finish_reason = "length";
-        for (text, prob) in &result.tokens {
-            completion_text.push_str(text);
-            completion_tokens.push((text.clone(), *prob));
-            if larql_inference::vindex::is_end_of_turn(text) {
-                finish_reason = "stop";
-                break;
-            }
-        }
-        if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
-            completion_text = trim_at_stop(&completion_text, stop_strings);
-            finish_reason = "stop";
-            // Drop tokens past the byte boundary so logprobs and text stay
-            // length-aligned.
-            let target = completion_text.len();
-            let mut acc = 0usize;
-            completion_tokens.retain(|(t, _)| {
-                if acc >= target {
-                    return false;
-                }
-                acc += t.len();
-                true
-            });
-        }
+        let (completion_text, completion_tokens, finish_reason) =
+            finalize_completion(&result.tokens, stop_strings);
 
         total_completion_tokens += completion_tokens.len();
 
@@ -569,6 +587,67 @@ mod tests {
             CompletionPrompt::Batch(v) => assert_eq!(v, vec!["a", "b"]),
             _ => panic!(),
         }
+    }
+
+    fn toks(parts: &[&str]) -> Vec<(String, f64)> {
+        parts.iter().map(|s| (s.to_string(), 1.0)).collect()
+    }
+
+    #[test]
+    fn build_text_completion_chunk_shapes_token_and_final_events() {
+        // Per-token chunk: text present, finish_reason null.
+        let mid = build_text_completion_chunk("cmpl-1", "synthetic", Some(" Paris"), None);
+        let v: serde_json::Value = serde_json::from_str(&mid).unwrap();
+        assert_eq!(v["object"], TEXT_COMPLETION_OBJECT);
+        assert_eq!(v["model"], "synthetic");
+        assert_eq!(v["choices"][0]["text"], " Paris");
+        assert!(v["choices"][0]["finish_reason"].is_null());
+        assert!(v["choices"][0]["logprobs"].is_null());
+
+        // Final chunk: no text (defaults to ""), finish_reason set.
+        let last = build_text_completion_chunk("cmpl-1", "synthetic", None, Some("stop"));
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(v["choices"][0]["text"], "");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn finalize_completion_plain_run_is_length_and_keeps_all_tokens() {
+        let (text, kept, reason) = finalize_completion(&toks(&["Par", "is"]), &[]);
+        assert_eq!(text, "Paris");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(reason, "length");
+    }
+
+    #[test]
+    fn finalize_completion_stops_and_truncates_on_end_of_turn_token() {
+        // The `<eos>` marker ends the turn: it's included, anything after is
+        // dropped, finish_reason flips to "stop".
+        let (text, kept, reason) = finalize_completion(&toks(&["hi", "<eos>", "ignored"]), &[]);
+        assert_eq!(text, "hi<eos>");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(reason, "stop");
+    }
+
+    #[test]
+    fn finalize_completion_trims_at_stop_string_and_realigns_tokens() {
+        // "STOP" is a stop string; text is trimmed at it and the token list
+        // is truncated to stay byte-aligned with the trimmed text.
+        let (text, kept, reason) =
+            finalize_completion(&toks(&["foo", "STOP", "bar"]), &["STOP".to_string()]);
+        assert_eq!(text, "foo");
+        assert_eq!(reason, "stop");
+        // Only the "foo" token survives the byte-boundary retention.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "foo");
+    }
+
+    #[test]
+    fn finalize_completion_no_stop_match_is_unchanged() {
+        let (text, kept, reason) = finalize_completion(&toks(&["a", "b"]), &["zzz".to_string()]);
+        assert_eq!(text, "ab");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(reason, "length");
     }
 
     #[test]

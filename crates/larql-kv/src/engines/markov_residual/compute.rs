@@ -10,9 +10,7 @@ use super::helpers::append_row;
 use super::store::RsStore;
 use crate::profiler::EngineProfiler;
 use larql_inference::attention::SharedKV;
-use larql_inference::attention::{
-    apply_rope_partial_at, run_attention_with_kv_backend,
-};
+use larql_inference::attention::{apply_rope_partial_at, run_attention_with_kv_backend};
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::{add_bias, apply_norm, embed_tokens_pub};
 use larql_inference::model::ModelWeights;
@@ -168,7 +166,15 @@ pub(crate) fn rs_decode_step_profiled(
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
     index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStore)> {
-    rs_decode_step_inner(weights, new_token_id, rs, backend, Some(profiler), moe_ffn, index)
+    rs_decode_step_inner(
+        weights,
+        new_token_id,
+        rs,
+        backend,
+        Some(profiler),
+        moe_ffn,
+        index,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,8 +217,7 @@ fn rs_decode_step_inner(
     // configs keep the existing recompute path unchanged.
     let cache_eligible =
         rs.max_window.is_none() && rs.cold_residuals.is_none() && rs.cold_kv.is_none();
-    let mut step_new_kv: Vec<larql_inference::attention::SharedKV> =
-        Vec::with_capacity(num_layers);
+    let mut step_new_kv: Vec<larql_inference::attention::SharedKV> = Vec::with_capacity(num_layers);
     // Move the hot K/V cache out so the cache_eligible steady state (step 2+)
     // can append into it IN PLACE — borrowing `hot_kv_store` mutably while
     // reading `rs.stored` (a disjoint field) immutably. `had_hot_kv` marks the
@@ -283,7 +288,15 @@ fn rs_decode_step_inner(
             };
             let inplace = if markov_inplace_kv_enabled() {
                 larql_inference::attention::run_attention_block_decode_step_auto_inplace(
-                    weights, &h_new, layer, k_buf, v_buf, s_hot, abs_position, Some(backend), idx_kv,
+                    weights,
+                    &h_new,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    s_hot,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
                 )
             } else {
                 None
@@ -1175,8 +1188,8 @@ mod tests {
     fn rs_decode_step_produces_finite_hidden() {
         let weights = make_test_weights();
         let prefill = rs_prefill(&weights, &[0u32], None, &CpuBackend, None);
-        let (h, _) =
-            rs_decode_step(&weights, 1, prefill.store, &CpuBackend, None, None).expect("decode step");
+        let (h, _) = rs_decode_step(&weights, 1, prefill.store, &CpuBackend, None, None)
+            .expect("decode step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }
@@ -1243,7 +1256,10 @@ mod tests {
 
         // Run a 10-step decode and collect per-step hidden states.
         let run = |inplace: bool| -> (Vec<Vec<u32>>, usize, usize) {
-            set_markov_env_override("LARQL_MARKOV_INPLACE_KV", Some(if inplace { "1" } else { "0" }));
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
             let prefill = rs_prefill(&weights, &[0u32, 1, 2], None, &CpuBackend, None);
             let mut rs = prefill.store;
             let mut hiddens = Vec::new();
@@ -1263,7 +1279,10 @@ mod tests {
 
         assert_eq!(a_len, 13, "3 prompt + 10 decode rows");
         assert_eq!(a_len, b_len, "hot_len must agree across paths");
-        assert!(a_cap >= a_len, "in-place buffer cap {a_cap} < len {a_len} (no doubling?)");
+        assert!(
+            a_cap >= a_len,
+            "in-place buffer cap {a_cap} < len {a_len} (no doubling?)"
+        );
         assert_eq!(
             a_hiddens, b_hiddens,
             "in-place and owned-concat hidden states diverged (q4k-direct on)"
@@ -1322,8 +1341,15 @@ mod tests {
         // with profiler timing recompute_hot).
         assert!(prefill.store.cold_kv.is_some());
         let mut profiler = EngineProfiler::default();
-        let result =
-            rs_decode_step_profiled(&weights, 4, prefill.store, &CpuBackend, &mut profiler, None, None);
+        let result = rs_decode_step_profiled(
+            &weights,
+            4,
+            prefill.store,
+            &CpuBackend,
+            &mut profiler,
+            None,
+            None,
+        );
         assert!(result.is_some());
         // Profiler must record positive durations across all stages.
         assert!(profiler.recompute_hot.count > 0);
@@ -1346,7 +1372,8 @@ mod tests {
             "cold_kv should be cleared after overflow"
         );
         let mut profiler = EngineProfiler::default();
-        let result = rs_decode_step_profiled(&weights, 5, rs2, &CpuBackend, &mut profiler, None, None);
+        let result =
+            rs_decode_step_profiled(&weights, 5, rs2, &CpuBackend, &mut profiler, None, None);
         assert!(result.is_some());
         // cold_residuals branch exercises recompute_cold counter (line 171).
         assert!(profiler.recompute_cold.count > 0);

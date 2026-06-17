@@ -258,9 +258,13 @@ fn matvec_q4k_or_q6k_q8k(
     if !cols.is_multiple_of(ELEMS_PER_BLOCK) {
         return None;
     }
-    let bytes_per_row = match format {
-        "Q4_K" => (cols / ELEMS_PER_BLOCK) * 144,
-        "Q6_K" => (cols / ELEMS_PER_BLOCK) * 210,
+    // Pre-flight length check only (the actual matvec recomputes this stride
+    // internally). Gate on the two kernel-backed formats and take the packed
+    // row length from the format helper instead of re-spelling `(cols/256)*144`.
+    let bytes_per_row = match crate::QuantFormat::from_registry_tag(format) {
+        Some(f @ (crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K)) => {
+            f.packed_matrix_bytes(1, cols)?
+        }
         _ => return None,
     };
     if bytes.len() < rows * bytes_per_row {

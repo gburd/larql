@@ -265,9 +265,15 @@ fn matvec_q4k_or_q6k_q8k(
     if !cols.is_multiple_of(ELEMS_PER_BLOCK) {
         return None;
     }
-    let bytes_per_row = match format {
-        "Q4_K" => (cols / ELEMS_PER_BLOCK) * 144,
-        "Q6_K" => (cols / ELEMS_PER_BLOCK) * 210,
+    // Gate on the two kernel-backed formats and take the packed row length
+    // from the format helper rather than re-spelling `(cols/256)*144` (twin
+    // of `larql_compute::cpu::ops::q4k_q8k_dot` — kept in sync via
+    // `from_registry_tag`). `%256` is guarded above, so `packed_matrix_bytes`
+    // is exact.
+    let bytes_per_row = match larql_compute::QuantFormat::from_registry_tag(format) {
+        Some(f @ (larql_compute::QuantFormat::Q4_K | larql_compute::QuantFormat::Q6_K)) => {
+            f.packed_matrix_bytes(1, cols)?
+        }
         _ => return None,
     };
     if bytes.len() < rows * bytes_per_row {
@@ -838,9 +844,11 @@ fn run_ffn_decode_step_q4k_direct(
     // intermediate 2112 stored as 2304-col Q6_K rows). Derive the stored
     // width from the byte length and zero-pad the activation to match —
     // pad columns multiply zero activations, so the result is exact.
-    let down_sb_bytes = match down_fmt {
-        "Q4_K" => 144,
-        "Q6_K" => 210,
+    // Bytes per 256-element super-block, from the format helper (= 144 / 210).
+    let down_sb_bytes = match larql_compute::QuantFormat::from_registry_tag(down_fmt) {
+        Some(f @ (larql_compute::QuantFormat::Q4_K | larql_compute::QuantFormat::Q6_K)) => {
+            f.packed_matrix_bytes(1, 256)?
+        }
         _ => return None,
     };
     let down_bytes_per_row = down_bytes.len() / hidden;
@@ -1228,20 +1236,13 @@ mod tests {
         let token_ids = vec![1u32, 2, 3, 4, 5];
         let next = 6u32;
 
-        let (_, mut cache_a, _) =
-            predict_kquant_prefill(&mut weights_a, &token_ids, &index);
-        let (h_staged, _) = predict_kquant_decode_step(
-            &mut weights_a,
-            next,
-            &index,
-            &mut cache_a,
-            token_ids.len(),
-        )
-        .expect("staged step");
+        let (_, mut cache_a, _) = predict_kquant_prefill(&mut weights_a, &token_ids, &index);
+        let (h_staged, _) =
+            predict_kquant_decode_step(&mut weights_a, next, &index, &mut cache_a, token_ids.len())
+                .expect("staged step");
 
         let mut weights_b = make_test_q4k_weights_rope_scaled();
-        let (_, mut cache_b, _) =
-            predict_kquant_prefill(&mut weights_b, &token_ids, &index);
+        let (_, mut cache_b, _) = predict_kquant_prefill(&mut weights_b, &token_ids, &index);
         let backend = CpuBackend;
         let h_direct = predict_kquant_decode_step_direct(
             &mut weights_b,

@@ -559,8 +559,8 @@ pub use larql_models::test_fixtures::{make_gemma3_test_weights, make_starcoder2_
 // `crate::test_utils::*` callers.
 pub use larql_models::test_fixtures::{
     arc_mmap_from_bytes, make_test_q4k_weights, make_test_q4k_weights_layers,
-    make_test_q4k_weights_rope_scaled, make_test_q4k_weights_silu, Q4K_TEST_HIDDEN,
-    Q4K_TEST_INTER, Q4K_TEST_NUM_LAYERS, Q4K_TEST_VOCAB,
+    make_test_q4k_weights_rope_scaled, make_test_q4k_weights_silu, Q4K_TEST_HIDDEN, Q4K_TEST_INTER,
+    Q4K_TEST_NUM_LAYERS, Q4K_TEST_VOCAB,
 };
 /// Build a fully-populated synthetic `VectorIndex` that satisfies the
 /// cached + direct-matvec decode contract on the Q4_K weights from

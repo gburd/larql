@@ -6,9 +6,7 @@
 //! `recompute_kv`. The differences are isolated to cold-tier read/write paths.
 
 use larql_compute::ComputeBackend;
-use larql_inference::attention::{
-    run_attention_with_kv_backend, SharedKV,
-};
+use larql_inference::attention::{run_attention_with_kv_backend, SharedKV};
 use larql_inference::ffn::BackendFfn;
 use larql_inference::forward::embed_tokens_pub;
 use larql_inference::model::ModelWeights;
@@ -117,16 +115,14 @@ pub fn rs_decode_step_codec(
     // configs keep the existing recompute path unchanged.
     let cache_eligible =
         rs.max_window.is_none() && rs.cold_encoded.is_none() && rs.cold_kv.is_none();
-    let mut step_new_kv: Vec<larql_inference::attention::SharedKV> =
-        Vec::with_capacity(num_layers);
+    let mut step_new_kv: Vec<larql_inference::attention::SharedKV> = Vec::with_capacity(num_layers);
     // Move the hot K/V cache out so the steady state (step 2+) can append in
     // place — twin of `markov_residual::compute::rs_decode_step_inner`.
     let mut hot_kv_store = rs.hot_kv;
     let had_hot_kv = hot_kv_store.is_some();
     let idx_kv: Option<&dyn larql_compute::KvIndex> =
         index.map(|v| v as &dyn larql_compute::KvIndex);
-    let inplace_enabled =
-        crate::engines::markov_residual::compute::markov_inplace_kv_enabled();
+    let inplace_enabled = crate::engines::markov_residual::compute::markov_inplace_kv_enabled();
 
     for layer in 0..num_layers {
         // `stored` is a doubling-capacity buffer (W8.2): logical row count is
@@ -173,7 +169,15 @@ pub fn rs_decode_step_codec(
             let (k_buf, v_buf) = &mut bufs[layer];
             let inplace = if inplace_enabled {
                 larql_inference::attention::run_attention_block_decode_step_auto_inplace(
-                    weights, &h_new, layer, k_buf, v_buf, s_hot, abs_position, Some(backend), idx_kv,
+                    weights,
+                    &h_new,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    s_hot,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
                 )
             } else {
                 None
@@ -430,7 +434,8 @@ mod tests {
             None,
         );
         assert_eq!(prefill.store.next_position, 2);
-        let (_, rs2) = rs_decode_step_codec(&weights, 2, prefill.store, &CpuBackend, None, None).unwrap();
+        let (_, rs2) =
+            rs_decode_step_codec(&weights, 2, prefill.store, &CpuBackend, None, None).unwrap();
         assert_eq!(rs2.next_position, 3);
     }
 
@@ -446,7 +451,8 @@ mod tests {
             None,
         );
         assert!(prefill.store.cold_kv.is_some());
-        let (h, _) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
+        let (h, _) =
+            rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(h.iter().all(|v| v.is_finite()));
     }
@@ -464,7 +470,8 @@ mod tests {
             &CpuBackend,
             None,
         );
-        let (_, rs2) = rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
+        let (_, rs2) =
+            rs_decode_step_codec(&weights, 4, prefill.store, &CpuBackend, None, None).unwrap();
         // Second decode: cold_kv was cleared by overflow at the first decode,
         // so this step exercises the cold_encoded recompute branch.
         let (h, _) = rs_decode_step_codec(&weights, 5, rs2, &CpuBackend, None, None).unwrap();
@@ -510,9 +517,18 @@ mod tests {
         let index = make_test_q4k_vindex(&weights);
 
         let run = |inplace: bool| -> (Vec<Vec<u32>>, usize) {
-            set_markov_env_override("LARQL_MARKOV_INPLACE_KV", Some(if inplace { "1" } else { "0" }));
-            let prefill =
-                rs_prefill_codec(&weights, &[0u32, 1, 2], None, ColdResidualCodec::Bf16, &CpuBackend, None);
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
+            let prefill = rs_prefill_codec(
+                &weights,
+                &[0u32, 1, 2],
+                None,
+                ColdResidualCodec::Bf16,
+                &CpuBackend,
+                None,
+            );
             let mut rs = prefill.store;
             let mut hiddens = Vec::new();
             for tok in 3u32..=12 {

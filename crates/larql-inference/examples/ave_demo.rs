@@ -187,9 +187,7 @@ fn main() {
                 for (prompt, expected) in EXPLICIT {
                     let expr = ave.extract(prompt, None).expect("tier-0 fired above");
                     let answer = ave.compute(&expr);
-                    let schedule_ids = ave
-                        .drive(&answer)
-                        .forced_ids(&tok);
+                    let schedule_ids = ave.drive(&answer).forced_ids(&tok);
                     let prompt_ids = tok
                         .encode(*prompt, true)
                         .expect("encode")
@@ -305,11 +303,7 @@ fn showcase(
     use std::io::Write;
 
     let flush = || std::io::stdout().flush().ok();
-    let prompt_ids = tok
-        .encode(prompt, true)
-        .expect("encode")
-        .get_ids()
-        .to_vec();
+    let prompt_ids = tok.encode(prompt, true).expect("encode").get_ids().to_vec();
 
     println!("\n════════════════ AVE showcase ════════════════");
 
@@ -347,7 +341,9 @@ fn showcase(
     println!("GATE       tier-0 fire — math notation adjacent to digit spans   [{gate_us} µs]");
 
     let t = std::time::Instant::now();
-    let expr = ave.extract(prompt, None).expect("tier-0 fire ⇒ symbolic extract");
+    let expr = ave
+        .extract(prompt, None)
+        .expect("tier-0 fire ⇒ symbolic extract");
     let extract_us = t.elapsed().as_micros();
     println!("EXTRACT    {expr}   [symbolic, 0 model tokens, {extract_us} µs]");
 
@@ -366,10 +362,17 @@ fn showcase(
     print!("{prompt}");
     flush();
     let t0 = std::time::Instant::now();
-    let fd = force_decode_kquant_streaming(weights, tok, index, &prompt_ids, &schedule_ids, |_, text| {
-        print!("{text}");
-        flush();
-    });
+    let fd = force_decode_kquant_streaming(
+        weights,
+        tok,
+        index,
+        &prompt_ids,
+        &schedule_ids,
+        |_, text| {
+            print!("{text}");
+            flush();
+        },
+    );
     let drive_ms = t0.elapsed().as_millis();
     println!();
     let n = fd.ids.len();
@@ -387,7 +390,10 @@ fn showcase(
     // something to read — the one place the model's own arithmetic is
     // consumed, as a tripwire, never as the emission.
     let verdict = ave.verify(&answer, Some(&native_text));
-    println!("VERIFY     magnitude prior vs the native attempt: {}", verdict.label());
+    println!(
+        "VERIFY     magnitude prior vs the native attempt: {}",
+        verdict.label()
+    );
 }
 
 #[cfg(all(feature = "gpu", target_os = "macos"))]

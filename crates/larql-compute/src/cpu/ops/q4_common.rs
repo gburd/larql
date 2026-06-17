@@ -823,7 +823,8 @@ pub fn q4k_dual_matvec_into(
                 *out_a_slot = acc_a;
                 *out_b_slot = acc_b;
             }
-        });
+        },
+    );
 }
 
 /// 32-element dual nibble dot product: returns
@@ -1176,7 +1177,11 @@ mod tests {
     #[test]
     fn f16_to_f32_subnormal_pinned_values() {
         // IEEE 754 half subnormals: value = mant × 2^-24 exactly.
-        assert_eq!(super::f16_to_f32(0x0001), 2f32.powi(-24), "smallest subnormal");
+        assert_eq!(
+            super::f16_to_f32(0x0001),
+            2f32.powi(-24),
+            "smallest subnormal"
+        );
         assert_eq!(
             super::f16_to_f32(0x03fe),
             1022.0 * 2f32.powi(-24),
@@ -1188,7 +1193,11 @@ mod tests {
             "largest subnormal"
         );
         assert_eq!(super::f16_to_f32(0x0400), 2f32.powi(-14), "smallest normal");
-        assert_eq!(super::f16_to_f32(0x8001), -(2f32.powi(-24)), "negative subnormal");
+        assert_eq!(
+            super::f16_to_f32(0x8001),
+            -(2f32.powi(-24)),
+            "negative subnormal"
+        );
     }
 
     #[test]
@@ -1580,8 +1589,6 @@ mod tests {
             "Q4 matvec should produce nonzero"
         );
     }
-
-
 
     /// Test alias — dispatches to the canonical module-scope implementation.
     fn dequantize_q4_k_llama(data: &[u8], n_elements: usize) -> Vec<f32> {

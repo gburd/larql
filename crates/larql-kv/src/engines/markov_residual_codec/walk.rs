@@ -9,9 +9,7 @@
 //! take the Q4K-native path.
 
 use larql_compute::ComputeBackend;
-use larql_inference::attention::{
-    run_attention_with_kv_backend, SharedKV,
-};
+use larql_inference::attention::{run_attention_with_kv_backend, SharedKV};
 use larql_inference::forward::{embed_tokens_pub, run_ffn};
 use larql_inference::model::ModelWeights;
 use larql_inference::vindex::{WalkFfn, WalkFfnConfig};

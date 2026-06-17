@@ -422,7 +422,12 @@ fn bench_mt_shapes(c: &mut Criterion) {
 }
 
 #[cfg(target_arch = "aarch64")]
-criterion_group!(benches, bench_q4k_q8k, bench_sb_decomposition, bench_mt_shapes);
+criterion_group!(
+    benches,
+    bench_q4k_q8k,
+    bench_sb_decomposition,
+    bench_mt_shapes
+);
 #[cfg(not(target_arch = "aarch64"))]
 criterion_group!(benches, bench_q4k_q8k);
 criterion_main!(benches);

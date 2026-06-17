@@ -704,17 +704,34 @@ mod tests {
 
     #[test]
     fn match_relation_top1_accepts_exact_and_subword_relations() {
-        let rels = vec!["capital".to_string(), "currency".to_string(), "language".to_string()];
+        let rels = vec![
+            "capital".to_string(),
+            "currency".to_string(),
+            "language".to_string(),
+        ];
         // Full-word top-1 (the common case — these tokenise to one token).
-        assert_eq!(match_relation_top1(&rels, " capital").as_deref(), Some("capital"));
-        assert_eq!(match_relation_top1(&rels, "Currency").as_deref(), Some("currency"));
+        assert_eq!(
+            match_relation_top1(&rels, " capital").as_deref(),
+            Some("capital")
+        );
+        assert_eq!(
+            match_relation_top1(&rels, "Currency").as_deref(),
+            Some("currency")
+        );
         // Leading sub-word still resolves (prefix-match in either direction).
-        assert_eq!(match_relation_top1(&rels, "lang").as_deref(), Some("language"));
+        assert_eq!(
+            match_relation_top1(&rels, "lang").as_deref(),
+            Some("language")
+        );
     }
 
     #[test]
     fn match_relation_top1_abstains_on_none_and_out_of_domain() {
-        let rels = vec!["capital".to_string(), "currency".to_string(), "language".to_string()];
+        let rels = vec![
+            "capital".to_string(),
+            "currency".to_string(),
+            "language".to_string(),
+        ];
         // The `none` escape: top-1 == none → no relation → abstain.
         assert_eq!(match_relation_top1(&rels, "none"), None);
         // Out-of-domain distractors abstain (the confident-wrong fix).

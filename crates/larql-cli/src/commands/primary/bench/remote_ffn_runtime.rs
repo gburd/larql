@@ -68,7 +68,26 @@ pub(super) fn run_remote_ffn_bench(
     }
 
     let timeout = Duration::from_secs(args.ffn_timeout_secs);
-    let backend = larql_compute::default_backend();
+    // The dense remote-FFN walk dispatches through the GPU-only
+    // `decode_token_with_moe`; the CPU `default_backend()` ignores the
+    // remote hook and returns `None` during prefill. Mirror the
+    // `--metal` opt-in in `run_with_remote_ffn` (run_cmd.rs:553): explicit
+    // CLI flag, Metal-init failure falls back to CPU. Each concurrent
+    // worker builds its own backend (this fn runs per spawned thread).
+    let backend: Box<dyn larql_compute::ComputeBackend> = if args.metal {
+        #[cfg(all(feature = "gpu", target_os = "macos"))]
+        {
+            larql_compute_metal::metal_backend()
+                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
+                .unwrap_or_else(larql_compute::cpu_backend)
+        }
+        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
+        {
+            return Err("`--metal` requires the `gpu` feature on macOS".into());
+        }
+    } else {
+        larql_compute::default_backend()
+    };
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let weights = larql_vindex::load_model_weights_kquant(vindex_path, &mut cb)

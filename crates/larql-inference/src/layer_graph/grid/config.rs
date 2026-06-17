@@ -54,7 +54,12 @@ mod tests {
             }
         }
         let _clear = Clear;
-        for var in [ENV_MOE_TOP_K, ENV_SKIP_MOE, ENV_MOE_TIMING, ENV_MOE_NO_SPLIT] {
+        for var in [
+            ENV_MOE_TOP_K,
+            ENV_SKIP_MOE,
+            ENV_MOE_TIMING,
+            ENV_MOE_NO_SPLIT,
+        ] {
             larql_compute::options::set_env_override(var, None);
         }
 

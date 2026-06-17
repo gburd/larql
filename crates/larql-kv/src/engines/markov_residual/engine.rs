@@ -91,10 +91,17 @@ impl MarkovResidualEngine {
                 details: "rs_decode_step_profiled returned None".into(),
             })?
         } else {
-            rs_decode_step(weights, token_id, rs, self.backend.as_ref(), Some(ffn), index)
-                .ok_or_else(|| EngineError::BackendFailure {
-                    details: "rs_decode_step returned None".into(),
-                })?
+            rs_decode_step(
+                weights,
+                token_id,
+                rs,
+                self.backend.as_ref(),
+                Some(ffn),
+                index,
+            )
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "rs_decode_step returned None".into(),
+            })?
         };
         self.store = Some(new_rs);
         Ok(hidden)

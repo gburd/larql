@@ -175,7 +175,10 @@ fn run_chunks(shared: &Shared, participant_id: usize, n_participants: usize) {
         IN_BODY.with(|b| b.set(false));
         if let Err(payload) = r {
             if !shared.panicked.swap(true, Ordering::AcqRel) {
-                *shared.panic_payload.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload);
+                *shared
+                    .panic_payload
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(payload);
             }
         }
         shared.completed.fetch_add(1, Ordering::Release);

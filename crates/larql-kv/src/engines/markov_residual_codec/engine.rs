@@ -104,11 +104,17 @@ impl MarkovResidualCodecEngine {
             .ok_or_else(|| EngineError::InvariantViolation {
                 what: "decode_step called before prefill (store missing)".into(),
             })?;
-        let (hidden, new_rs) =
-            rs_decode_step_codec(weights, token_id, rs, self.backend.as_ref(), Some(ffn), index)
-                .ok_or_else(|| EngineError::BackendFailure {
-                    details: "rs_decode_step_codec returned None".into(),
-                })?;
+        let (hidden, new_rs) = rs_decode_step_codec(
+            weights,
+            token_id,
+            rs,
+            self.backend.as_ref(),
+            Some(ffn),
+            index,
+        )
+        .ok_or_else(|| EngineError::BackendFailure {
+            details: "rs_decode_step_codec returned None".into(),
+        })?;
         self.store = Some(new_rs);
         Ok(hidden)
     }

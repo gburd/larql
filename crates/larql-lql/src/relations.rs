@@ -155,11 +155,11 @@ impl RelationClassifier {
     /// actually populate the index and lets the `none` escape work (rare labels
     /// fall out, so an out-of-domain word finds no plausible match).
     pub fn relation_labels_ranked(&self, top_n: usize) -> Vec<String> {
-        let mut counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         if let Some(clusters) = self.clusters.as_ref() {
             for (i, l) in clusters.labels.iter().enumerate() {
-                *counts.entry(l.clone()).or_insert(0) += clusters.counts.get(i).copied().unwrap_or(0);
+                *counts.entry(l.clone()).or_insert(0) +=
+                    clusters.counts.get(i).copied().unwrap_or(0);
             }
         }
         for l in self.probe_labels.values() {

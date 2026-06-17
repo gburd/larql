@@ -81,15 +81,16 @@ pub fn rs_extend_from_checkpoint_backend(
                 None
             };
 
-            let (h_post_attn, new_kv) = larql_inference::attention::run_attention_block_decode_step_auto(
-                weights,
-                &h,
-                layer,
-                kv_entry,
-                abs_position,
-                Some(backend),
-                index.map(|v| v as &dyn larql_compute::KvIndex),
-            )?;
+            let (h_post_attn, new_kv) =
+                larql_inference::attention::run_attention_block_decode_step_auto(
+                    weights,
+                    &h,
+                    layer,
+                    kv_entry,
+                    abs_position,
+                    Some(backend),
+                    index.map(|v| v as &dyn larql_compute::KvIndex),
+                )?;
 
             let bffn = BackendFfn { weights, backend };
             let h_out =
@@ -160,7 +161,15 @@ pub fn rs_extend_inplace(
         for (layer, (k_buf, v_buf)) in kv_cache.iter_mut().enumerate() {
             let h_post_attn =
                 match larql_inference::attention::run_attention_block_decode_step_auto_inplace(
-                    weights, &h, layer, k_buf, v_buf, len, abs_position, Some(backend), idx_kv,
+                    weights,
+                    &h,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    len,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
                 ) {
                     Some(hp) => hp,
                     None => {

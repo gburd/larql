@@ -167,12 +167,7 @@ where
 {
     if !super::cached::supports_cached_decode(weights) {
         return generate_kquant_cpu_constrained(
-            weights,
-            tokenizer,
-            prompt_ids,
-            max_tokens,
-            index,
-            mask_fn,
+            weights, tokenizer, prompt_ids, max_tokens, index, mask_fn,
         );
     }
     let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
@@ -185,7 +180,8 @@ where
         crate::layer_graph::Sampler::new(crate::layer_graph::SamplingConfig::greedy());
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    let (h, mut cache, _timings) = super::cached::predict_kquant_prefill(weights, prompt_ids, index);
+    let (h, mut cache, _timings) =
+        super::cached::predict_kquant_prefill(weights, prompt_ids, index);
     let last = h.nrows().saturating_sub(1);
     let mut h_last = h.slice(ndarray::s![last..last + 1, ..]).to_owned();
 
@@ -196,7 +192,9 @@ where
     // `examples/ave_direct_step_parity.rs`, post-fix hidden cosine
     // 0.99995, identical top-k). `LARQL_DIRECT_DECODE_STEP=0` forces the
     // staged step for A/B runs.
-    let direct = std::env::var("LARQL_DIRECT_DECODE_STEP").map(|v| v != "0").unwrap_or(true)
+    let direct = std::env::var("LARQL_DIRECT_DECODE_STEP")
+        .map(|v| v != "0")
+        .unwrap_or(true)
         && super::cached::supports_direct_matvec_decode(weights, index);
     let backend = larql_compute::default_backend();
 

@@ -79,9 +79,7 @@ fn first_number(text: &str) -> Option<BigInt> {
     let mut i = 0;
     while i < chars.len() {
         if chars[i].is_ascii_digit() {
-            let neg = i > 0
-                && chars[i - 1] == '-'
-                && (i == 1 || !chars[i - 2].is_ascii_digit());
+            let neg = i > 0 && chars[i - 1] == '-' && (i == 1 || !chars[i - 2].is_ascii_digit());
             let mut digits = String::new();
             while i < chars.len() {
                 let c = chars[i];
@@ -146,7 +144,10 @@ mod tests {
             magnitude_prior(&big("0"), Some("12"), 2),
             Verdict::Suspect(_)
         ));
-        assert_eq!(magnitude_prior(&big("0"), Some("0"), 2), Verdict::Consistent);
+        assert_eq!(
+            magnitude_prior(&big("0"), Some("0"), 2),
+            Verdict::Consistent
+        );
     }
 
     #[test]

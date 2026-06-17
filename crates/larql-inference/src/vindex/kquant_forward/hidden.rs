@@ -162,7 +162,15 @@ pub fn moe_ffn_block_cpu(
     ple_input: Option<&Array2<f32>>,
     moe_remote: Option<&crate::ffn::RemoteMoeBackend>,
 ) -> Array2<f32> {
-    moe_ffn_block_cpu_with_index(weights, h_post_attn, layer, ffn, ple_input, moe_remote, None)
+    moe_ffn_block_cpu_with_index(
+        weights,
+        h_post_attn,
+        layer,
+        ffn,
+        ple_input,
+        moe_remote,
+        None,
+    )
 }
 
 /// `LARQL_Q4K_DIRECT_FFN=1` routes the hybrid-MoE *dense slab* through the
@@ -217,9 +225,7 @@ pub fn moe_ffn_block_cpu_with_index(
                 layer,
             )
         })
-        .unwrap_or_else(|| {
-            crate::forward::run_ffn(weights, h_post_attn, layer, ffn, false).0
-        });
+        .unwrap_or_else(|| crate::forward::run_ffn(weights, h_post_attn, layer, ffn, false).0);
     crate::decode_stages::record_dense(_t_dense.elapsed().as_nanos());
     let h1 = &h_post_ffn_dense - h_post_attn;
 

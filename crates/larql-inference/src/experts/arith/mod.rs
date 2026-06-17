@@ -24,7 +24,9 @@ use tokenizers::Tokenizer;
 
 use crate::vindex::generate_kquant_cpu_cached;
 
-use super::virtual_expert::{DriveSchedule, ExtractMiss, Fire, ResidualTap, Verdict, VirtualExpert};
+use super::virtual_expert::{
+    DriveSchedule, ExtractMiss, Fire, ResidualTap, Verdict, VirtualExpert,
+};
 use alu::{BigInt, Expr};
 use drive::TerminationCause;
 
@@ -207,8 +209,13 @@ pub fn ave_generate_kquant(
                 .map_err(|e| format!("tokenize rewrite prompt: {e}"))?
                 .get_ids()
                 .to_vec();
-            let rew =
-                generate_kquant_cpu_cached(weights, tokenizer, &rids, opts.rewrite_max_tokens, index);
+            let rew = generate_kquant_cpu_cached(
+                weights,
+                tokenizer,
+                &rids,
+                opts.rewrite_max_tokens,
+                index,
+            );
             rewrite_tokens = rew.len();
             let rew_text: String = rew.iter().map(|(t, _)| t.as_str()).collect();
             match expert.extract(prompt, Some(&rew_text)) {
@@ -284,8 +291,13 @@ fn run_native(
     prompt_ids: &[u32],
     opts: &AveOptions,
 ) -> (String, usize) {
-    let out =
-        generate_kquant_cpu_cached(weights, tokenizer, prompt_ids, opts.max_native_tokens, index);
+    let out = generate_kquant_cpu_cached(
+        weights,
+        tokenizer,
+        prompt_ids,
+        opts.max_native_tokens,
+        index,
+    );
     let n = out.len();
     (out.into_iter().map(|(t, _)| t).collect(), n)
 }
@@ -332,7 +344,9 @@ pub fn decomposition_residual(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights, synthetic_tokenizer_json};
+    use crate::test_utils::{
+        make_test_q4k_vindex, make_test_q4k_weights, synthetic_tokenizer_json,
+    };
 
     /// Fixture tokenizer with `[UNK]` mapped to id 0 (a real vocab slot), so
     /// free-text prompts — which the WordLevel fixture can't represent —
@@ -393,7 +407,13 @@ mod tests {
         };
         // "[1] [2]" carries digits but no operator — must not fire.
         let out = ave_generate_kquant(
-            &ave, &mut weights, &tokenizer, &index, "[1] [2]", None, &opts,
+            &ave,
+            &mut weights,
+            &tokenizer,
+            &index,
+            "[1] [2]",
+            None,
+            &opts,
         )
         .expect("run");
         assert_eq!(out.path, AvePath::Native);

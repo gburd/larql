@@ -51,7 +51,9 @@ fn main() {
     let mut seed = 0x2545F4914F6CDD1Du64;
     let x: Vec<f32> = (0..hidden)
         .map(|_| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         })
         .collect();
@@ -63,7 +65,10 @@ fn main() {
     for &layer in &layers {
         let attn = index.attn_kquant_layer_data(layer).expect("attn data");
         let (k_bytes, k_fmt) = attn[1];
-        println!("\nlayer {layer}: k_fmt={k_fmt} kv_dim={arch_kv} bytes={}", k_bytes.len());
+        println!(
+            "\nlayer {layer}: k_fmt={k_fmt} kv_dim={arch_kv} bytes={}",
+            k_bytes.len()
+        );
         if k_fmt != "Q4_K" {
             println!("  (not Q4_K, skipping)");
             continue;
@@ -88,9 +93,19 @@ fn main() {
             let b: f32 = deq.iter().zip(x.iter()).map(|(w, v)| w * v).sum();
             // (c): staged row — orientation per dequantize_matrix(rows=kv_dim, cols=hidden).
             let c: f32 = if w_staged.shape()[0] == arch_kv {
-                w_staged.row(r).iter().zip(x.iter()).map(|(w, v)| w * v).sum()
+                w_staged
+                    .row(r)
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(w, v)| w * v)
+                    .sum()
             } else {
-                w_staged.column(r).iter().zip(x.iter()).map(|(w, v)| w * v).sum()
+                w_staged
+                    .column(r)
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(w, v)| w * v)
+                    .sum()
             };
             let scale = b.abs().max(1e-3);
             let dab = (a[0] - b).abs() / scale;
@@ -151,7 +166,10 @@ fn main() {
             let blk = i / 256;
             let row_bytes = &k_bytes_owned[r * bytes_per_row..(r + 1) * bytes_per_row];
             let block = &row_bytes[blk * 144..(blk + 1) * 144];
-            println!("  forensic block row {r} block {blk} (elem {i} = in-block {}):", i % 256);
+            println!(
+                "  forensic block row {r} block {blk} (elem {i} = in-block {}):",
+                i % 256
+            );
             println!("    header[0..16]: {:02x?}", &block[0..16]);
             let via_common = dequantize_q4_k(block, 256);
             let info = larql_vindex::quant::registry::lookup("Q4_K").expect("registry");

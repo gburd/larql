@@ -1036,9 +1036,14 @@ mod tests {
         let ffn = NullFfn;
 
         let run = |inplace: bool| -> Vec<Vec<u32>> {
-            set_markov_env_override("LARQL_MARKOV_INPLACE_KV", Some(if inplace { "1" } else { "0" }));
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
             let mut engine = UnlimitedContextEngine::new(512);
-            engine.prefill(&weights, &ffn, &[0u32, 1, 2]).expect("prefill");
+            engine
+                .prefill(&weights, &ffn, &[0u32, 1, 2])
+                .expect("prefill");
             let mut hiddens = Vec::new();
             for tok in 3u32..=12 {
                 let h = engine
@@ -1052,7 +1057,10 @@ mod tests {
 
         let a = run(true);
         let b = run(false);
-        assert_eq!(a, b, "unlimited in-place vs owned-concat hidden states diverged (q4k on)");
+        assert_eq!(
+            a, b,
+            "unlimited in-place vs owned-concat hidden states diverged (q4k on)"
+        );
     }
 
     #[test]

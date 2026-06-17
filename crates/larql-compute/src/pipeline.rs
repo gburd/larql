@@ -91,6 +91,29 @@ impl QuantFormat {
     pub fn is_legacy_q8(self) -> bool {
         matches!(self, Self::Q4_0 | Self::Q8_0)
     }
+
+    /// Parse a GGUF-convention registry tag (`"Q4_K"`, `"Q6_K"`, …) into a
+    /// `QuantFormat`. The canonical inverse of the names the extractor and
+    /// weight manifests record; `None` for any tag with no compute mapping.
+    ///
+    /// This is the contained version of Roadmap #7's `from_registry_tag`:
+    /// it lets the string-keyed matvec dispatchers (`q4k_q8k_matvec_parallel`,
+    /// `kquant_forward::cached`) ask the format for its packed layout instead
+    /// of re-spelling `(cols/256)*144` locally, without changing their `&str`
+    /// call-site signatures.
+    pub fn from_registry_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "Q4_0" => Self::Q4_0,
+            "Q4_K" => Self::Q4_K,
+            "Q4_KF" => Self::Q4_KF,
+            "Q6_K" => Self::Q6_K,
+            "Q8_0" => Self::Q8_0,
+            "BF16" => Self::BF16,
+            "F16" => Self::F16,
+            "F32" => Self::F32,
+            _ => return None,
+        })
+    }
 }
 
 /// A quantized weight matrix — raw bytes with format tag.
@@ -867,6 +890,44 @@ mod tests {
         assert_eq!(QuantFormat::Q4_KF.packed_matrix_bytes(2, 256), Some(320));
         assert_eq!(QuantFormat::Q6_K.packed_matrix_bytes(2, 256), Some(420));
         assert_eq!(QuantFormat::F16.packed_matrix_bytes(2, 256), None);
+    }
+
+    #[test]
+    fn from_registry_tag_round_trips_known_tags_and_rejects_unknown() {
+        for (tag, fmt) in [
+            ("Q4_0", QuantFormat::Q4_0),
+            ("Q4_K", QuantFormat::Q4_K),
+            ("Q4_KF", QuantFormat::Q4_KF),
+            ("Q6_K", QuantFormat::Q6_K),
+            ("Q8_0", QuantFormat::Q8_0),
+            ("BF16", QuantFormat::BF16),
+            ("F16", QuantFormat::F16),
+            ("F32", QuantFormat::F32),
+        ] {
+            assert_eq!(QuantFormat::from_registry_tag(tag), Some(fmt));
+        }
+        assert_eq!(QuantFormat::from_registry_tag("Q42_X"), None);
+        assert_eq!(QuantFormat::from_registry_tag("q4_k"), None); // case-sensitive
+        assert_eq!(QuantFormat::from_registry_tag(""), None);
+    }
+
+    /// The two string-keyed matvec dispatchers derive their packed row
+    /// stride as `(cols / block_elems) * block_bytes`; pin that this equals
+    /// what `from_registry_tag` + `packed_block_layout` produce for the
+    /// Q4_K / Q6_K tags they accept (256-multiple cols).
+    #[test]
+    fn registry_tag_block_layout_matches_dispatcher_stride() {
+        let cols = 512usize;
+        for (tag, raw_block_bytes) in [("Q4_K", 144usize), ("Q6_K", 210usize)] {
+            let fmt = QuantFormat::from_registry_tag(tag).unwrap();
+            let (block_elems, block_bytes) = fmt.packed_block_layout().unwrap();
+            assert_eq!(block_elems, 256);
+            assert_eq!(block_bytes, raw_block_bytes);
+            assert_eq!(
+                (cols / block_elems) * block_bytes,
+                (cols / 256) * raw_block_bytes
+            );
+        }
     }
 
     /// `..Default::default()` must work with stack-local borrowed data —

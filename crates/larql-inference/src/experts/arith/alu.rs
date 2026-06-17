@@ -306,7 +306,8 @@ fn sub_mag(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(a.len());
     let mut borrow = 0i8;
     for (i, da) in a.iter().enumerate() {
-        let mut d = i8::try_from(*da).expect("digit") - borrow
+        let mut d = i8::try_from(*da).expect("digit")
+            - borrow
             - i8::try_from(b.get(i).copied().unwrap_or(0)).expect("digit");
         if d < 0 {
             d += 10;
@@ -435,11 +436,15 @@ mod tests {
     #[test]
     fn eval_precedence_mul_before_add() {
         assert_eq!(
-            expr(&["2", "3", "4"], &[Op::Add, Op::Mul]).eval().to_string(),
+            expr(&["2", "3", "4"], &[Op::Add, Op::Mul])
+                .eval()
+                .to_string(),
             "14"
         );
         assert_eq!(
-            expr(&["2", "3", "4"], &[Op::Mul, Op::Add]).eval().to_string(),
+            expr(&["2", "3", "4"], &[Op::Mul, Op::Add])
+                .eval()
+                .to_string(),
             "10"
         );
     }
@@ -505,9 +510,21 @@ mod tests {
             let b: i64 = rng.gen();
             let (a, b) = (i128::from(a), i128::from(b));
             let (ba, bb) = (big(&a.to_string()), big(&b.to_string()));
-            assert_eq!(ba.add(&bb).to_string(), (a + b).to_string(), "case {case}: {a}+{b}");
-            assert_eq!(ba.sub(&bb).to_string(), (a - b).to_string(), "case {case}: {a}-{b}");
-            assert_eq!(ba.mul(&bb).to_string(), (a * b).to_string(), "case {case}: {a}*{b}");
+            assert_eq!(
+                ba.add(&bb).to_string(),
+                (a + b).to_string(),
+                "case {case}: {a}+{b}"
+            );
+            assert_eq!(
+                ba.sub(&bb).to_string(),
+                (a - b).to_string(),
+                "case {case}: {a}-{b}"
+            );
+            assert_eq!(
+                ba.mul(&bb).to_string(),
+                (a * b).to_string(),
+                "case {case}: {a}*{b}"
+            );
         }
     }
 
@@ -519,12 +536,24 @@ mod tests {
         for width in 1..=40 {
             let nines = "9".repeat(width);
             let one_zeros = format!("1{}", "0".repeat(width));
-            assert_eq!(big(&nines).add(&big("1")).to_string(), one_zeros, "width {width}");
-            assert_eq!(big(&one_zeros).sub(&big("1")).to_string(), nines, "width {width}");
+            assert_eq!(
+                big(&nines).add(&big("1")).to_string(),
+                one_zeros,
+                "width {width}"
+            );
+            assert_eq!(
+                big(&one_zeros).sub(&big("1")).to_string(),
+                nines,
+                "width {width}"
+            );
             // Nines-complement pair sums to all nines (the demo's 24-digit
             // construction, generalized): N + (nines − N) = nines.
             let n = big(&"4".repeat(width));
-            assert_eq!(n.add(&big(&nines).sub(&n)).to_string(), nines, "width {width}");
+            assert_eq!(
+                n.add(&big(&nines).sub(&n)).to_string(),
+                nines,
+                "width {width}"
+            );
         }
     }
 

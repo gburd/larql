@@ -402,9 +402,14 @@ fn q8k_direct_proj(
     if !in_dim.is_multiple_of(256) {
         return None;
     }
+    // Only the Q4_K / Q6_K k-quant layouts have a `q*k_q8k_matvec_into`
+    // kernel below; gate on those two, but take the packed row stride from
+    // the format helper instead of re-spelling `(in_dim/256)*144`/`*210`
+    // (= `Q4_K_BLOCK_BYTES` / `Q6_K_BLOCK_BYTES` per 256-element block).
     let bytes_per_row = match qw.format {
-        crate::QuantFormat::Q4_K => (in_dim / 256) * 144,
-        crate::QuantFormat::Q6_K => (in_dim / 256) * 210,
+        crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K => {
+            qw.format.packed_matrix_bytes(1, in_dim)?
+        }
         _ => return None,
     };
     if qw.data.len() < num_rows * bytes_per_row {
@@ -647,12 +652,20 @@ pub fn decode_step_attend_q4k_direct(
     let int8 = attn_int8_enabled();
 
     let softcap = arch.attn_logit_softcapping();
-    let attn_out =
-        gqa_attention_decode_step(q_rope, &k_all, &v_all, num_q, head_dim, reps, scale, softcap);
+    let attn_out = gqa_attention_decode_step(
+        q_rope, &k_all, &v_all, num_q, head_dim, reps, scale, softcap,
+    );
 
     let mut attn_out_q8k: Option<crate::cpu::ops::q4k_q8k_dot::Q8KActivation> = None;
-    let mut attn_projected =
-        direct_proj(backend, &wo, &attn_out, &mut attn_out_q8k, int8, hidden, q_dim)?;
+    let mut attn_projected = direct_proj(
+        backend,
+        &wo,
+        &attn_out,
+        &mut attn_out_q8k,
+        int8,
+        hidden,
+        q_dim,
+    )?;
     if let Some(bias) = arch
         .attn_o_bias_key(layer)
         .and_then(|k| weights.vectors.get(&k))
@@ -831,7 +844,15 @@ pub fn run_attention_block_decode_step_auto_inplace(
     if q4k_direct_attn_enabled() {
         if let (Some(be), Some(idx)) = (backend, index) {
             return run_attention_block_decode_step_q4k_direct_inplace(
-                weights, h_new, layer, k_cache, v_cache, cache_len, abs_position, be, idx,
+                weights,
+                h_new,
+                layer,
+                k_cache,
+                v_cache,
+                cache_len,
+                abs_position,
+                be,
+                idx,
             );
         }
     }
@@ -872,8 +893,7 @@ mod tests {
                 scales: None,
                 format: fmt,
             };
-            let chunked =
-                q8k_direct_proj(&qw, &q8, num_rows, in_dim).expect("q8k proj must run");
+            let chunked = q8k_direct_proj(&qw, &q8, num_rows, in_dim).expect("q8k proj must run");
 
             let mut whole = vec![0.0f32; num_rows];
             match fmt {
@@ -1067,10 +1087,12 @@ mod tests {
         // Concat-path cache: one owned SharedKV per layer (grows by concat).
         let mut concat_kv: Vec<Option<SharedKV>> = vec![None; num_layers];
         // In-place cache: doubling-capacity buffers per layer + a logical length.
-        let mut inplace_k: Vec<Array2<f32>> =
-            (0..num_layers).map(|_| Array2::zeros((0, kv_dim))).collect();
-        let mut inplace_v: Vec<Array2<f32>> =
-            (0..num_layers).map(|_| Array2::zeros((0, kv_dim))).collect();
+        let mut inplace_k: Vec<Array2<f32>> = (0..num_layers)
+            .map(|_| Array2::zeros((0, kv_dim)))
+            .collect();
+        let mut inplace_v: Vec<Array2<f32>> = (0..num_layers)
+            .map(|_| Array2::zeros((0, kv_dim)))
+            .collect();
 
         for step in 0..6 {
             // The buffer's logical length at the start of this step == `step`.
@@ -1103,24 +1125,43 @@ mod tests {
 
                 // h_post_attn must match bit-for-bit.
                 for (a, b) in h_concat.iter().zip(h_inplace.iter()) {
-                    assert_eq!(a.to_bits(), b.to_bits(), "h_post_attn diverged step {step} layer {layer}");
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "h_post_attn diverged step {step} layer {layer}"
+                    );
                 }
                 // The in-place buffer's logical view must equal the concat K/V.
                 let total = len + 1;
                 let k_view = inplace_k[layer].slice(ndarray::s![..total, ..]);
                 let v_view = inplace_v[layer].slice(ndarray::s![..total, ..]);
-                assert_eq!(new_kv.0.shape(), k_view.shape(), "K shape step {step} layer {layer}");
+                assert_eq!(
+                    new_kv.0.shape(),
+                    k_view.shape(),
+                    "K shape step {step} layer {layer}"
+                );
                 for (a, b) in new_kv.0.iter().zip(k_view.iter()) {
-                    assert_eq!(a.to_bits(), b.to_bits(), "K diverged step {step} layer {layer}");
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "K diverged step {step} layer {layer}"
+                    );
                 }
                 for (a, b) in new_kv.1.iter().zip(v_view.iter()) {
-                    assert_eq!(a.to_bits(), b.to_bits(), "V diverged step {step} layer {layer}");
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "V diverged step {step} layer {layer}"
+                    );
                 }
                 concat_kv[layer] = Some(new_kv);
             }
         }
         // Buffer must have grown past its first allocation (crossed a doubling).
-        assert!(inplace_k[0].shape()[0] >= 6, "buffer should have grown to hold 6 rows");
+        assert!(
+            inplace_k[0].shape()[0] >= 6,
+            "buffer should have grown to hold 6 rows"
+        );
     }
 
     #[test]
@@ -1181,7 +1222,8 @@ mod tests {
         // carries a looser (~2% scale-relative) bound by design, so disable it
         // here. Thread-local override (NOT `set_var`, which races concurrent
         // `getenv` on the decode path → SIGSEGV); cleared on drop.
-        let _guard = crate::options::FastPathGuard::set(&[(crate::options::ENV_Q4K_ATTN_INT8, false)]);
+        let _guard =
+            crate::options::FastPathGuard::set(&[(crate::options::ENV_Q4K_ATTN_INT8, false)]);
 
         // Parity contract (roadmap #16, "<1e-3"): the Q4K-direct decode
         // step should track the f32-BLAS path that runs on the SAME bytes

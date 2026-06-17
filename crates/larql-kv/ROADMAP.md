@@ -502,15 +502,42 @@ risk/leverage; the first is a live correctness bug.
 3. **Quantization meshing — finish deferred ROADMAP #7 (`FormatRoute`).**
    `QuantFormat` exists with helpers (`packed_matrix_bytes`, `packed_block_layout`,
    `is_kquant_family`) and a clean dispatch point (`backend.quant_matvec`), but
-   hand-rolled fast paths bypass them and re-mesh magic numbers. Verified worst
-   offenders: `larql-compute/src/attention/decode.rs:405` (`(in_dim/256)*144` /
-   `*210` — duplicates `packed_matrix_bytes(1, in_dim)`); `cpu/ops/moe/expert.rs`
-   (silently **Q4_K-only**: `matches!(format, Q4_K)` + hardcoded
-   `Q4_K_BLOCK_BYTES`); `pipeline_layer.rs`'s twin `attn_str_to_format`/
-   `ffn_str_to_format` panicking string tables. **Proposal:** *Step 1 (≈1 hr,
-   zero-risk):* swap the magic numbers for `packed_matrix_bytes()`. *Step 2:* a
-   `QuantFormat::q8k_matvec_into_fn()` kernel table + `from_registry_tag()` so a
-   new format is ~3 edits, not ~49 files.
+   hand-rolled fast paths bypass them and re-mesh magic numbers.
+
+   **Step 1 (magic-numbers→helper) — DONE 2026-06-17.** Three production sites that
+   re-derived the packed row stride as `(cols/256)*144`/`*210` now ask the format:
+   - `attention/decode.rs` `q8k_direct_proj` → `packed_matrix_bytes(1, in_dim)`
+     (path already requires `in_dim % 256 == 0`, so identical).
+   - `cpu/ops/q4k_q8k_dot.rs` `q4k_q8k_matvec_parallel` (the *centralized* matvec
+     twin) and `kquant_forward/cached.rs` `matvec_q4k_or_q6k_q8k` — both were
+     **string-keyed** (`format: &str`), so the magic-number and string-table
+     problems converged there. Added `QuantFormat::from_registry_tag(&str)` (the
+     contained version of #7's named helper) and routed both through
+     `from_registry_tag` → `packed_block_layout`/`packed_matrix_bytes`. The
+     centralized twin now parses the tag once and keys its kernel dispatch off the
+     `QuantFormat` (not a second string match). No call-site signature changes.
+     `q4k_q8k_matvec_parallel` keeps the truncating `cols/block_elems` (no `%256`
+     guard there) via `packed_block_layout`; `cached.rs` uses `packed_matrix_bytes`
+     (it guards `%256`). Numerically identical — full larql-compute suite green
+     (33 q8k + 77 decode + 43 kquant + 2 new `from_registry_tag` tests), clippy clean.
+   - `larql-inference/src/vindex/kquant_forward/cached.rs` — the "consolidation
+     hazard twin" the compute dispatcher's own doc-comment names. Both its sites
+     (`matvec_q4k_or_q6k_q8k` row stride + the `down_sb_bytes` per-super-block
+     check) now route through `QuantFormat::from_registry_tag` so the two crates'
+     copies stay in sync. 60 kquant + 46 cached inference tests green.
+
+   *Lower-priority Step-1 tail (deferred, low value):* `q4_common.rs` is the packer
+   where 144/210 are legitimately *defined* (consumer-side strides at 344/350 could
+   still ask the format); the `*18` Q4_0 legacy-block sites (`q4_matvec.rs`,
+   `q4_common.rs:58`, `gpu.rs:512`) are the block-32 equivalent.
+
+   **Remaining offenders (Step 2 territory):** `cpu/ops/moe/expert.rs` is silently
+   **Q4_K-only** (`matches!(format, Q4_K)` + hardcoded `Q4_K_BLOCK_BYTES` at 274/453
+   — these are *named* constants, lesser offense; the real issue is the Q4_K-only
+   dispatch); `pipeline_layer.rs`'s twin `attn_str_to_format`/`ffn_str_to_format`
+   panicking string tables (now subsumable by `from_registry_tag`). **Step 2:** a
+   `QuantFormat::q8k_matvec_into_fn()` kernel table so a new format is ~3 edits, not
+   ~49 files — this generalizes the Q4_K-only dispatchers to any k-quant kernel.
 
 4. **Engine pluggability — finish the `LayerExecutor` migration.** A new engine
    needs 4 required methods but **~8 boilerplate overrides** (the

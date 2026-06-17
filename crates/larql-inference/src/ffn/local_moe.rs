@@ -102,7 +102,10 @@ mod tests {
     #[test]
     fn forward_moe_full_layer_returns_finite_combined_output() {
         let weights = make_test_gemma4_moe_weights();
-        let ffn = LocalMoeFfn { weights: &weights, index: None };
+        let ffn = LocalMoeFfn {
+            weights: &weights,
+            index: None,
+        };
         let h_post_attn = Array2::<f32>::from_elem((2, weights.hidden_size), 0.1);
         let out = ffn
             .forward_moe_full_layer(0, &h_post_attn)
@@ -136,7 +139,10 @@ mod tests {
         // (The synthetic fixture's expert weights are tiny, so the delta is
         // small but strictly non-zero; an identically-zeroed h2 would give a
         // bit-exact match.)
-        let local = LocalMoeFfn { weights: &weights, index: None };
+        let local = LocalMoeFfn {
+            weights: &weights,
+            index: None,
+        };
         let disconnected = RemoteMoeBackend::new_disconnected();
         let remote = RemoteMoeFfn {
             weights: &weights,
@@ -162,7 +168,10 @@ mod tests {
     #[test]
     fn dense_fallbacks_and_name() {
         let weights = make_test_gemma4_moe_weights();
-        let ffn = LocalMoeFfn { weights: &weights, index: None };
+        let ffn = LocalMoeFfn {
+            weights: &weights,
+            index: None,
+        };
         assert_eq!(ffn.name(), "local-moe");
         let x = Array2::<f32>::from_elem((2, weights.hidden_size), 0.1);
         let dense = ffn.forward(0, &x);

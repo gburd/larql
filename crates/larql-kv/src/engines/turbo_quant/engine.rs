@@ -469,7 +469,6 @@ impl KvEngine for TurboQuantEngine {
         self.decode_step_impl(weights, ffn, token_id, Some(index))
     }
 
-
     fn memory_bytes(&self) -> usize {
         self.layers.iter().map(|l| l.memory_bytes()).sum()
     }

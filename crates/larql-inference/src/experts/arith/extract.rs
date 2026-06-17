@@ -17,8 +17,15 @@ use super::alu::{BigInt, Expr, Op};
 /// char indices into the input, used for the weak-chain cue check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
-    Num { digits: String, start: usize, end: usize },
-    Op { op: Op, weak: bool },
+    Num {
+        digits: String,
+        start: usize,
+        end: usize,
+    },
+    Op {
+        op: Op,
+        weak: bool,
+    },
     Other,
 }
 
@@ -157,9 +164,8 @@ pub fn find_triggers(text: &str) -> Vec<(Expr, usize)> {
 /// next non-whitespace char after the chain is `=` (see
 /// [`find_expression`] docs).
 fn chain_qualifies(chars: &[char], toks: &[Tok], start: usize, op_count: usize) -> bool {
-    let has_strong = (0..op_count).any(|k| {
-        matches!(toks[start + 2 * k + 1], Tok::Op { weak: false, .. })
-    });
+    let has_strong =
+        (0..op_count).any(|k| matches!(toks[start + 2 * k + 1], Tok::Op { weak: false, .. }));
     if has_strong {
         return true;
     }
@@ -265,7 +271,10 @@ mod tests {
             parse("What is 123456 + 654321?"),
             Some("123456 + 654321 -> 777777".into())
         );
-        assert_eq!(parse("12345 * 6789"), Some("12345 * 6789 -> 83810205".into()));
+        assert_eq!(
+            parse("12345 * 6789"),
+            Some("12345 * 6789 -> 83810205".into())
+        );
         assert_eq!(parse("12×34"), Some("12 * 34 -> 408".into()));
         assert_eq!(parse("3 x 4 ="), Some("3 * 4 -> 12".into()));
         assert_eq!(parse("100000 - 1 ="), Some("100000 - 1 -> 99999".into()));
@@ -319,7 +328,10 @@ mod tests {
 
     #[test]
     fn hyphen_needs_whitespace_both_sides_and_equals_notation() {
-        assert!(find_expression("100-1 =").is_none(), "unspaced never counts");
+        assert!(
+            find_expression("100-1 =").is_none(),
+            "unspaced never counts"
+        );
         assert!(find_expression("100- 1 =").is_none());
         assert!(find_expression("100 -1 =").is_none());
         assert!(find_expression("100 - 1 =").is_some());
@@ -334,7 +346,10 @@ mod tests {
         assert!(find_expression("3 x 4 =").is_some(), "= notation");
         assert!(find_expression("3 x 4").is_none(), "bare → native");
         assert!(find_expression("matrix 3 x 4").is_none(), "prose dimension");
-        assert!(find_expression("what is 3 x 4?").is_none(), "? is not notation");
+        assert!(
+            find_expression("what is 3 x 4?").is_none(),
+            "? is not notation"
+        );
     }
 
     #[test]

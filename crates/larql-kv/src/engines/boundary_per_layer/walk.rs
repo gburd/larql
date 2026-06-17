@@ -10,9 +10,7 @@
 //! typically on backends/vindexes lacking direct-matvec decode.
 
 use larql_compute::ComputeBackend;
-use larql_inference::attention::{
-    run_attention_with_kv_backend, SharedKV,
-};
+use larql_inference::attention::{run_attention_with_kv_backend, SharedKV};
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::embed_tokens_pub;
 use larql_inference::model::ModelWeights;
@@ -138,9 +136,14 @@ pub(super) fn run_decode(
                 // f32 `recompute_kv` by >1e-2; it has its own A/B oracle).
                 if !larql_compute::options::q4k_direct_attn_enabled() {
                     let (k_buf, v_buf) = &bufs[layer];
-                    if let Some((rk, rv)) =
-                        recompute_kv(weights, &rs.stored[layer], layer, hot_abs_start, backend, None)
-                    {
+                    if let Some((rk, rv)) = recompute_kv(
+                        weights,
+                        &rs.stored[layer],
+                        layer,
+                        hot_abs_start,
+                        backend,
+                        None,
+                    ) {
                         let kd = k_buf
                             .slice(s![..s_hot, ..])
                             .iter()
@@ -161,7 +164,15 @@ pub(super) fn run_decode(
             let (k_buf, v_buf) = &mut bufs[layer];
             let inplace = if inplace_enabled {
                 larql_inference::attention::run_attention_block_decode_step_auto_inplace(
-                    weights, &h_new, layer, k_buf, v_buf, s_hot, abs_position, Some(backend), idx_kv,
+                    weights,
+                    &h_new,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    s_hot,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
                 )
             } else {
                 None
@@ -360,7 +371,8 @@ mod tests {
         let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(4), &[0]).unwrap();
         assert!(rs.cold_encoded.is_none());
 
-        let (hidden, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 1, None).unwrap();
+        let (hidden, rs_after) =
+            run_decode(&weights, &ffn, &backend, &policy, rs, 1, None).unwrap();
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs_after.next_position, 2);
         for slab in &rs_after.stored {
@@ -422,7 +434,10 @@ mod tests {
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
 
         let run = |inplace: bool| -> (Vec<Vec<u32>>, usize) {
-            set_markov_env_override("LARQL_MARKOV_INPLACE_KV", Some(if inplace { "1" } else { "0" }));
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
             let (_, mut rs) =
                 run_prefill(&weights, &ffn, &backend, &policy, None, &[0u32, 1, 2]).unwrap();
             let mut hiddens = Vec::new();
@@ -440,7 +455,10 @@ mod tests {
         let (b, b_pos) = run(false);
         assert_eq!(a_pos, 13, "3 prompt + 10 decode");
         assert_eq!(a_pos, b_pos);
-        assert_eq!(a, b, "boundary-per-layer in-place vs owned-concat hidden states diverged");
+        assert_eq!(
+            a, b,
+            "boundary-per-layer in-place vs owned-concat hidden states diverged"
+        );
     }
 
     #[test]

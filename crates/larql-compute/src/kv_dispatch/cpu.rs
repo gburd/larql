@@ -30,8 +30,7 @@ use ndarray::Array2;
 
 use super::{KvDispatch, KvHandle, KvHandleInner, ResidualHandle, ResidualHandleInner};
 use crate::attention::{
-    run_attention_block_decode_step_backend,
-    run_attention_with_kv_backend, SharedKV,
+    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
 };
 use larql_models::ModelWeights;
 

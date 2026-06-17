@@ -45,33 +45,78 @@ use larql_inference::vindex::generate_kquant_cpu_constrained_cached_streaming;
 /// cold on all of them by construction.
 const PROBLEMS: &[(&str, &str)] = &[
     // addition, varied phrasing
-    ("If you have 38 apples and pick 17 more, how many apples do you have?", "38 + 17"),
-    ("What do you get when you add 123456 and 654321?", "123456 + 654321"),
+    (
+        "If you have 38 apples and pick 17 more, how many apples do you have?",
+        "38 + 17",
+    ),
+    (
+        "What do you get when you add 123456 and 654321?",
+        "123456 + 654321",
+    ),
     ("What is the sum of 999 and 111?", "999 + 111"),
-    ("A tank holds 4500 liters and 2750 more are pumped in. How much is in the tank?", "4500 + 2750"),
-    ("Tom scored 1284 points and then earned another 716. What is his total?", "1284 + 716"),
+    (
+        "A tank holds 4500 liters and 2750 more are pumped in. How much is in the tank?",
+        "4500 + 2750",
+    ),
+    (
+        "Tom scored 1284 points and then earned another 716. What is his total?",
+        "1284 + 716",
+    ),
     ("Add 87 to 246.", "246 + 87"),
-    ("A library has 58210 books and acquires 4790 new ones. How many books now?", "58210 + 4790"),
+    (
+        "A library has 58210 books and acquires 4790 new ones. How many books now?",
+        "58210 + 4790",
+    ),
     ("What is 312487 increased by 96513?", "312487 + 96513"),
     // subtraction
-    ("Sarah had 5000 dollars and spent 1234. How much does she have left?", "5000 - 1234"),
+    (
+        "Sarah had 5000 dollars and spent 1234. How much does she have left?",
+        "5000 - 1234",
+    ),
     ("Take 250 away from 1000.", "1000 - 250"),
-    ("John is 47 and Mary is 23 years younger. How old is Mary?", "47 - 23"),
-    ("A warehouse stored 90000 crates and shipped 12345. How many remain?", "90000 - 12345"),
+    (
+        "John is 47 and Mary is 23 years younger. How old is Mary?",
+        "47 - 23",
+    ),
+    (
+        "A warehouse stored 90000 crates and shipped 12345. How many remain?",
+        "90000 - 12345",
+    ),
     ("What is 700 minus 458?", "700 - 458"),
     ("From 86420 subtract 13579.", "86420 - 13579"),
-    ("A flight covers 5400 km and 1750 km are already behind. How far is left?", "5400 - 1750"),
+    (
+        "A flight covers 5400 km and 1750 km are already behind. How far is left?",
+        "5400 - 1750",
+    ),
     // multiplication
-    ("A crate holds 240 bottles. How many bottles are in 12 crates?", "240 * 12"),
+    (
+        "A crate holds 240 bottles. How many bottles are in 12 crates?",
+        "240 * 12",
+    ),
     ("Multiply 73 by 19.", "73 * 19"),
-    ("A factory makes 1500 widgets a day. How many in 365 days?", "1500 * 365"),
-    ("Each of the 48 rows has 96 seats. How many seats in total?", "48 * 96"),
+    (
+        "A factory makes 1500 widgets a day. How many in 365 days?",
+        "1500 * 365",
+    ),
+    (
+        "Each of the 48 rows has 96 seats. How many seats in total?",
+        "48 * 96",
+    ),
     ("What is the product of 407 and 311?", "407 * 311"),
-    ("Nine hundred boxes each weigh 75 kilos. What is the total weight?", "900 * 75"),
+    (
+        "Nine hundred boxes each weigh 75 kilos. What is the total weight?",
+        "900 * 75",
+    ),
     // two-op chains (multiplicity watch)
     ("What is 47 plus 358 plus 1200?", "47 + 358 + 1200"),
-    ("Start with 999, add 111, then take away 222. What do you get?", "999 + 111 - 222"),
-    ("A bus starts with 50 passengers, then 23 get off and 12 get on. How many are aboard?", "50 - 23 + 12"),
+    (
+        "Start with 999, add 111, then take away 222. What do you get?",
+        "999 + 111 - 222",
+    ),
+    (
+        "A bus starts with 50 passengers, then 23 get off and 12 get on. How many are aboard?",
+        "50 - 23 + 12",
+    ),
 ];
 
 /// (arm name, prompt suffix, generation budget).
@@ -118,71 +163,73 @@ fn main() {
         let mut multi = 0usize;
 
         for (idx, (prompt, expected)) in PROBLEMS.iter().enumerate() {
-        let full_prompt = format!("{prompt}{suffix}");
-        let prompt_ids = tok
-            .encode(full_prompt.as_str(), true)
-            .expect("encode")
-            .get_ids()
-            .to_vec();
+            let full_prompt = format!("{prompt}{suffix}");
+            let prompt_ids = tok
+                .encode(full_prompt.as_str(), true)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
 
-        // Stream and record the token position at which the first trigger
-        // completes — the same incremental read the gate would perform.
-        let mut emitted = String::new();
-        let mut first_trigger_pos: Option<usize> = None;
-        let mut n_tokens = 0usize;
-        let out = generate_kquant_cpu_constrained_cached_streaming(
-            &mut weights,
-            &tok,
-            &prompt_ids,
-            *budget,
-            &index,
-            |_, _| {},
-            |_, text| {
-                emitted.push_str(text);
-                n_tokens += 1;
-                if first_trigger_pos.is_none()
-                    && text.contains('=')
-                    && !find_triggers(&emitted).is_empty()
-                {
-                    first_trigger_pos = Some(n_tokens);
-                }
-            },
-        );
-        let _ = out;
-        let triggers = find_triggers(&emitted);
-        let fire = !triggers.is_empty();
-        let n_trg = triggers.len();
-        let first_expr = triggers.first().map(|(e, _)| e.to_string());
-        // Fidelity: the FIRST emitted trigger must be the ground-truth
-        // expression (operands and ops, exact, order-insensitive only via
-        // the canonical string — the harness corpus is written in the
-        // model's natural restatement order).
-        let correct = first_expr.as_deref() == Some(*expected);
+            // Stream and record the token position at which the first trigger
+            // completes — the same incremental read the gate would perform.
+            let mut emitted = String::new();
+            let mut first_trigger_pos: Option<usize> = None;
+            let mut n_tokens = 0usize;
+            let out = generate_kquant_cpu_constrained_cached_streaming(
+                &mut weights,
+                &tok,
+                &prompt_ids,
+                *budget,
+                &index,
+                |_, _| {},
+                |_, text| {
+                    emitted.push_str(text);
+                    n_tokens += 1;
+                    if first_trigger_pos.is_none()
+                        && text.contains('=')
+                        && !find_triggers(&emitted).is_empty()
+                    {
+                        first_trigger_pos = Some(n_tokens);
+                    }
+                },
+            );
+            let _ = out;
+            let triggers = find_triggers(&emitted);
+            let fire = !triggers.is_empty();
+            let n_trg = triggers.len();
+            let first_expr = triggers.first().map(|(e, _)| e.to_string());
+            // Fidelity: the FIRST emitted trigger must be the ground-truth
+            // expression (operands and ops, exact, order-insensitive only via
+            // the canonical string — the harness corpus is written in the
+            // model's natural restatement order).
+            let correct = first_expr.as_deref() == Some(*expected);
 
-        fired += usize::from(fire);
-        faithful += usize::from(correct);
-        if let Some(p) = first_trigger_pos {
-            positions.push(p);
-        }
-        multi += usize::from(n_trg > 1);
+            fired += usize::from(fire);
+            faithful += usize::from(correct);
+            if let Some(p) = first_trigger_pos {
+                positions.push(p);
+            }
+            multi += usize::from(n_trg > 1);
 
-        println!(
-            "{:<4} {:>5} {:>9} {:>6} {:>5}   {} (exp {})",
-            idx,
-            if fire { "✓" } else { "—" },
-            if !fire {
-                "n/a"
-            } else if correct {
-                "✓"
-            } else {
-                "✗ WRONG"
-            },
-            first_trigger_pos.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            n_trg,
-            first_expr.as_deref().unwrap_or("-"),
-            expected,
-        );
-        json_rows.push_str(&format!(
+            println!(
+                "{:<4} {:>5} {:>9} {:>6} {:>5}   {} (exp {})",
+                idx,
+                if fire { "✓" } else { "—" },
+                if !fire {
+                    "n/a"
+                } else if correct {
+                    "✓"
+                } else {
+                    "✗ WRONG"
+                },
+                first_trigger_pos
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                n_trg,
+                first_expr.as_deref().unwrap_or("-"),
+                expected,
+            );
+            json_rows.push_str(&format!(
             "{}{{\"arm\":\"{arm}\",\"prompt\":{},\"expected\":{},\"fire\":{fire},\"emitted_expr\":{},\"correct\":{correct},\"pos\":{},\"n_triggers\":{n_trg},\"emission\":{}}}",
             if json_rows.is_empty() { "" } else { "," },
             serde_json::to_string(prompt).expect("json"),
@@ -198,14 +245,23 @@ fn main() {
             p.sort_unstable();
             p.get(p.len() / 2).copied().unwrap_or(0)
         };
-        arm_summaries.push((arm.to_string(), fired, faithful, median_pos, multi, PROBLEMS.len()));
+        arm_summaries.push((
+            arm.to_string(),
+            fired,
+            faithful,
+            median_pos,
+            multi,
+            PROBLEMS.len(),
+        ));
     }
 
     // ── Release-mode cell: splice at the trigger, release the mask,
     // count post-schedule digit overruns. The splice payload is the ALU
     // result of the EMITTED expression (honest end-to-end: wrong emitted
     // expr → wrong splice, which fidelity already scores). ──
-    println!("\n  ── release-mode cell (splice at trigger, release mask, watch for digit overrun) ──");
+    println!(
+        "\n  ── release-mode cell (splice at trigger, release mask, watch for digit overrun) ──"
+    );
     let mut release_runs = 0usize;
     let mut overruns = 0usize;
     let mut release_rows = String::new();
@@ -285,8 +341,11 @@ fn main() {
         );
         let _ = out;
         let state = state.into_inner();
-        let (released_tail, done_forcing, had_schedule) =
-            (state.released_tail, state.done_forcing, state.schedule.is_some());
+        let (released_tail, done_forcing, had_schedule) = (
+            state.released_tail,
+            state.done_forcing,
+            state.schedule.is_some(),
+        );
         if had_schedule && done_forcing {
             release_runs += 1;
             // Overrun = the released model immediately continues the

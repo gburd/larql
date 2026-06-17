@@ -230,7 +230,9 @@ impl KvEngine for BoundaryKvEngine {
         if token_ids.is_empty() {
             return Err(EngineError::EmptyPrompt);
         }
-        let hidden = self.inner.prefill_resident(weights, ffn, index, token_ids)?;
+        let hidden = self
+            .inner
+            .prefill_resident(weights, ffn, index, token_ids)?;
         self.abs_position = token_ids.len();
         if self.maybe_emit_frame(weights, &hidden).is_err() {
             return Err(EngineError::BackendFailure {
@@ -249,7 +251,9 @@ impl KvEngine for BoundaryKvEngine {
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        let hidden = self.inner.decode_step_resident(weights, ffn, index, token_id)?;
+        let hidden = self
+            .inner
+            .decode_step_resident(weights, ffn, index, token_id)?;
         self.abs_position += 1;
         if self.maybe_emit_frame(weights, &hidden).is_err() {
             return Err(EngineError::BackendFailure {
@@ -811,7 +815,11 @@ mod tests {
             .expect("prefill_resident");
         assert!(h.iter().all(|v| v.is_finite()));
         assert_eq!(eng.abs_position(), 2);
-        assert_eq!(eng.archive().total_frames(), Some(1), "landed on boundary → frame");
+        assert_eq!(
+            eng.archive().total_frames(),
+            Some(1),
+            "landed on boundary → frame"
+        );
         let h2 = eng
             .decode_step_resident(&weights, &ffn, &index, 2)
             .expect("decode_step_resident");
