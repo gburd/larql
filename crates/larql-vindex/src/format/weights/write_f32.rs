@@ -619,6 +619,22 @@ pub fn write_model_weights_with_opts(
                 }
             }
 
+            // BitNet 1.58 sub-layer norms.  These are architecture-
+            // specific (`*_sub_norm.weight`, applied to activations
+            // before each output projection) and have no entry in the
+            // standard arch norm-key list, so without this they are
+            // silently dropped at vindex-build time and the BitNet
+            // forward pass loses an essential normalisation step.
+            // Keyed off the source vector map directly so it is a
+            // no-op for any architecture that lacks them.
+            // See BUG-infer-deadlock §5.4 (sub-norm data loss).
+            for suffix in ["attn_sub_norm.weight", "ffn_sub_norm.weight"] {
+                let k = format!("{}{suffix}", arch.layer_prefix(layer));
+                if !norm_keys.contains(&k) && source.get_vector(&k).is_some() {
+                    norm_keys.push(k);
+                }
+            }
+
             for key in norm_keys {
                 if let Some(data) = source.get_vector(&key) {
                     let bytes = crate::config::dtype::encode_floats(&data, dtype);

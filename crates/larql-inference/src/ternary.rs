@@ -1695,54 +1695,51 @@ pub fn load_bitnet_model(vindex_path: &std::path::Path) -> Result<BitnetModel, B
     let hidden = config.hidden_size;
     let n_layers = config.num_layers;
 
-    // 4. Per-layer norms.  The keys in dense.vectors are the
-    //    GGUF-canonical names (already prefix-stripped by the loader).
+    // 4. Per-layer norms + BitLinear projections.
+    //
+    //    Keys are HF-normalised — the GGUF loader rewrites every
+    //    tensor name through GGUF_TO_HF_KEY_REPLACEMENTS before it
+    //    reaches the vindex, and the keep-quant writer stamps the
+    //    same HF names into `bitnet_layout`.  So:
+    //      blk.N.attn_norm.weight   -> layers.N.input_layernorm.weight
+    //      blk.N.ffn_norm.weight    -> layers.N.post_attention_layernorm.weight
+    //      blk.N.attn_sub_norm      -> layers.N.attn_sub_norm.weight (no HF
+    //                                  equivalent; only blk.->layers. applies)
+    //      blk.N.ffn_sub_norm       -> layers.N.ffn_sub_norm.weight
+    //      blk.N.attn_q.weight      -> layers.N.self_attn.q_proj.weight
+    //      blk.N.ffn_gate.weight    -> layers.N.mlp.gate_proj.weight  (etc.)
+    //    Using GGUF-native keys here was BUG-infer-deadlock bug #5
+    //    (loader/vindex namespace mismatch) — it made every lookup miss.
+    let inter = config.intermediate_size;
     let mut layers = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
-        let attn_norm = take_norm(&dense, &format!("blk.{i}.attn_norm.weight"), hidden)?;
+        let attn_norm =
+            take_norm(&dense, &format!("layers.{i}.input_layernorm.weight"), hidden)?;
         let attn_sub_norm =
-            take_norm(&dense, &format!("blk.{i}.attn_sub_norm.weight"), hidden)?;
-        let ffn_norm = take_norm(&dense, &format!("blk.{i}.ffn_norm.weight"), hidden)?;
-        let inter = config.intermediate_size;
-        let ffn_sub_norm = take_norm(&dense, &format!("blk.{i}.ffn_sub_norm.weight"), inter)?;
+            take_norm(&dense, &format!("layers.{i}.attn_sub_norm.weight"), hidden)?;
+        let ffn_norm = take_norm(
+            &dense,
+            &format!("layers.{i}.post_attention_layernorm.weight"),
+            hidden,
+        )?;
+        let ffn_sub_norm =
+            take_norm(&dense, &format!("layers.{i}.ffn_sub_norm.weight"), inter)?;
 
-        let attn_q = bitnet
-            .tensors
-            .get(&format!("blk.{i}.attn_q.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_q.weight")))?;
-        let attn_k = bitnet
-            .tensors
-            .get(&format!("blk.{i}.attn_k.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_k.weight")))?;
-        let attn_v = bitnet
-            .tensors
-            .get(&format!("blk.{i}.attn_v.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.attn_v.weight")))?;
-        let attn_o = bitnet
-            .tensors
-            .get(&format!("blk.{i}.attn_output.weight"))
-            .cloned()
-            .ok_or_else(|| {
-                BitnetLoadError::MissingTensor(format!("blk.{i}.attn_output.weight"))
-            })?;
-        let ffn_gate = bitnet
-            .tensors
-            .get(&format!("blk.{i}.ffn_gate.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_gate.weight")))?;
-        let ffn_up = bitnet
-            .tensors
-            .get(&format!("blk.{i}.ffn_up.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_up.weight")))?;
-        let ffn_down = bitnet
-            .tensors
-            .get(&format!("blk.{i}.ffn_down.weight"))
-            .cloned()
-            .ok_or_else(|| BitnetLoadError::MissingTensor(format!("blk.{i}.ffn_down.weight")))?;
+        let get_bitlinear = |suffix: &str| -> Result<BitLinearWeight, BitnetLoadError> {
+            let key = format!("layers.{i}.{suffix}.weight");
+            bitnet
+                .tensors
+                .get(&key)
+                .cloned()
+                .ok_or(BitnetLoadError::MissingTensor(key))
+        };
+        let attn_q = get_bitlinear("self_attn.q_proj")?;
+        let attn_k = get_bitlinear("self_attn.k_proj")?;
+        let attn_v = get_bitlinear("self_attn.v_proj")?;
+        let attn_o = get_bitlinear("self_attn.o_proj")?;
+        let ffn_gate = get_bitlinear("mlp.gate_proj")?;
+        let ffn_up = get_bitlinear("mlp.up_proj")?;
+        let ffn_down = get_bitlinear("mlp.down_proj")?;
 
         let ffn = BitNetFfn {
             gate: ffn_gate,
@@ -1764,12 +1761,12 @@ pub fn load_bitnet_model(vindex_path: &std::path::Path) -> Result<BitnetModel, B
         });
     }
 
-    // 5. output_norm.
+    // 5. output_norm.  GGUF `output_norm.weight` -> HF `norm.weight`.
     let output_norm = dense
         .vectors
-        .get("output_norm.weight")
+        .get("norm.weight")
         .cloned()
-        .ok_or_else(|| BitnetLoadError::MissingTensor("output_norm.weight".into()))?;
+        .ok_or_else(|| BitnetLoadError::MissingTensor("norm.weight".into()))?;
 
     Ok(BitnetModel {
         layers,
