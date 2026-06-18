@@ -110,7 +110,17 @@ fn run_infer(
         }
 
         let start = std::time::Instant::now();
-        let (is_compare, use_walk, use_dense) = infer_mode_flags(&req.mode);
+        let (is_compare, mut use_walk, mut use_dense) = infer_mode_flags(&req.mode);
+        // Dense-only BitNet vindexes (`--dense-only`) have no gate
+        // vectors / KNN store, so walk-mode would silently return
+        // nothing useful.  Coerce any walk request to dense so
+        // clients that omit `mode` (which defaults to walk) still
+        // get correct predictions.  Compare-mode also collapses to
+        // dense-only output here.
+        if model.is_dense_only() && (use_walk || is_compare) {
+            use_walk = false;
+            use_dense = true;
+        }
         let mut result = serde_json::Map::new();
         result.insert("prompt".into(), serde_json::json!(req.prompt));
 

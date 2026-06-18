@@ -193,6 +193,18 @@ impl LoadedModel {
         self.config.bitnet_layout.is_some()
     }
 
+    /// Whether this vindex was built `--dense-only`: it has the
+    /// dense weights + BitNet I2_S artifacts but NO gate vectors /
+    /// HNSW clustering, so walk-mode inference cannot run against
+    /// it (the KNN store is empty).  Detected by an empty gate-layer
+    /// list in index.json (`build_vindex_dense_only` leaves
+    /// `layer_infos` empty).  Route handlers force dense-mode
+    /// inference on such vindexes regardless of the requested mode,
+    /// since walk would silently return nothing useful.
+    pub fn is_dense_only(&self) -> bool {
+        self.config.layers.is_empty()
+    }
+
     /// Get a read guard on the lazy-loaded BitNet model.  Returns
     /// `Err` when the vindex isn't a BitNet (callers should check
     /// `is_bitnet()` first).
@@ -576,6 +588,29 @@ mod loaded_model_tests {
             f32_model.config.quant != QuantFormat::Q4K,
             "None config → f32 branch (load_model_weights_with_opts + WalkFfn::new_unlimited)"
         );
+    }
+
+    #[test]
+    fn is_dense_only_detects_empty_gate_layers() {
+        // A normal vindex has gate layers -> not dense-only.
+        let normal = tiny_loaded_model(QuantFormat::None, false);
+        assert!(
+            !normal.is_dense_only(),
+            "vindex with gate layers must not be dense-only"
+        );
+
+        // A --dense-only BitNet vindex has zero gate layers.  Build
+        // one by emptying the layer list + setting bitnet_layout.
+        let mut cfg = tiny_config(QuantFormat::None);
+        cfg.layers = Vec::new();
+        cfg.bitnet_layout = Some(larql_vindex::config::BitnetLayout::default());
+        let mut dense_only = tiny_loaded_model(QuantFormat::None, false);
+        dense_only.config = cfg;
+        assert!(
+            dense_only.is_dense_only(),
+            "dense-only vindex (empty gate layers) must be detected"
+        );
+        assert!(dense_only.is_bitnet(), "and it is a BitNet vindex");
     }
 
     #[test]
