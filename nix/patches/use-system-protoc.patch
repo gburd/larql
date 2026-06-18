@@ -1,71 +1,93 @@
---- a/crates/larql-server/Cargo.toml
-+++ b/crates/larql-server/Cargo.toml
-@@ -42,4 +42,3 @@
-
+diff --git a/crates/larql-router-protocol/Cargo.toml b/crates/larql-router-protocol/Cargo.toml
+index a30effaa..d588d869 100644
+--- a/crates/larql-router-protocol/Cargo.toml
++++ b/crates/larql-router-protocol/Cargo.toml
+@@ -70,11 +70,10 @@ serde_json = { workspace = true }
  [build-dependencies]
  tonic-build = "0.13"
+ 
+-# `protobuf-src` builds a fresh `protoc` via cmake. That works on Linux
+-# and macOS but fails on the GitHub windows-latest runner — cmake links
+-# against the debug UCRT and absl drops a pile of unresolved
+-# `__imp_ceilf` / `__imp_modf` symbols. On Windows we expect `protoc`
+-# to be on `PATH` (CI installs it via `arduino/setup-protoc`); the
+-# build script falls back to that.
+-[target.'cfg(not(windows))'.build-dependencies]
 -protobuf-src = "2"
++# `protoc` is supplied by the build environment (Nix nativeBuildInputs
++# provide it; CI installs it via `arduino/setup-protoc`).  We do not
++# bundle `protobuf-src`: its cmake-built protoc fails to link against
++# the debug UCRT on the GitHub windows-latest runner (absl drops a
++# pile of unresolved `__imp_ceilf` / `__imp_modf` symbols), and under
++# Nix it would pull a redundant cmake build.  `tonic_build` discovers
++# `protoc` from the `PROTOC` env var or `PATH`.
+diff --git a/crates/larql-router-protocol/build.rs b/crates/larql-router-protocol/build.rs
+index 28aba5a5..4323d3ec 100644
+--- a/crates/larql-router-protocol/build.rs
++++ b/crates/larql-router-protocol/build.rs
+@@ -3,18 +3,9 @@
+ // against the debug UCRT (see Cargo.toml), so `protoc` must be on
+ // PATH — CI sets it via `arduino/setup-protoc`. `tonic_build` picks
+ // up `protoc` from the `PROTOC` env var or PATH automatically.
+-#[cfg(not(windows))]
+-fn set_protoc() {
+-    std::env::set_var("PROTOC", protobuf_src::protoc());
+-}
+-
+-#[cfg(windows)]
+-fn set_protoc() {
+-    // No-op: rely on the system `protoc` discovered via PROTOC / PATH.
+-}
+-
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+-    set_protoc();
++    // PROTOC is provided by the Nix build (nativeBuildInputs:
++    // protobuf); tonic_build picks it up from the env / PATH.
+     tonic_build::compile_protos("proto/grid.proto")?;
+     tonic_build::compile_protos("proto/expert.proto")?;
+     tonic_build::compile_protos("proto/shard.proto")?;
+diff --git a/crates/larql-server/Cargo.toml b/crates/larql-server/Cargo.toml
+index db123fde..f8da6d10 100644
+--- a/crates/larql-server/Cargo.toml
++++ b/crates/larql-server/Cargo.toml
+@@ -104,9 +104,9 @@ http3 = ["quic", "larql-router-protocol/http3"]
+ [build-dependencies]
+ tonic-build = "0.13"
+ 
+-# See `crates/larql-router-protocol/Cargo.toml` for the Windows
+-# rationale: `protobuf-src` builds protoc via cmake and the link step
+-# fails on windows-latest. On Windows we rely on a system protoc
+-# (installed by CI via `arduino/setup-protoc`).
+-[target.'cfg(not(windows))'.build-dependencies]
+-protobuf-src = "2"
++# `protoc` is supplied by the build environment (Nix nativeBuildInputs
++# provide it; CI installs it via `arduino/setup-protoc`).  We do not
++# bundle `protobuf-src` because its cmake-built protoc fails to link
++# against the debug UCRT on the GitHub windows-latest runner, and
++# under Nix it would pull a redundant cmake build.  `tonic_build`
++# discovers `protoc` from the `PROTOC` env var or `PATH`.
+diff --git a/crates/larql-server/build.rs b/crates/larql-server/build.rs
+index d2dbe281..760d4cb0 100644
 --- a/crates/larql-server/build.rs
 +++ b/crates/larql-server/build.rs
-@@ -1,6 +1,5 @@
- fn main() -> Result<(), Box<dyn std::error::Error>> {
--    // Use bundled protoc (no system install required).
+@@ -2,18 +2,9 @@
+ // Windows we rely on a system protoc (CI installs it via
+ // `arduino/setup-protoc`) because cmake-built protoc fails to link
+ // against the debug UCRT runtime on the GitHub windows-latest runner.
+-#[cfg(not(windows))]
+-fn set_protoc() {
 -    std::env::set_var("PROTOC", protobuf_src::protoc());
-+    // Use system protoc (set via PROTOC env var by Nix).
+-}
+-
+-#[cfg(windows)]
+-fn set_protoc() {
+-    // No-op: rely on the system `protoc` discovered via PROTOC / PATH.
+-}
+-
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+-    set_protoc();
++    // PROTOC is provided by the Nix build (nativeBuildInputs:
++    // protobuf); tonic_build picks it up from the env / PATH.
      tonic_build::compile_protos("proto/vindex.proto")?;
      Ok(())
  }
---- a/crates/larql-router-protocol/Cargo.toml
-+++ b/crates/larql-router-protocol/Cargo.toml
-@@ -14,4 +14,3 @@
-
- [build-dependencies]
- tonic-build = "0.13"
--protobuf-src = "2"
---- a/crates/larql-router-protocol/build.rs
-+++ b/crates/larql-router-protocol/build.rs
-@@ -1,5 +1,4 @@
- fn main() -> Result<(), Box<dyn std::error::Error>> {
--    std::env::set_var("PROTOC", protobuf_src::protoc());
-     tonic_build::compile_protos("proto/grid.proto")?;
-     Ok(())
- }
---- a/crates/larql-cli/Cargo.toml
-+++ b/crates/larql-cli/Cargo.toml
-@@ -32,7 +32,7 @@
- libc = "0.2"
-
- [features]
--default = ["metal"]
-+default = []
- metal = [
-     "larql-compute/metal",
-     "larql-inference/metal",
---- a/crates/larql-cli/src/commands/primary/bench_cmd.rs
-+++ b/crates/larql-cli/src/commands/primary/bench_cmd.rs
-@@ -156,12 +156,19 @@
-         &tokenizer, &*weights.arch, args.prompt.as_str(),
-     ).map_err(|e| format!("tokenize: {e}"))?;
-
--    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
--        let b = larql_compute::metal::MetalBackend::new()
--            .ok_or("Metal backend unavailable — rebuild with `--features metal` on an M-series Mac")?;
--        Box::new(b)
--    } else {
--        Box::new(larql_compute::CpuBackend)
-+    let backend: Box<dyn larql_compute::ComputeBackend> = {
-+        #[cfg(feature = "metal")]
-+        {
-+            if metal {
-+                let b = larql_compute::metal::MetalBackend::new()
-+                    .ok_or("Metal backend unavailable — rebuild with `--features metal` on an M-series Mac")?;
-+                Box::new(b)
-+            } else {
-+                Box::new(larql_compute::CpuBackend)
-+            }
-+        }
-+        #[cfg(not(feature = "metal"))]
-+        { Box::new(larql_compute::CpuBackend) }
-     };
-
-     let cached_layers = CachedLayerGraph::from_residuals(Vec::new());

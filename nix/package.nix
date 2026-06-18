@@ -31,7 +31,13 @@ pkgs.rustPlatform.buildRustPackage {
   version = "0.1.0";
   src = srcFiltered;
 
-  cargoHash = "sha256-6mvESL1m5sZZCx8YdArgTkwNnGHRQz3RPub/hVYelqg=";
+  # Use the Rust-based vendor fetcher (not the legacy Python
+  # cargo-vendor, which hits crates.io 403s on some crates).  Required
+  # because the workspace pulls deps that the legacy fetcher mis-
+  # downloads.  cargoHash is the fetchCargoVendor hash (different from
+  # the legacy cargoSha256/cargoHash); recomputed below.
+  useFetchCargoVendor = true;
+  cargoHash = "sha256-rfLIFwAUa7Qo1CdaSVTzS43BvBSb6pE4SRU9H0Cch7U=";
 
   # Use system protoc instead of bundled protobuf-src
   cargoPatches = [
@@ -56,6 +62,19 @@ pkgs.rustPlatform.buildRustPackage {
 
   # Point tonic-build to nixpkgs protoc
   PROTOC = "${pkgs.protobuf}/bin/protoc";
+
+  # utoipa-swagger-ui's build script otherwise tries to `curl` the
+  # Swagger UI dist tarball from the network, which fails in the Nix
+  # sandbox (no network, no curl).  Hand it a pre-fetched zip via the
+  # documented env var so the build script uses the local file.
+  SWAGGER_UI_DOWNLOAD_URL =
+    let
+      swaggerUi = pkgs.fetchurl {
+        url = "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip";
+        hash = "sha256-SBJE0IEgl7Efuu73n3HZQrFxYX+cn5UU5jrL4T5xzNw=";
+      };
+    in
+    "file://${swaggerUi}";
 
   # Point openblas-src to system library
   OPENBLAS_LIB_DIR = lib.optionalString pkgs.stdenv.hostPlatform.isLinux
