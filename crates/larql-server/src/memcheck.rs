@@ -64,6 +64,14 @@ pub fn check_memory_headroom(estimate_bytes: u64, headroom_bytes: u64) -> MemChe
         }
     };
 
+    decide_headroom(limit, estimate_bytes, headroom_bytes)
+}
+
+/// Pure classification: given an already-resolved cgroup `limit`, decide
+/// whether `estimate_bytes` fits under it once `headroom_bytes` (capped at
+/// half the limit) is reserved.  Split out from [`check_memory_headroom`] so
+/// the decision arms are unit-testable without a cgroup-bearing filesystem.
+fn decide_headroom(limit: u64, estimate_bytes: u64, headroom_bytes: u64) -> MemCheckOutcome {
     let headroom = headroom_bytes.min(limit / 2); // never claim more than half
     let usable = limit.saturating_sub(headroom);
 
@@ -93,24 +101,8 @@ pub fn read_cgroup_v2_memory_max() -> Result<Option<u64>, String> {
 fn locate_memory_max() -> Result<PathBuf, String> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
-    // cgroup v2 unified line shape: "0::/path/under/sys/fs/cgroup".
-    // cgroup v1 lines have a non-zero hierarchy id; we ignore those
-    // (the v1 file layout puts limits in memory.limit_in_bytes which
-    // we don't currently read).
-    let mut v2_path: Option<&str> = None;
-    for line in cgroup.lines() {
-        let mut parts = line.splitn(3, ':');
-        let id = parts.next();
-        let controllers = parts.next();
-        let path = parts.next();
-        if id == Some("0") && controllers == Some("") {
-            if let Some(p) = path {
-                v2_path = Some(p);
-                break;
-            }
-        }
-    }
-    let cgroup_rel = v2_path.ok_or_else(|| "no cgroup v2 unified entry".to_string())?;
+    let cgroup_rel =
+        parse_cgroup_v2_path(&cgroup).ok_or_else(|| "no cgroup v2 unified entry".to_string())?;
     let trimmed = cgroup_rel.trim_start_matches('/');
     let unified_root = Path::new("/sys/fs/cgroup");
     let candidate = if trimmed.is_empty() {
@@ -131,6 +123,26 @@ fn parse_memory_max(s: &str) -> Result<Option<u64>, String> {
     s.parse::<u64>()
         .map(Some)
         .map_err(|e| format!("parse memory.max '{s}': {e}"))
+}
+
+/// Extract the cgroup v2 unified-hierarchy path (the `"0::/path"` line) from
+/// `/proc/self/cgroup` content.  Returns `None` when only cgroup v1 lines
+/// (non-zero hierarchy id) are present.  Pure string work, split out so the
+/// parse is unit-testable without a real procfs.
+fn parse_cgroup_v2_path(content: &str) -> Option<&str> {
+    for line in content.lines() {
+        // cgroup v2 unified line shape: "0::/path/under/sys/fs/cgroup".
+        let mut parts = line.splitn(3, ':');
+        let id = parts.next();
+        let controllers = parts.next();
+        let path = parts.next();
+        if id == Some("0") && controllers == Some("") {
+            if let Some(p) = path {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Format an explanation message for `MemCheckOutcome::Tight`.
@@ -231,5 +243,70 @@ mod tests {
             !matches!(result, MemCheckOutcome::Tight { .. }),
             "got {result:?}"
         );
+    }
+
+    #[test]
+    fn decide_headroom_ok_when_estimate_fits() {
+        // 2 GB estimate under an 8 GB limit with 512 MiB headroom → Ok.
+        let limit = 8 * 1024 * 1024 * 1024;
+        let out = decide_headroom(limit, 2 * 1024 * 1024 * 1024, 512 * 1024 * 1024);
+        assert_eq!(
+            out,
+            MemCheckOutcome::Ok {
+                cgroup_max_bytes: limit,
+                estimate_bytes: 2 * 1024 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_headroom_tight_when_estimate_exceeds_usable() {
+        // 7.8 GB estimate under an 8 GB limit minus 512 MiB headroom → Tight.
+        let limit = 8 * 1024 * 1024 * 1024;
+        let estimate = limit - 100 * 1024 * 1024; // 7.9 GB
+        let out = decide_headroom(limit, estimate, 512 * 1024 * 1024);
+        assert!(
+            matches!(out, MemCheckOutcome::Tight { headroom_bytes, .. } if headroom_bytes == 512 * 1024 * 1024),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn decide_headroom_caps_reserve_at_half_the_limit() {
+        // A 1 GB headroom request against a 1 GB limit is capped to 512 MiB
+        // (half), leaving 512 MiB usable. A 400 MiB estimate fits — but only
+        // because of the cap: an uncapped 1 GB reserve would leave 0 usable
+        // and trip Tight.
+        let limit = 1024 * 1024 * 1024;
+        let out = decide_headroom(limit, 400 * 1024 * 1024, 1024 * 1024 * 1024);
+        assert_eq!(
+            out,
+            MemCheckOutcome::Ok {
+                cgroup_max_bytes: limit,
+                estimate_bytes: 400 * 1024 * 1024,
+            },
+            "headroom should be capped at limit/2 = 512 MiB"
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_finds_unified_entry() {
+        let content = "12:pids:/system.slice\n0::/system.slice/larql.service\n";
+        assert_eq!(
+            parse_cgroup_v2_path(content),
+            Some("/system.slice/larql.service")
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_returns_root_path() {
+        assert_eq!(parse_cgroup_v2_path("0::/\n"), Some("/"));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_none_for_v1_only() {
+        // Only legacy v1 lines (non-zero hierarchy ids) → no unified entry.
+        let content = "11:memory:/docker/abc\n4:cpu,cpuacct:/docker/abc\n";
+        assert_eq!(parse_cgroup_v2_path(content), None);
     }
 }
