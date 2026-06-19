@@ -443,6 +443,11 @@ pub struct Cli {
     /// Pass this flag if you want the historical lazy behaviour
     /// (e.g. for `--ffn-only` boxes that *might* be promoted to
     /// inference later, or in tests).
+    ///
+    /// Note: `--lazy-weights` also skips the startup memory
+    /// pre-flight check (there is nothing to size before the
+    /// deferred load), so a too-small-RAM condition surfaces on the
+    /// first request rather than at startup.
     #[arg(long)]
     pub lazy_weights: bool,
 
@@ -947,9 +952,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     info!("Memcheck: skipped ({reason})");
                 }
                 crate::memcheck::MemCheckOutcome::Tight { .. } => {
-                    return Err(
-                        crate::memcheck::explain_tight_outcome(&outcome).into(),
-                    );
+                    return Err(crate::memcheck::explain_tight_outcome(&outcome).into());
                 }
             }
         }

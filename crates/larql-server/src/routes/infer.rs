@@ -274,9 +274,8 @@ pub(crate) async fn run_infer_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<serde_json::Value, ServerError> {
     let started = std::time::Instant::now();
-    let handle = tokio::task::spawn_blocking(move || {
-        run_infer(&state, &model, &req, session_id.as_deref())
-    });
+    let handle =
+        tokio::task::spawn_blocking(move || run_infer(&state, &model, &req, session_id.as_deref()));
 
     if timeout.is_zero() {
         return handle
@@ -285,8 +284,7 @@ pub(crate) async fn run_infer_with_timeout(
     }
 
     match tokio::time::timeout(timeout, handle).await {
-        Ok(join_result) => join_result
-            .map_err(|e| ServerError::Internal(e.to_string()))?,
+        Ok(join_result) => join_result.map_err(|e| ServerError::Internal(e.to_string()))?,
         Err(_elapsed) => {
             tracing::warn!(
                 target: "larql_server::infer",
@@ -368,8 +366,7 @@ mod tests {
             let mut sessions = mgr.sessions_blocking_write();
             let hidden = 4;
             let gate = larql_vindex::ndarray::Array2::<f32>::zeros((2, hidden));
-            let index =
-                larql_vindex::VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
+            let index = larql_vindex::VectorIndex::new(vec![Some(gate)], vec![None], 1, hidden);
             sessions.insert(
                 "test-sid".to_string(),
                 SessionState::new(index, Instant::now()),

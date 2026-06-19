@@ -217,6 +217,21 @@ impl VindexConfig {
             // gate vectors + tokenizer + tiny overhead.
             return self.browse_only_resident_bytes();
         }
+        // Quantized vindexes (Q4_K/Q6_K/…, ~4.5 bits/elem) do NOT
+        // load their weights at the dtype width this estimator
+        // assumes — sizing them with `bytes_per_float` over-counts
+        // 3–4× and would make memcheck REFUSE a quantized model that
+        // actually fits.  Since quantized models are the main reason
+        // to care about RSS, that defeats the feature.  Rather than
+        // model every quant format's exact resident layout here
+        // (fragile), return 0 so the startup pre-flight skips
+        // quantized vindexes.  The caller treats a 0 estimate as
+        // "skip" (see bootstrap memcheck).  Dense f16/f32 vindexes —
+        // the case this estimator was validated against — still get a
+        // real estimate below.
+        if self.quant != crate::QuantFormat::None {
+            return 0;
+        }
         let elem = crate::config::dtype::bytes_per_float(self.dtype) as u64;
         let layers = self.num_layers as u64;
         let hidden = self.hidden_size as u64;
@@ -623,6 +638,29 @@ mod resident_size_tests {
         assert!(
             (1.7..=2.1).contains(&ratio),
             "ratio {ratio} (r16={r16}, r32={r32})"
+        );
+    }
+
+    /// Quantized vindexes (Q4_K etc.) must NOT be sized at the dtype
+    /// width — that over-counts 3–4× and would make memcheck refuse
+    /// a model that fits.  estimate_resident_bytes returns 0 ("skip
+    /// the pre-flight") for them.
+    #[test]
+    fn estimate_skips_quantized() {
+        let mut q4k = cfg(ExtractLevel::Inference, StorageDtype::F16, 30);
+        q4k.quant = crate::QuantFormat::Q4K;
+        assert_eq!(
+            q4k.estimate_resident_bytes(),
+            0,
+            "Q4_K vindex must skip memcheck (returns 0)"
+        );
+
+        // A plain dense f16 vindex still gets a real (non-zero)
+        // estimate — the case this estimator was validated against.
+        let dense = cfg(ExtractLevel::Inference, StorageDtype::F16, 30);
+        assert!(
+            dense.estimate_resident_bytes() > 0,
+            "dense f16 vindex must still be estimated"
         );
     }
 

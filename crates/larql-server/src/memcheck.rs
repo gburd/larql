@@ -86,8 +86,7 @@ pub fn check_memory_headroom(estimate_bytes: u64, headroom_bytes: u64) -> MemChe
 /// `Err` if the cgroup hierarchy can't be discovered.
 pub fn read_cgroup_v2_memory_max() -> Result<Option<u64>, String> {
     let path = locate_memory_max()?;
-    let s = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     parse_memory_max(s.trim())
 }
 

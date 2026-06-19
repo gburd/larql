@@ -612,10 +612,7 @@ mod loaded_model_tests {
                 if model.weights.get().is_some() {
                     return;
                 }
-                let _g = model
-                    .weights_init
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let _g = model.weights_init.lock().unwrap_or_else(|p| p.into_inner());
                 let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 let prev_max = max_in_flight.load(Ordering::SeqCst);
                 if n > prev_max {
