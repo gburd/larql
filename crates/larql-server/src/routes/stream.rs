@@ -697,6 +697,7 @@ mod tests {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
+            weights_init: std::sync::Mutex::new(()),
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -722,6 +723,7 @@ mod tests {
             api_key: None,
             sessions: SessionManager::new(3600),
             describe_cache: DescribeCache::new(0),
+            infer_timeout: std::time::Duration::from_secs(60),
         })
     }
 

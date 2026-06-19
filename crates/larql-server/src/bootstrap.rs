@@ -353,6 +353,7 @@ pub fn load_single_vindex(
         embed_store,
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -422,6 +423,59 @@ pub struct Cli {
     /// Disable INFER endpoint (browse-only, reduces memory).
     #[arg(long)]
     pub no_infer: bool,
+
+    /// Defer model-weight loading until the first `/v1/infer` (or
+    /// other inference) request, instead of loading at startup.
+    ///
+    /// The eager startup load is the default because:
+    ///
+    /// - Lazy load happens on a request thread under HTTP handler
+    ///   backpressure, and a 5+ GB allocation under cgroup pressure
+    ///   reliably triggers an OOM-kill on memory-constrained hosts
+    ///   (see `BUG-infer-deadlock.md`).  Eager load surfaces the
+    ///   same condition as a clean startup failure that systemd
+    ///   reports loudly, *before* the listener binds.
+    /// - Lazy first-callers double-allocated until the single-flight
+    ///   `weights_init` guard landed; eager load avoids that path
+    ///   entirely on hosts where every inference call is going to
+    ///   trigger the load anyway.
+    ///
+    /// Pass this flag if you want the historical lazy behaviour
+    /// (e.g. for `--ffn-only` boxes that *might* be promoted to
+    /// inference later, or in tests).
+    ///
+    /// Note: `--lazy-weights` also skips the startup memory
+    /// pre-flight check (there is nothing to size before the
+    /// deferred load), so a too-small-RAM condition surfaces on the
+    /// first request rather than at startup.
+    #[arg(long)]
+    pub lazy_weights: bool,
+
+    /// Skip the startup cgroup memory pre-flight check (BUG
+    /// `infer-deadlock-oom` §5.5).  By default the server reads
+    /// `/sys/fs/cgroup/<self>/memory.max` and refuses to start when
+    /// the vindex's estimated resident size + a 512 MiB headroom
+    /// reserve exceeds the limit.  Pass `--no-memcheck` to override
+    /// (e.g. for cases where the estimate is wrong, or when running
+    /// in an environment without cgroup v2).
+    #[arg(long)]
+    pub no_memcheck: bool,
+
+    /// Headroom (MiB) to reserve below `memory.max` for the OS,
+    /// allocator overhead, and the request-handling working set.
+    /// Used by the startup pre-flight; ignored when
+    /// `--no-memcheck` is set.
+    #[arg(long, default_value_t = 512)]
+    pub memcheck_headroom_mib: u64,
+
+    /// Per-request hard timeout for `/v1/infer` and other inference
+    /// endpoints, in seconds.  When the inference exceeds this, the
+    /// handler responds 504 Gateway Timeout and drops the
+    /// `spawn_blocking` JoinHandle.  The blocking thread runs to
+    /// completion in the background; its result is discarded.
+    /// Set to 0 to disable.  See BUG-infer-deadlock §5.6.
+    #[arg(long, default_value_t = 60)]
+    pub infer_timeout_secs: u64,
 
     /// Run as an FFN-service endpoint for remote `RemoteWalkBackend`
     /// clients. Disables `/v1/infer` (like `--no-infer`) and advertises
@@ -869,6 +923,73 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         return Err("no vindexes loaded".into());
     }
 
+    // Cgroup memory pre-flight (BUG-infer-deadlock §5.5).  Refuses to
+    // start when the configured cgroup leaves no room to load weights;
+    // converts a 10-second OOM-kill loop into a one-line startup error.
+    if !cli.no_memcheck && !cli.lazy_weights {
+        let total_estimate: u64 = models
+            .iter()
+            .filter(|m| !m.infer_disabled)
+            .map(|m| m.config.estimate_resident_bytes())
+            .sum();
+        if total_estimate > 0 {
+            let headroom = cli.memcheck_headroom_mib * 1024 * 1024;
+            let outcome = crate::memcheck::check_memory_headroom(total_estimate, headroom);
+            match &outcome {
+                crate::memcheck::MemCheckOutcome::Ok {
+                    cgroup_max_bytes,
+                    estimate_bytes,
+                } => {
+                    info!(
+                        "Memcheck: estimated {:.1} GB resident vs cgroup memory.max {:.1} GB \
+                         (headroom {} MiB, ok)",
+                        (*estimate_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                        (*cgroup_max_bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                        cli.memcheck_headroom_mib,
+                    );
+                }
+                crate::memcheck::MemCheckOutcome::Skipped { reason } => {
+                    info!("Memcheck: skipped ({reason})");
+                }
+                crate::memcheck::MemCheckOutcome::Tight { .. } => {
+                    return Err(crate::memcheck::explain_tight_outcome(&outcome).into());
+                }
+            }
+        }
+    } else if cli.no_memcheck {
+        info!("Memcheck: disabled (--no-memcheck)");
+    }
+
+    // Eager-load model weights at startup so the first /v1/infer
+    // request does not face a multi-GB allocation under HTTP-handler
+    // backpressure.  Failure here is a clean startup error rather
+    // than an OOM-kill during the first request.  See
+    // `BUG-infer-deadlock.md` and `LoadedModel::force_load_weights`.
+    if cli.lazy_weights {
+        info!("Lazy weight load: enabled (--lazy-weights)");
+    } else {
+        for m in &models {
+            if m.infer_disabled {
+                continue;
+            }
+            let load_start = std::time::Instant::now();
+            info!("Pre-loading model weights for '{}' …", m.id);
+            if let Err(e) = m.force_load_weights() {
+                return Err(format!(
+                    "failed to load weights for '{}': {} \
+                     (pass --lazy-weights to defer until first request)",
+                    m.id, e
+                )
+                .into());
+            }
+            info!(
+                "  Pre-loaded weights for '{}' in {:.1}s",
+                m.id,
+                load_start.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
     let rate_limiter =
         cli.rate_limit
             .as_ref()
@@ -893,7 +1014,14 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(DEFAULT_SESSION_TTL_SECS),
         describe_cache: DescribeCache::new(cli.cache_ttl),
+        infer_timeout: std::time::Duration::from_secs(cli.infer_timeout_secs),
     });
+
+    if cli.infer_timeout_secs == 0 {
+        info!("Infer timeout: disabled");
+    } else {
+        info!("Infer timeout: {}s", cli.infer_timeout_secs);
+    }
 
     if cli.cache_ttl > 0 {
         info!("DESCRIBE cache: {}s TTL", cli.cache_ttl);

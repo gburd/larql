@@ -124,6 +124,7 @@ fn make_app_state(model: LoadedModel) -> Arc<AppState> {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(60),
+        infer_timeout: std::time::Duration::from_secs(60),
     })
 }
 

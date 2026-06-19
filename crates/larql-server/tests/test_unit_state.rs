@@ -92,6 +92,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -119,6 +120,7 @@ fn make_tiny_state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
+        infer_timeout: std::time::Duration::from_secs(60),
     })
 }
 
@@ -180,6 +182,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

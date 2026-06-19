@@ -26,6 +26,16 @@ pub enum ServerError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Inference handler exceeded the server-side deadline.  We drop
+    /// the in-flight `spawn_blocking` future, log the original
+    /// elapsed time, and respond `504 Gateway Timeout` so the
+    /// client can decide whether to retry.  The blocking thread
+    /// keeps running to completion in the background — we don't
+    /// have cooperative cancellation on the inference path — but it
+    /// no longer holds up the HTTP handler or the next request.
+    #[error("inference timed out: {0}")]
+    Timeout(String),
 }
 
 impl IntoResponse for ServerError {
@@ -37,6 +47,7 @@ impl IntoResponse for ServerError {
                 (StatusCode::SERVICE_UNAVAILABLE, msg.clone())
             }
             ServerError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            ServerError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg.clone()),
         };
 
         (status, axum::Json(ErrorBody { error: message })).into_response()

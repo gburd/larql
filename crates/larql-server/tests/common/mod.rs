@@ -144,6 +144,7 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -186,6 +187,7 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -269,6 +271,7 @@ impl ModelBuilder {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
+            weights_init: std::sync::Mutex::new(()),
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(
@@ -356,6 +359,7 @@ pub fn model_with_real_weights_and_labels(
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -435,6 +439,7 @@ pub fn model_with_q4k_weights(
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -467,6 +472,7 @@ pub fn state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
+        infer_timeout: std::time::Duration::from_secs(60),
     })
 }
 
@@ -478,6 +484,7 @@ pub fn state_with_key(models: Vec<Arc<LoadedModel>>, key: &str) -> Arc<AppState>
         api_key: Some(key.to_string()),
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
+        infer_timeout: std::time::Duration::from_secs(60),
     })
 }
 
@@ -489,6 +496,7 @@ pub fn state_with_cache(models: Vec<Arc<LoadedModel>>, cache_size: u64) -> Arc<A
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(cache_size),
+        infer_timeout: std::time::Duration::from_secs(60),
     })
 }
 
