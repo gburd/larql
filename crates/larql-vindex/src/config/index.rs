@@ -608,7 +608,7 @@ mod resident_size_tests {
         // Estimator allows for f16 storage + 12 % overhead;
         // accept anywhere in [4 GB, 8 GB].
         let gb = (est as f64) / (1024.0 * 1024.0 * 1024.0);
-        assert!(gb >= 4.0 && gb <= 8.0, "got {gb} GB");
+        assert!((4.0..=8.0).contains(&gb), "got {gb} GB");
     }
 
     /// Browse-only vindex (no inference weights) reports a smaller
