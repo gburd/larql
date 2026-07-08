@@ -5,8 +5,6 @@ pub mod bitnet_writer;
 pub mod build;
 pub mod build_from_vectors;
 pub mod build_helpers;
-pub mod bitnet_loader;
-pub mod bitnet_writer;
 pub mod callbacks;
 pub mod checkpoint;
 pub mod constants;

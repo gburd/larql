@@ -70,7 +70,6 @@ pub mod residual;
 pub mod residual_diff;
 pub mod ternary;
 pub mod test_utils;
-pub mod ternary;
 pub mod tokenizer;
 pub mod trace;
 pub mod vindex;
