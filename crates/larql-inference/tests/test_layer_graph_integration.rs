@@ -158,7 +158,7 @@ fn prefill_with_kv_matches_predict_q4k_hidden() {
     );
 
     // predict_kquant_hidden dequantises layer-by-layer
-    let h_q4k = predict_kquant_hidden(&mut weights, &prompt_ids, &index, None);
+    let h_q4k = predict_kquant_hidden(&weights, &prompt_ids, &index, None);
 
     // The two paths use different FFN implementations — cosine similarity should
     // be > 0.95 at the last position (they differ mainly in FFN quantisation).

@@ -11,7 +11,7 @@
 //!
 //! Usage: `cargo run --release --example walk_ffn_k_agreement -- [VINDEX_DIR]`
 
-use larql_inference::vindex::{insert_q4k_layer_tensors, WalkFfn, WalkFfnConfig};
+use larql_inference::vindex::{insert_q4k_layer_tensors_resident, WalkFfn, WalkFfnConfig};
 use larql_inference::{load_tokenizer, predict_with_ffn};
 
 fn argmax(
@@ -43,7 +43,7 @@ fn main() {
     let _ = index.load_gate_vectors_q4(&dir);
     let tok = load_tokenizer(&dir).expect("tok");
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant");
     }
     let nl = weights.num_layers;
     let feats = index.num_features(nl / 2);

@@ -48,7 +48,7 @@ pub(super) fn run_local_moe(
     // for the whole generation (experts stay Q4K — read directly by
     // `build_moe_weights`). Matches the `larql run --moe-shards` CPU default.
     for layer in 0..weights.num_layers {
-        larql_inference::vindex::insert_q4k_layer_tensors(weights, index, layer)
+        larql_inference::vindex::insert_q4k_layer_tensors_resident(weights, index, layer)
             .map_err(|e| format!("failed to dequantize layer {layer} to f32: {e}"))?;
     }
 
@@ -57,6 +57,7 @@ pub(super) fn run_local_moe(
     let weights_ref: &ModelWeights = weights;
     let moe_ffn = larql_inference::ffn::LocalMoeFfn {
         weights: weights_ref,
+        index: Some(index),
     };
 
     let mut rows = Vec::new();
@@ -95,6 +96,11 @@ fn run_one(
 ) -> BenchRow {
     let label = format!("larql-cpu-moe ({})", kind.display_name());
     let mut engine = kind.build(larql_inference::cpu_engine_backend());
+
+    // Per-stage split (`LARQL_DECODE_STAGES=1`): reset the thread-local
+    // accumulators so this engine's numbers aren't polluted by a previous
+    // engine kind in the same process.
+    larql_inference::decode_stages::reset();
 
     let max_tokens = args.warmup + args.tokens;
     // Capture a timestamp per emitted token: prefill (TTFT) is the gap from
@@ -143,6 +149,26 @@ fn run_one(
     } else {
         "in-process experts, KV-cached".to_string()
     };
+
+    // Accumulated over prefill + decode on the driving thread; per-token
+    // figures divide by ALL emitted tokens (incl. warmup) since the
+    // accumulators can't be split retroactively. "other" (router, embed,
+    // combine, norms) falls out of the wall-clock by subtraction.
+    if larql_inference::decode_stages::is_enabled() && !tok_times.is_empty() {
+        let (attn_ms, dense_ms, expert_ms, lmhead_ms) =
+            larql_inference::decode_stages::snapshot_ms();
+        let n = tok_times.len() as f64;
+        eprintln!(
+            "  [stages/{}] per-token over {} emits (incl. prefill+warmup): \
+             attn {:.1} ms | dense {:.1} ms | experts {:.1} ms | lm_head {:.1} ms",
+            label,
+            tok_times.len(),
+            attn_ms / n,
+            dense_ms / n,
+            expert_ms / n,
+            lmhead_ms / n,
+        );
+    }
 
     BenchRow {
         backend: label,

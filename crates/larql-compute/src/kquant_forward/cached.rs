@@ -7,9 +7,12 @@
 //! per-step decode (single-row attention against the cache + 1-row
 //! FFN). Speedup scales linearly with decode length.
 //!
-//! Per-step Q4_K → f32 dequant via `insert_q4k_layer_tensors` is
-//! still paid for now; eliminating it is a follow-up (route Q/K/V/O
-//! and gate/up/down through `backend.q4k_matvec` directly).
+//! Prefill projects Q/K/V/O and gate/up/down straight from the vindex's
+//! Q4_K/Q6_K bytes via the amortised q4k/q6k matmul — no per-layer f32
+//! dequant — when the projection dims are 256-aligned (see
+//! `predict_kquant_prefill_with_state`'s `use_q4k_attn` / `use_q4k_ffn`).
+//! Per-step decode still dequantises via `insert_q4k_layer_tensors`
+//! (a smaller follow-up).
 //!
 //! Scope: dense architectures only. Hybrid-MoE (Gemma 4 26B A4B)
 //! and cross-layer KV sharing (Gemma 4 E2B) fall back to the slow
@@ -25,19 +28,16 @@
 // across two files.
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
-use crate::cpu::ops::q4k_q8k_dot::{
-    q4k_q8k_matvec_into, q6k_q8k_matvec_into, quantize_x_to_q8k_into, Q8KActivation,
-};
+use crate::cpu::ops::q4k_q8k_dot::{quantize_x_to_q8k_into, Q8KActivation};
 use crate::ComputeBackend;
 use larql_models::ModelWeights;
 use ndarray::Array2;
 
 use crate::attention::{
     decode::{gqa_attention_decode_step, run_attention_block_decode_step_backend},
-    rope::apply_rope_partial_at,
+    rope::apply_rope_partial_at_full,
     run_attention_with_kv_backend,
 };
-use crate::ffn::WeightFfn;
 use crate::forward::embed_tokens_pub;
 use crate::forward::layer::apply_layer_scalar;
 use crate::forward::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
@@ -45,7 +45,7 @@ use crate::forward::run_ffn;
 use crate::forward::{add_bias, apply_norm};
 use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
 
-use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
+use super::tensors::{insert_q4k_attn_tensors, insert_q4k_layer_tensors, remove_layer_tensors};
 
 /// Per-layer K/V captured during prefill. One entry per layer; matches
 /// the [`crate::attention::decode::KvCache`] convention so future work
@@ -88,7 +88,7 @@ pub fn supports_cached_decode(weights: &ModelWeights) -> bool {
 /// Returns the `[seq_len, hidden]` hidden state and the populated
 /// cache. Caller takes the last row for lm_head.
 pub fn predict_kquant_prefill(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_ids: &[u32],
     index: &dyn crate::KvIndex,
 ) -> (Array2<f32>, CpuKvCache, CachedTimings) {
@@ -104,7 +104,7 @@ pub fn predict_kquant_prefill(
 /// from a single prefill pass without a follow-up CPU re-walk. When
 /// `state` is `None`, bit-identical to [`predict_kquant_prefill`].
 pub fn predict_kquant_prefill_with_state(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_ids: &[u32],
     index: &dyn crate::KvIndex,
     mut state: Option<&mut crate::PerLayerDecodeState>,
@@ -112,14 +112,38 @@ pub fn predict_kquant_prefill_with_state(
     let num_layers = weights.num_layers;
     let mut cache: CpuKvCache = vec![None; num_layers];
     let mut timings = CachedTimings::default();
+    // Forward-local dequant scratch — per-forward derived state; `weights`
+    // stays immutable. Readers resolve via with_scratch (scratch ∪ canonical).
+    let mut scratch = larql_models::DequantScratch::new();
 
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
 
     for layer in 0..num_layers {
+        // q4k-direct prefill: project straight from the vindex's Q4_K/Q6_K bytes
+        // (no per-layer f32 dequant). The FFN gate/up/down (`use_q4k_ffn`) and
+        // attention Q/K/V/O (`use_q4k_attn`) are gated independently — each needs
+        // its interleaved bytes present and the relevant dims 256-aligned (the
+        // matmul contraction is `hidden` for Q/K/V/gate/up and `q_dim` for O).
+        // The FFN weights are ~4× the attention weights, so the FFN path is the
+        // bulk of the saving; the attn path closes the rest.
+        const BLK: usize = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        let q_dim =
+            weights.arch.num_q_heads_for_layer(layer) * weights.arch.head_dim_for_layer(layer);
+        let use_q4k_ffn = weights.hidden_size.is_multiple_of(BLK)
+            && index.interleaved_kquant_layer_data(layer).is_some();
+        let use_q4k_attn = weights.hidden_size.is_multiple_of(BLK)
+            && q_dim.is_multiple_of(BLK)
+            && index.attn_kquant_layer_data(layer).is_some();
+
         let t0 = std::time::Instant::now();
-        let inserted =
-            insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"));
+        // Dequant only what the q4k-direct paths won't read straight from bytes.
+        let inserted = match (use_q4k_attn, use_q4k_ffn) {
+            (true, true) => Ok(Vec::new()),
+            (false, true) => insert_q4k_attn_tensors(&mut scratch, weights, index, layer),
+            _ => insert_q4k_layer_tensors(&mut scratch, weights, index, layer),
+        }
+        .unwrap_or_else(|err| panic!("{err}"));
         timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         // Snapshot pre-attention residual for this layer if engine wants it.
@@ -128,17 +152,23 @@ pub fn predict_kquant_prefill_with_state(
                 .push(crate::state_handle::CpuStateHandle::boxed(h.clone()));
         }
 
-        // Attention with K/V capture. Backend stays None — we want the
-        // CPU BLAS path for the dequantised f32 tensors that
-        // `insert_q4k_layer_tensors` just placed in `weights.tensors`.
-        let (h_post_attn, k_rope, v_final) =
-            match run_attention_with_kv_backend(weights, &h, layer, None) {
-                Some(t) => t,
-                None => {
-                    remove_layer_tensors(weights, inserted);
-                    return (h, cache, timings);
-                }
-            };
+        // Attention with K/V capture. When `use_q4k_attn`, Q/K/V/O project
+        // straight from the Q4_K/Q6_K bytes (empty scratch — norms still come
+        // from canonical weights); else the dequantised f32 view path.
+        let attn_index = if use_q4k_attn { Some(index) } else { None };
+        let (h_post_attn, k_rope, v_final) = match run_attention_with_kv_backend(
+            larql_models::WeightsView::with_scratch(weights, &scratch),
+            &h,
+            layer,
+            None,
+            attn_index,
+        ) {
+            Some(t) => t,
+            None => {
+                remove_layer_tensors(&mut scratch, inserted);
+                return (h, cache, timings);
+            }
+        };
 
         if let Some(s) = state.as_deref_mut() {
             // Prefill K/V for THIS layer = full seq_len × kv_dim.
@@ -148,13 +178,20 @@ pub fn predict_kquant_prefill_with_state(
                 .push(crate::state_handle::CpuStateHandle::boxed(v_final.clone()));
         }
 
-        let ffn = WeightFfn { weights };
-        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
+        let h_post_ffn = if use_q4k_ffn {
+            let ffn = crate::ffn::Q4kMatmulFfn { weights, index };
+            run_ffn(weights, &h_post_attn, layer, &ffn, false).0
+        } else {
+            let ffn = crate::ffn::ViewFfn {
+                view: larql_models::WeightsView::with_scratch(weights, &scratch),
+            };
+            run_ffn(weights, &h_post_attn, layer, &ffn, false).0
+        };
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
         apply_layer_scalar(weights, &mut h_out, layer);
 
-        remove_layer_tensors(weights, inserted);
+        remove_layer_tensors(&mut scratch, inserted);
 
         cache[layer] = Some((k_rope, v_final));
         h = h_out;
@@ -171,7 +208,7 @@ pub fn predict_kquant_prefill_with_state(
 /// `prompt_len + steps_already_decoded`. The caller maintains this
 /// counter (typical: `prompt_len + step_index` starting at 0).
 pub fn predict_kquant_decode_step(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_id: u32,
     index: &dyn crate::KvIndex,
     cache: &mut CpuKvCache,
@@ -182,6 +219,7 @@ pub fn predict_kquant_decode_step(
         return None;
     }
     let mut timings = CachedTimings::default();
+    let mut scratch = larql_models::DequantScratch::new();
 
     // 1-row embed + 1-row PLE for the new token.
     let mut h = embed_tokens_pub(weights, &[token_id]);
@@ -189,13 +227,13 @@ pub fn predict_kquant_decode_step(
 
     for layer in 0..num_layers {
         let t0 = std::time::Instant::now();
-        let inserted =
-            insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"));
+        let inserted = insert_q4k_layer_tensors(&mut scratch, weights, index, layer)
+            .unwrap_or_else(|err| panic!("{err}"));
         timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         let kv_entry = cache[layer].as_ref();
         let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
-            weights,
+            larql_models::WeightsView::with_scratch(weights, &scratch),
             &h,
             layer,
             kv_entry,
@@ -204,19 +242,21 @@ pub fn predict_kquant_decode_step(
         ) {
             Some(t) => t,
             None => {
-                remove_layer_tensors(weights, inserted);
+                remove_layer_tensors(&mut scratch, inserted);
                 return None;
             }
         };
         cache[layer] = Some(new_kv);
 
-        let ffn = WeightFfn { weights };
+        let ffn = crate::ffn::ViewFfn {
+            view: larql_models::WeightsView::with_scratch(weights, &scratch),
+        };
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
         apply_layer_scalar(weights, &mut h_out, layer);
 
-        remove_layer_tensors(weights, inserted);
+        remove_layer_tensors(&mut scratch, inserted);
 
         h = h_out;
     }
@@ -260,9 +300,13 @@ fn matvec_q4k_or_q6k_q8k(
     if !cols.is_multiple_of(ELEMS_PER_BLOCK) {
         return None;
     }
-    let bytes_per_row = match format {
-        "Q4_K" => (cols / ELEMS_PER_BLOCK) * 144,
-        "Q6_K" => (cols / ELEMS_PER_BLOCK) * 210,
+    // Pre-flight length check only (the actual matvec recomputes this stride
+    // internally). Gate on the two kernel-backed formats and take the packed
+    // row length from the format helper instead of re-spelling `(cols/256)*144`.
+    let bytes_per_row = match crate::QuantFormat::from_registry_tag(format) {
+        Some(f @ (crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K)) => {
+            f.packed_matrix_bytes(1, cols)?
+        }
         _ => return None,
     };
     if bytes.len() < rows * bytes_per_row {
@@ -276,30 +320,10 @@ fn matvec_q4k_or_q6k_q8k(
     // `q4k_matvec_into` in `q4_common.rs`. Without this, decode runs
     // single-threaded and the sdot path actually regresses vs the
     // (rayon-parallel) f32 path despite each row being faster.
-    use rayon::prelude::*;
-    const CHUNK_ROWS: usize = 32;
     let mut out = vec![0.0f32; rows];
-    let w_ref = bytes;
-    out.par_chunks_mut(CHUNK_ROWS)
-        .enumerate()
-        .for_each(|(chunk_idx, chunk)| {
-            let row_start = chunk_idx * CHUNK_ROWS;
-            let chunk_len = chunk.len().min(rows.saturating_sub(row_start));
-            if chunk_len == 0 {
-                return;
-            }
-            let w_chunk =
-                &w_ref[row_start * bytes_per_row..(row_start + chunk_len) * bytes_per_row];
-            match format {
-                "Q4_K" => {
-                    q4k_q8k_matvec_into(&mut chunk[..chunk_len], x_q8k, w_chunk, chunk_len, cols)
-                }
-                "Q6_K" => {
-                    q6k_q8k_matvec_into(&mut chunk[..chunk_len], x_q8k, w_chunk, chunk_len, cols)
-                }
-                _ => {}
-            }
-        });
+    crate::cpu::ops::q4k_q8k_dot::q4k_q8k_matvec_parallel(
+        &mut out, x_q8k, bytes, rows, cols, format,
+    );
     Some(out)
 }
 
@@ -630,15 +654,26 @@ pub fn attention_decode_step_native(
         Some(norm_w) => rms_norm_heads(&q_full, norm_w, num_q, head_dim, qk_norm_off),
         None => q_full,
     };
-    let layer_rope_base = arch.rope_base_for_layer(layer);
+    // RoPE must match the staged path / prefill exactly: override-aware
+    // base, the per-layer position divisor (Gemma 3 linear rope_scaling
+    // applies ÷factor on GLOBAL layers only), and llama3 frequency
+    // scaling. The unscaled `apply_rope_partial_at` here was the direct-
+    // path divergence on gemma3-4b (global-layer K/Q rope'd at 8× the
+    // position the prefill cache used).
+    let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
-    let q_rope = apply_rope_partial_at(
+    let pos_divisor =
+        crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
+    let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
+    let q_rope = apply_rope_partial_at_full(
         &q_normed,
         num_q,
         head_dim,
         layer_rope_base,
         rotary_frac,
         abs_position,
+        pos_divisor,
+        llama3,
     );
 
     let k_vec = matvec_q4k_or_q6k_q8k(k_bytes, k_fmt, &h_norm_q8k, kv_dim, hidden)?;
@@ -667,13 +702,15 @@ pub fn attention_decode_step_native(
         Some(norm_w) => rms_norm_heads(&k_full_new, norm_w, num_kv, head_dim, qk_norm_off),
         None => k_full_new,
     };
-    let k_new_rope = apply_rope_partial_at(
+    let k_new_rope = apply_rope_partial_at_full(
         &k_normed,
         num_kv,
         head_dim,
         layer_rope_base,
         rotary_frac,
         abs_position,
+        pos_divisor,
+        llama3,
     );
 
     let (k_concat, v_concat) = match kv_entry {
@@ -819,36 +856,73 @@ fn run_ffn_decode_step_q4k_direct(
     let gate_vec = matvec_q4k_or_q6k_q8k(gate_bytes, gate_fmt, &h_in_q8k, intermediate, hidden)?;
     let up_vec = matvec_q4k_or_q6k_q8k(up_bytes, up_fmt, &h_in_q8k, intermediate, hidden)?;
 
-    // Element-wise activation: activation(gate) * up.
+    // Element-wise activation: activation(gate) * up. Rayon-chunked — the
+    // per-element math (libm tanh/exp included) is unchanged, so the output
+    // is bit-identical to the serial loop; the decode sample showed this
+    // scalar pass serial on the main thread while the workers slept.
     let mut activated = vec![0.0f32; intermediate];
-    match arch.activation() {
-        larql_models::Activation::GeluTanh => {
-            let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-            for i in 0..intermediate {
-                let x = gate_vec[i];
-                let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                let g = 0.5 * x * (1.0 + inner.tanh());
-                activated[i] = g * up_vec[i];
+    {
+        let gelu = matches!(arch.activation(), larql_models::Activation::GeluTanh);
+        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        let gate_ref = &gate_vec[..];
+        let up_ref = &up_vec[..];
+        crate::cpu::spin_pool::par_chunks_mut(&mut activated, 256, |ci, a_c| {
+            let start = ci * 256;
+            let g_c = &gate_ref[start..start + a_c.len()];
+            let u_c = &up_ref[start..start + a_c.len()];
+            if gelu {
+                for ((a, &x), &u) in a_c.iter_mut().zip(g_c.iter()).zip(u_c.iter()) {
+                    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    *a = 0.5 * x * (1.0 + inner.tanh()) * u;
+                }
+            } else {
+                // SiLU = x * sigmoid(x). Same shape as dense_ffn_forward_backend.
+                for ((a, &x), &u) in a_c.iter_mut().zip(g_c.iter()).zip(u_c.iter()) {
+                    let sig = 1.0 / (1.0 + (-x).exp());
+                    *a = x * sig * u;
+                }
             }
-        }
-        _ => {
-            // SiLU = x * sigmoid(x). Same shape as dense_ffn_forward_backend.
-            for i in 0..intermediate {
-                let x = gate_vec[i];
-                let sig = 1.0 / (1.0 + (-x).exp());
-                let g = x * sig;
-                activated[i] = g * up_vec[i];
-            }
-        }
+        });
     }
 
     // down projection: out = activated @ W_down.T → [hidden].
     // Re-quantise the post-activation vector (`intermediate`-wide) for
     // the down matvec — different input from gate/up.
-    let mut activated_q8k = Q8KActivation::with_capacity(intermediate);
-    quantize_x_to_q8k_into(&mut activated_q8k, &activated);
+    //
+    // The stored down row width may be PADDED up to a 256-multiple when
+    // `intermediate` isn't one (e.g. the 26B-A4B hybrid-MoE dense slab:
+    // intermediate 2112 stored as 2304-col Q6_K rows). Derive the stored
+    // width from the byte length and zero-pad the activation to match —
+    // pad columns multiply zero activations, so the result is exact.
+    // (Twin of the same handling in larql-inference's cached.rs — keep in
+    // lockstep, see the consolidation hazard in q4k-direct-attention.md.)
+    let down_sb_bytes = match down_fmt {
+        "Q4_K" => 144,
+        "Q6_K" => 210,
+        _ => return None,
+    };
+    let down_bytes_per_row = down_bytes.len() / hidden;
+    if down_bytes_per_row == 0 || !down_bytes_per_row.is_multiple_of(down_sb_bytes) {
+        return None;
+    }
+    let stored_cols =
+        down_bytes_per_row / down_sb_bytes * larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
+    if stored_cols < intermediate {
+        return None;
+    }
+    let activated_padded: Vec<f32>;
+    let act_slice: &[f32] = if stored_cols != intermediate {
+        let mut p = vec![0.0f32; stored_cols];
+        p[..intermediate].copy_from_slice(&activated);
+        activated_padded = p;
+        &activated_padded
+    } else {
+        &activated
+    };
+    let mut activated_q8k = Q8KActivation::with_capacity(stored_cols);
+    quantize_x_to_q8k_into(&mut activated_q8k, act_slice);
     let down_vec =
-        matvec_q4k_or_q6k_q8k(down_bytes, down_fmt, &activated_q8k, hidden, intermediate)?;
+        matvec_q4k_or_q6k_q8k(down_bytes, down_fmt, &activated_q8k, hidden, stored_cols)?;
     let mut out = vec_to_2d_row(down_vec);
     if let Some(bias) = arch
         .ffn_down_bias_key(layer)
@@ -887,7 +961,7 @@ fn run_ffn_decode_step_q4k_direct(
 /// if any layer has a format the direct-matvec path doesn't handle
 /// (caller falls back to [`predict_kquant_decode_step`]).
 pub fn predict_kquant_decode_step_direct(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_id: u32,
     index: &dyn crate::KvIndex,
     backend: &dyn ComputeBackend,
@@ -914,7 +988,7 @@ pub fn predict_kquant_decode_step_direct(
 /// coarse_decode_step_with_state`. When `state` is `None` this is
 /// bit-identical to [`predict_kquant_decode_step_direct`].
 pub fn predict_kquant_decode_step_direct_with_state(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_id: u32,
     index: &dyn crate::KvIndex,
     backend: &dyn ComputeBackend,

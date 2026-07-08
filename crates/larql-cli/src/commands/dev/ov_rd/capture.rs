@@ -132,8 +132,12 @@ pub(super) fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::E
             let inserted = insert_q4k_layer_tensors(&mut weights, &index, layer)?;
 
             if capture_layer(layer) {
-                let (_, pre_o) = run_attention_block_with_pre_o(&weights, &h, layer)
-                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let (_, pre_o) = run_attention_block_with_pre_o(
+                    larql_models::WeightsView::dense(&weights),
+                    &h,
+                    layer,
+                )
+                .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
                 add_pre_o_stats(
                     &mut stats[layer],
                     &pre_o,
@@ -160,7 +164,7 @@ pub(super) fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::E
             {
                 let ffn = WeightFfn { weights: &weights };
                 if let Some((h_new, _, _)) = run_layer_with_ffn(
-                    &weights,
+                    larql_inference::WeightsView::dense(&weights),
                     &h,
                     layer,
                     &ffn,

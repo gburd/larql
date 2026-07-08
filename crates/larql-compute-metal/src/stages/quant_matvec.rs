@@ -219,6 +219,17 @@ pub fn encode(
                  `Pipelines` struct to carry a Q8 kernel."
             );
         }
+        larql_compute::QuantFormat::I2S => {
+            // BitNet ternary (I2_S) has no Metal shader yet — it is a
+            // CPU-only path (`CpuBackend::ternary_matvec` over a
+            // `BitLinearWeight`). Fail loudly rather than silently no-op so a
+            // mis-route is caught, mirroring the Q8_0 arm above.
+            panic!(
+                "metal::stages::quant_matvec::encode: I2_S (BitNet ternary) is \
+                 not implemented on Metal. Run ternary matvec on the CPU \
+                 backend (`ternary_matvec`), or add a Metal sign-select shader."
+            );
+        }
         larql_compute::QuantFormat::BF16
         | larql_compute::QuantFormat::F16
         | larql_compute::QuantFormat::F32 => {

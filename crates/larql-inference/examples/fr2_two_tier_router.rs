@@ -18,7 +18,7 @@
 //! Usage: `cargo run --release --example fr2_two_tier_router -- [VINDEX_DIR]`
 //! Writes `bench/aim-validation/fr2_two_tier_router_gemma3-4b.json`.
 
-use larql_inference::vindex::insert_q4k_layer_tensors;
+use larql_inference::vindex::insert_q4k_layer_tensors_resident;
 use larql_inference::{capture_residuals, load_tokenizer};
 use larql_vindex::KnnStore;
 use std::collections::HashMap;
@@ -183,7 +183,7 @@ fn main() {
     let tok = load_tokenizer(&dir).expect("tokenizer");
     eprintln!("Dequantising {} layers ...", weights.num_layers);
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant");
     }
 
     let cap = |prompt: &str| -> HashMap<usize, Vec<f32>> {

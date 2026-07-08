@@ -22,7 +22,6 @@
 
 use larql_compute::ComputeBackend;
 use larql_inference::attention::SharedKV;
-use larql_inference::model::ModelWeights;
 use ndarray::{s, Array2};
 
 use crate::engines::boundary_per_layer::policy::BoundaryLayerPolicy;
@@ -41,7 +40,7 @@ use crate::engines::markov_residual_codec::codec::ColdResidualCodec;
 /// overflow lands — caller MUST snapshot this BEFORE appending the
 /// overflow to `cold_encoded` (which would advance `n_positions`).
 pub(super) fn extend_cold_kv_with_overflow(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     backend: &dyn ComputeBackend,
     policy: &BoundaryLayerPolicy,
     rs: &mut RsStorePerLayer,
@@ -156,6 +155,7 @@ mod tests {
                 .collect(),
             cold_encoded: None,
             cold_kv: None,
+            hot_kv: None,
             cold_abs_start: 0,
             next_position: 0,
             max_window: None,
@@ -175,7 +175,7 @@ mod tests {
             .map(|_| Array2::<f32>::zeros((0, weights.hidden_size)))
             .collect();
         let result = extend_cold_kv_with_overflow(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &CpuBackend,
             &policy,
             &mut rs,
@@ -198,7 +198,7 @@ mod tests {
             .map(|_| Array2::<f32>::from_elem((2, weights.hidden_size), 0.3f32))
             .collect();
         let result = extend_cold_kv_with_overflow(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &CpuBackend,
             &policy,
             &mut rs,
@@ -229,15 +229,22 @@ mod tests {
         let first_overflow: Vec<Array2<f32>> = (0..weights.num_layers)
             .map(|_| Array2::<f32>::from_elem((2, weights.hidden_size), 0.5f32))
             .collect();
-        extend_cold_kv_with_overflow(&weights, &CpuBackend, &policy, &mut rs, &first_overflow, 0)
-            .unwrap();
+        extend_cold_kv_with_overflow(
+            larql_inference::WeightsView::dense(&weights),
+            &CpuBackend,
+            &policy,
+            &mut rs,
+            &first_overflow,
+            0,
+        )
+        .unwrap();
 
         // Now extend with another 3 rows — exercises the Some arm.
         let second_overflow: Vec<Array2<f32>> = (0..weights.num_layers)
             .map(|_| Array2::<f32>::from_elem((3, weights.hidden_size), 0.7f32))
             .collect();
         let result = extend_cold_kv_with_overflow(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &CpuBackend,
             &policy,
             &mut rs,

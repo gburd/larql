@@ -42,6 +42,10 @@ pub fn build_vindex_streaming(
     model_name: &str,
     output_dir: &Path,
     down_top_k: usize,
+    // Per-expert summary tier (`--summary-features-per-expert`): `> 0` caps
+    // each expert's gate/down features to a top-K so many-experts MoE doesn't
+    // explode; `0` = full per-expert features.
+    summary_features_per_expert: usize,
     extract_level: crate::ExtractLevel,
     dtype: StorageDtype,
     quant: QuantFormat,
@@ -87,6 +91,7 @@ pub fn build_vindex_streaming(
         model_name,
         output_dir,
         down_top_k,
+        summary_features_per_expert,
         extract_level,
         dtype,
         quant,

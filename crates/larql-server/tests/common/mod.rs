@@ -73,7 +73,6 @@ pub fn test_index() -> VectorIndex {
 pub fn test_config() -> VindexConfig {
     VindexConfig {
         version: 2,
-        bitnet_layout: None,
         model: "test/model-4".to_string(),
         family: "test".to_string(),
         source: None,
@@ -104,6 +103,7 @@ pub fn test_config() -> VindexConfig {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     }
 }
 
@@ -146,8 +146,6 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -191,8 +189,6 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -276,9 +272,7 @@ impl ModelBuilder {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
-        weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
+            weights_init: std::sync::Mutex::new(()),
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(
@@ -367,8 +361,6 @@ pub fn model_with_real_weights_and_labels(
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -449,8 +441,6 @@ pub fn model_with_q4k_weights(
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

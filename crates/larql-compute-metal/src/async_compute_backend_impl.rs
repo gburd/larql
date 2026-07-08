@@ -26,7 +26,6 @@ use larql_compute::async_compute_backend::{
 use larql_compute::ffn::FfnBackend;
 use larql_compute::kv_dispatch::{KvHandle, ResidualHandle};
 use larql_compute::CpuBackend;
-use larql_models::ModelWeights;
 
 /// Convenience — the CPU backend instance every method delegates to.
 /// Zero-sized type; const-construction is free.
@@ -35,7 +34,7 @@ const CPU: CpuBackend = CpuBackend;
 impl AsyncComputeBackend for MetalBackend {
     fn attention_step_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -50,7 +49,7 @@ impl AsyncComputeBackend for MetalBackend {
 
     fn attention_step_windowed_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -63,7 +62,7 @@ impl AsyncComputeBackend for MetalBackend {
 
     fn attention_prefill_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
@@ -85,7 +84,7 @@ impl AsyncComputeBackend for MetalBackend {
 
     fn forward_from_layer_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         ffn: &dyn FfnBackend,
         start_layer: usize,
         residuals: &ResidualHandle,
@@ -127,11 +126,24 @@ mod tests {
         let m = backend();
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
-        let (_h_prefill, mut kv) = m.attention_prefill_async(&weights, &h_in, 0, None, None);
+        let (_h_prefill, mut kv) = m.attention_prefill_async(
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let abs_position = tokens.len();
         let h_async = m
-            .attention_step_async(&weights, &h_new, &mut kv, 0, abs_position, None)
+            .attention_step_async(
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                abs_position,
+                None,
+            )
             .read();
         assert_eq!(h_async.ncols(), weights.hidden_size);
         assert_eq!(h_async.nrows(), 1);
@@ -143,11 +155,17 @@ mod tests {
         let m = backend();
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
-        let (_, mut kv) = m.attention_prefill_async(&weights, &h_in, 0, None, None);
+        let (_, mut kv) = m.attention_prefill_async(
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h_async = m
             .attention_step_windowed_async(
-                &weights,
+                larql_models::WeightsView::dense(&weights),
                 &h_new,
                 &mut kv,
                 0,
@@ -165,7 +183,13 @@ mod tests {
         let m = backend();
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
-        let (h_handle, kv) = m.attention_prefill_async(&weights, &h_in, 0, None, None);
+        let (h_handle, kv) = m.attention_prefill_async(
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h = h_handle.read();
         assert_eq!(h.nrows(), tokens.len());
         assert_eq!(h.ncols(), weights.hidden_size);
@@ -205,10 +229,22 @@ mod tests {
         let (_, residuals_m) = m.upload_boundary_residual_async(&residual);
         let (_, residuals_c) = cpu.upload_boundary_residual_async(&residual);
         let h_m = m
-            .forward_from_layer_async(&weights, &ffn, 1, &residuals_m, &tokens)
+            .forward_from_layer_async(
+                larql_models::WeightsView::dense(&weights),
+                &ffn,
+                1,
+                &residuals_m,
+                &tokens,
+            )
             .read();
         let h_c = cpu
-            .forward_from_layer_async(&weights, &ffn, 1, &residuals_c, &tokens)
+            .forward_from_layer_async(
+                larql_models::WeightsView::dense(&weights),
+                &ffn,
+                1,
+                &residuals_c,
+                &tokens,
+            )
             .read();
         assert_eq!(h_m, h_c, "Metal delegation must bit-match CpuBackend");
     }

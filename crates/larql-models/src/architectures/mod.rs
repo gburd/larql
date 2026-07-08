@@ -4,6 +4,7 @@
 //! Every architecture implements [`ModelArchitecture`](crate::config::ModelArchitecture)
 //! and returns its own `model_type` from `family()`.
 
+pub mod bitnet;
 pub mod deepseek;
 pub mod deepseek_v4;
 pub mod gemma2;

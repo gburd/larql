@@ -92,8 +92,12 @@ fn run_profile_pass(
 
     for layer in 0..weights.num_layers {
         let t = Instant::now();
-        let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(weights, &h, layer)
-            .ok_or_else(|| format!("attention failed at layer {layer}"))?;
+        let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            layer,
+        )
+        .ok_or_else(|| format!("attention failed at layer {layer}"))?;
         stats.layers[layer].attention_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         if let Some(index) = index {

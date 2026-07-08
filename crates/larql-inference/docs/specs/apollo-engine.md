@@ -114,7 +114,7 @@ that consumes them.
 
 | Concern | Location |
 |---|---|
-| Engine struct + `KvEngine` impl | `crates/larql-kv/src/engines/apollo/engine.rs` |
+| Engine struct + `RetrievalEngine` impl (NOT `KvEngine` — see the 2026-05-24 note above) | `crates/larql-kv/src/engines/apollo/engine.rs` |
 | Store schema | `crates/larql-apollo/` |
 | `forward_from_layer` (run-tail) | `crates/larql-inference/src/forward/from_layer.rs` |
 | Residual capture (offline) | `crates/larql-apollo::capture` |

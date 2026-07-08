@@ -219,8 +219,10 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                      the remote block; dense engine row skipped"
                 );
             } else {
-                let kv_ref_bytes =
-                    larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
+                let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
+                    larql_inference::WeightsView::dense(&weights),
+                    token_ids.len(),
+                );
 
                 // Parse + validate --ffn-policy once before the engine loop
                 // (multi-engine sweep reuses the same validated policy).
@@ -266,8 +268,10 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes =
-                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
+            let kv_ref_bytes = larql_kv::markov_residual::kv_memory_bytes_for_seq(
+                larql_inference::WeightsView::dense(&weights),
+                token_ids.len(),
+            );
 
             let validated_policy =
                 parse_ffn_policy(args.ffn_policy.as_deref(), weights.num_layers)?;

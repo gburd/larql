@@ -169,6 +169,7 @@ fn bench_q4k_vs_f32(c: &mut Criterion) {
         "bench/q4k_vs_f32",
         &f32_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::All,
         larql_vindex::StorageDtype::F32,
         larql_vindex::QuantFormat::None,
@@ -186,6 +187,7 @@ fn bench_q4k_vs_f32(c: &mut Criterion) {
         "bench/q4k_vs_f32",
         &q4k_dir,
         5,
+        0,
         larql_vindex::ExtractLevel::All,
         larql_vindex::StorageDtype::F32,
         larql_vindex::QuantFormat::Q4K,

@@ -37,8 +37,82 @@
 //! native path drops the runtime working set to ~1.4 GB.  This
 //! module provides the math; replacing `--f16` in the convert path
 //! is what closes out §5.4 end-to-end.
+//!
+//! ## Relationship to the engine machinery (why a separate stack)
+//!
+//! This module deliberately sits *beside* `attention/`, `kv_dispatch`,
+//! `forward/`, and the StatePolicy engine rather than threading the
+//! BitNet forward through them.  The reasoning, component by
+//! component:
+//!
+//! - **RoPE** is reused directly (`super::attention::rope`) — the
+//!   seam is clean and the math is identical, so there's no reason
+//!   to fork it.
+//! - **RMSNorm** is NOT reused from `larql_compute::residual`.  That
+//!   crate's `rms_norm*` operate on `Array2<f32>` and allocate a new
+//!   array per call; the BitNet forward runs a per-token,
+//!   allocation-free `&[f32] -> &mut [f32]` norm in the hot inner
+//!   loop (`rmsnorm_into`).  Routing it through the allocating
+//!   `Array2` form would add an allocation per position per layer.
+//!   The numerics are the same (verified: same eps, same
+//!   `x/rms*weight`); the divergence is purely the alloc-free
+//!   buffer shape.  If `residual` grows an `_into` variant this can
+//!   collapse to a one-line call.
+//! - **GQA attention** is computed inline here rather than via
+//!   `attention::{gqa,decode}` because BitNet inserts an EXTRA norm
+//!   (`attn_sub_norm`) between the QK product and the output
+//!   projection — a sub-layer norm the standard attention path has
+//!   no hook for.  The Q/K/V/O projections are themselves ternary
+//!   (`BitLinearWeight`), not dense, so the projection step can't
+//!   call the dense attention kernels regardless.
+//! - **FFN** is squared-ReLU (ReLU²), not SwiGLU, and its
+//!   projections are ternary with a mid-FFN sub-norm
+//!   (`ffn_sub_norm`).  Neither shape matches the existing FFN
+//!   forward.
+//! - **KV cache / decode_step / generate / sampling** are the
+//!   genuinely-forkable parts.  They are reimplemented here as a
+//!   self-contained single-shot-prefill + greedy/temperature decode
+//!   so the BitNet path is verifiable on its own (it was qualified
+//!   end-to-end against the real 2 B model: "capital of France" ->
+//!   Paris 94.5%).  Status (branch feat/quant-ternary-a8): the
+//!   int8-quantized-activation (A8) kernel + NEON sign-select now
+//!   EXIST in `larql_compute::cpu::ops::ternary_matvec`, and this
+//!   forward already runs on them (`matvec_i2s_a8_f32_into`). What
+//!   remains is the *shared* path — dispatch through the
+//!   `QuantFormat`/`FormatRoute` registry (no ternary variant yet)
+//!   and a shared KV-cache (`larql_kv::KvCache`) in place of the
+//!   bespoke `BitnetKvCache`.
+//!
+//! Net: the legitimate BitNet-specific divergences are the two
+//! sub-norms and the ReLU² FFN over ternary projections.  The
+//! reimplemented KV/sampling is a maintenance cost acknowledged
+//! here. Its blocking precondition — the quantized-activation kernel
+//! — is now met, so folding the decode loop onto the forward-pass
+//! spine + a `KvEngine` impl is live roadmap work (ROADMAP "BitNet
+//! b1.58 integration hardening"), no longer blocked on a missing
+//! kernel. Until a second consumer exists it may stay isolated under
+//! the no-premature-extraction rule; the point is the decision is now
+//! explicit, not deferred to a non-existent dependency.
+//!
+//! ## I2_S layout (dual representation — intentional)
+//!
+//! There are TWO I2_S byte layouts in play, and they are not the
+//! same on purpose:
+//!   - `larql_models::quant::ggml::tq::dequantize_i2_s` decodes the
+//!     STRIDED microsoft layout (128-elem / 32-byte blocks) read
+//!     from the source GGUF.
+//!   - the runtime kernel + the keep-quant writer use a CONTIGUOUS
+//!     per-row layout (4 trits/byte, sequential).  The writer
+//!     re-packs from the strided source into this form so the hot
+//!     `matvec_i2s_f32` loop never has to handle the strided
+//!     addressing.
+//!
+//! Conflating the two scrambles every weight; see the decode-fix PR
+//! and the format spec for the authoritative description.
 
-use larql_compute::cpu::ops::ternary_matvec::{matvec_i2s_f32_into, BitLinearWeight};
+use larql_compute::cpu::ops::ternary_matvec::{
+    matvec_i2s_a8_f32_into, matvec_i2s_a8_into, quantize_activation_i8, BitLinearWeight,
+};
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// One BitLinear-FFN block.  Holds three ternary weight tensors
@@ -130,8 +204,11 @@ impl BitNetFfn {
 
         // 2. gate = ternary(gate.weight) · x_norm
         //    up   = ternary(up.weight)   · x_norm
-        matvec_i2s_f32_into(&self.gate, &x_norm, gate).expect("gate shape");
-        matvec_i2s_f32_into(&self.up, &x_norm, up).expect("up shape");
+        //    Both projections share x_norm — quantise it to int8 once (A8)
+        //    and feed both matvecs, instead of re-quantising per call.
+        let (x_i8, x_scale) = quantize_activation_i8(&x_norm);
+        matvec_i2s_a8_into(&self.gate, &x_i8, x_scale, gate).expect("gate shape");
+        matvec_i2s_a8_into(&self.up, &x_i8, x_scale, up).expect("up shape");
 
         // 3. Squared-ReLU activation (BitNet b1.58 spec) +
         //    element-wise multiply with up.
@@ -145,7 +222,7 @@ impl BitNetFfn {
         rmsnorm_into(hid, &self.ffn_sub_norm, self.eps, &mut hid_norm);
 
         // 5. y = ternary(down.weight) · hid_norm
-        matvec_i2s_f32_into(&self.down, &hid_norm, y).expect("down shape");
+        matvec_i2s_a8_f32_into(&self.down, &hid_norm, y).expect("down shape");
     }
 }
 
@@ -196,6 +273,95 @@ mod tests {
         BitLinearWeight::new(rows, cols, bytes, scales).unwrap()
     }
 
+    /// Parity gate for the A8 wiring: the production FFN forward (now the
+    /// int8-activation A8 path) must track a full f32-activation reference
+    /// FFN within int8 tolerance. Validates that swapping `matvec_i2s_f32`
+    /// → `matvec_i2s_a8_f32` across the forward didn't shift the numerics
+    /// beyond the intended activation-quantisation error.
+    #[test]
+    fn ffn_a8_forward_matches_f32_reference_within_tolerance() {
+        use larql_compute::cpu::ops::ternary_matvec::matvec_i2s_f32_into;
+
+        fn rand_w(rows: usize, cols: usize, seed: u64) -> BitLinearWeight {
+            let mut s = seed;
+            let mut bytes = vec![0u8; rows * cols / 4];
+            for b in bytes.iter_mut() {
+                let mut bv = 0u8;
+                for slot in 0..4 {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let code = match (s >> 33) % 3 {
+                        0 => 0b00u8,
+                        1 => 0b01,
+                        _ => 0b10,
+                    };
+                    bv |= code << (2 * slot);
+                }
+                *b = bv;
+            }
+            let scales = (0..rows).map(|r| 0.05 + (r % 5) as f32 * 0.01).collect();
+            BitLinearWeight::new(rows, cols, bytes, scales).unwrap()
+        }
+        fn synth(n: usize, seed: u64) -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((s >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect()
+        }
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        let (hidden, inter) = (256usize, 512usize);
+        let ffn = BitNetFfn {
+            gate: rand_w(inter, hidden, 1),
+            up: rand_w(inter, hidden, 2),
+            down: rand_w(hidden, inter, 3),
+            ffn_norm: vec![1.0; hidden],
+            ffn_sub_norm: vec![1.0; inter],
+            eps: 1e-5,
+        };
+        let x = synth(hidden, 42);
+
+        // Production (A8) forward.
+        let mut gate = vec![0.0; inter];
+        let mut up = vec![0.0; inter];
+        let mut hid = vec![0.0; inter];
+        let mut y_a8 = vec![0.0; hidden];
+        ffn.forward_into(&x, &mut gate, &mut up, &mut hid, &mut y_a8);
+
+        // f32-activation reference forward (same math, f32 kernel).
+        let mut x_norm = vec![0.0; hidden];
+        rmsnorm_into(&x, &ffn.ffn_norm, ffn.eps, &mut x_norm);
+        let mut g = vec![0.0; inter];
+        let mut u = vec![0.0; inter];
+        matvec_i2s_f32_into(&ffn.gate, &x_norm, &mut g).unwrap();
+        matvec_i2s_f32_into(&ffn.up, &x_norm, &mut u).unwrap();
+        let hid_f: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(gv, uv)| {
+                let r = gv.max(0.0);
+                r * r * uv
+            })
+            .collect();
+        let mut hid_norm = vec![0.0; inter];
+        rmsnorm_into(&hid_f, &ffn.ffn_sub_norm, ffn.eps, &mut hid_norm);
+        let mut y_f32 = vec![0.0; hidden];
+        matvec_i2s_f32_into(&ffn.down, &hid_norm, &mut y_f32).unwrap();
+
+        let cos = cosine(&y_a8, &y_f32);
+        assert!(
+            cos > 0.999,
+            "A8 FFN forward vs f32 reference cosine {cos} < 0.999"
+        );
+    }
+
     #[test]
     fn rmsnorm_zero_input_zero_output() {
         let x = vec![0.0f32; 8];
@@ -213,8 +379,7 @@ mod tests {
         let w = vec![1.0f32; 4];
         let mut out = vec![0.0f32; 4];
         rmsnorm_into(&x, &w, 0.0, &mut out);
-        let post_rms =
-            (out.iter().map(|v| v * v).sum::<f32>() / (out.len() as f32)).sqrt();
+        let post_rms = (out.iter().map(|v| v * v).sum::<f32>() / (out.len() as f32)).sqrt();
         assert!(
             (post_rms - 1.0).abs() < 1e-5,
             "post-norm rms should be ~1, got {post_rms}"
@@ -382,7 +547,6 @@ mod tests {
 //   4. logits = lm_head @ h_final
 //   5. Top-K softmax → predictions.
 
-
 /// Complete BitNet 1.58 model — every tensor needed for a forward
 /// pass.  Built by `larql-vindex::extract::bitnet_loader` from a
 /// `--keep-quant` vindex; feed into [`predict_bitnet`].
@@ -414,13 +578,13 @@ pub struct BitnetModel {
 
 /// One transformer block's worth of BitLinear weights + norms.
 pub struct BitnetLayer {
-    pub attn_norm: Vec<f32>,        // input RMSnorm, length = hidden
-    pub attn_q: BitLinearWeight,    // [hidden, hidden] (q heads x head_dim packed)
-    pub attn_k: BitLinearWeight,    // [n_kv_heads * head_dim, hidden]
-    pub attn_v: BitLinearWeight,    // [n_kv_heads * head_dim, hidden]
-    pub attn_sub_norm: Vec<f32>,    // post-attn RMSnorm, length = hidden
-    pub attn_o: BitLinearWeight,    // [hidden, hidden]
-    pub ffn: BitNetFfn,             // self-contained FFN block
+    pub attn_norm: Vec<f32>,     // input RMSnorm, length = hidden
+    pub attn_q: BitLinearWeight, // [hidden, hidden] (q heads x head_dim packed)
+    pub attn_k: BitLinearWeight, // [n_kv_heads * head_dim, hidden]
+    pub attn_v: BitLinearWeight, // [n_kv_heads * head_dim, hidden]
+    pub attn_sub_norm: Vec<f32>, // post-attn RMSnorm, length = hidden
+    pub attn_o: BitLinearWeight, // [hidden, hidden]
+    pub ffn: BitNetFfn,          // self-contained FFN block
 }
 
 /// One top-K prediction.
@@ -458,7 +622,11 @@ pub fn predict_bitnet(
     let n_q_heads = model.n_q_heads;
     let n_kv_heads = model.n_kv_heads;
     debug_assert!(n_q_heads >= n_kv_heads, "GQA: n_q_heads >= n_kv_heads");
-    debug_assert_eq!(n_q_heads * head_dim, hidden, "hidden = n_q_heads * head_dim");
+    debug_assert_eq!(
+        n_q_heads * head_dim,
+        hidden,
+        "hidden = n_q_heads * head_dim"
+    );
 
     // 1. Embed lookup -> residual stream h: [seq_len, hidden].
     let mut h = Array2::<f32>::zeros((seq_len, hidden));
@@ -495,23 +663,28 @@ pub fn predict_bitnet(
             );
         }
 
-        // b. Q/K/V projections via ternary matvec, per token.
+        // b. Q/K/V projections via ternary matvec, per token. Q/K/V share
+        //    x_norm.row(i), so quantise it to int8 once (A8) and reuse.
         for i in 0..seq_len {
-            matvec_i2s_f32_into(
+            let (x_i8, x_scale) = quantize_activation_i8(x_norm.row(i).as_slice().unwrap());
+            matvec_i2s_a8_into(
                 &layer.attn_q,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 q.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_q shape");
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_into(
                 &layer.attn_k,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 k.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_k shape");
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_into(
                 &layer.attn_v,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 v.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_v shape");
@@ -543,7 +716,7 @@ pub fn predict_bitnet(
                 model.eps,
                 attn_pool_norm.row_mut(i).as_slice_mut().unwrap(),
             );
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_f32_into(
                 &layer.attn_o,
                 attn_pool_norm.row(i).as_slice().unwrap(),
                 attn_out.row_mut(i).as_slice_mut().unwrap(),
@@ -641,9 +814,10 @@ fn ffn_forward_after_input_norm(
     debug_assert_eq!(up.len(), inter);
     debug_assert_eq!(hid.len(), inter);
 
-    // gate / up projections.
-    matvec_i2s_f32_into(&ffn.gate, x_norm, gate).expect("gate shape");
-    matvec_i2s_f32_into(&ffn.up, x_norm, up).expect("up shape");
+    // gate / up projections. Both share x_norm — quantise to int8 once (A8).
+    let (x_i8, x_scale) = quantize_activation_i8(x_norm);
+    matvec_i2s_a8_into(&ffn.gate, &x_i8, x_scale, gate).expect("gate shape");
+    matvec_i2s_a8_into(&ffn.up, &x_i8, x_scale, up).expect("up shape");
 
     // Squared-ReLU activation.
     for ((g, u), h) in gate.iter().zip(up.iter()).zip(hid.iter_mut()) {
@@ -656,7 +830,7 @@ fn ffn_forward_after_input_norm(
     rmsnorm_into(hid, &ffn.ffn_sub_norm, eps, &mut hid_norm);
 
     // Down projection.
-    matvec_i2s_f32_into(&ffn.down, &hid_norm, y).expect("down shape");
+    matvec_i2s_a8_f32_into(&ffn.down, &hid_norm, y).expect("down shape");
 }
 
 /// Causal-masked scaled-dot-product attention with GQA support.
@@ -817,7 +991,8 @@ mod predict_tests {
     /// Empty token_ids returns no predictions.
     #[test]
     fn predict_bitnet_empty_tokens_returns_empty() {
-        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+        let tok_json =
+            r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
         let tokenizer =
             larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
 
@@ -933,8 +1108,12 @@ impl BitnetKvCache {
     pub fn new(n_layers: usize, n_kv_heads: usize, head_dim: usize) -> Self {
         let kv_width = n_kv_heads * head_dim;
         Self {
-            k: (0..n_layers).map(|_| Array2::zeros((0, kv_width))).collect(),
-            v: (0..n_layers).map(|_| Array2::zeros((0, kv_width))).collect(),
+            k: (0..n_layers)
+                .map(|_| Array2::zeros((0, kv_width)))
+                .collect(),
+            v: (0..n_layers)
+                .map(|_| Array2::zeros((0, kv_width)))
+                .collect(),
             seq_len: 0,
         }
     }
@@ -962,11 +1141,7 @@ pub fn prefill(model: &BitnetModel, token_ids: &[u32]) -> (BitnetKvCache, Vec<f3
 /// Internally: position = cache.seq_len; the new token's Q sees
 /// causal-masked attention against the full cached K/V plus its own
 /// row.
-pub fn decode_step(
-    model: &BitnetModel,
-    cache: &mut BitnetKvCache,
-    new_token: u32,
-) -> Vec<f32> {
+pub fn decode_step(model: &BitnetModel, cache: &mut BitnetKvCache, new_token: u32) -> Vec<f32> {
     let position = cache.seq_len;
     let hidden = model.embed.shape()[1];
     let head_dim = model.head_dim;
@@ -998,12 +1173,18 @@ pub fn decode_step(
 
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         // a. attn_norm.
-        rmsnorm_into(h.as_slice().unwrap(), &layer.attn_norm, model.eps, &mut x_norm);
+        rmsnorm_into(
+            h.as_slice().unwrap(),
+            &layer.attn_norm,
+            model.eps,
+            &mut x_norm,
+        );
 
-        // b. Q/K/V projections.
-        matvec_i2s_f32_into(&layer.attn_q, &x_norm, &mut q).expect("attn_q shape");
-        matvec_i2s_f32_into(&layer.attn_k, &x_norm, &mut k).expect("attn_k shape");
-        matvec_i2s_f32_into(&layer.attn_v, &x_norm, &mut v).expect("attn_v shape");
+        // b. Q/K/V projections. Q/K/V share x_norm — quantise once (A8).
+        let (x_i8, x_scale) = quantize_activation_i8(&x_norm);
+        matvec_i2s_a8_into(&layer.attn_q, &x_i8, x_scale, &mut q).expect("attn_q shape");
+        matvec_i2s_a8_into(&layer.attn_k, &x_i8, x_scale, &mut k).expect("attn_k shape");
+        matvec_i2s_a8_into(&layer.attn_v, &x_i8, x_scale, &mut v).expect("attn_v shape");
 
         // c. RoPE on the new token's Q + K only.  The cached K
         //    already carries RoPE for positions 0..position-1.
@@ -1049,15 +1230,25 @@ pub fn decode_step(
         );
 
         // f. Sub-norm + O projection.
-        rmsnorm_into(&attn_pool, &layer.attn_sub_norm, model.eps, &mut attn_pool_norm);
-        matvec_i2s_f32_into(&layer.attn_o, &attn_pool_norm, &mut attn_out)
+        rmsnorm_into(
+            &attn_pool,
+            &layer.attn_sub_norm,
+            model.eps,
+            &mut attn_pool_norm,
+        );
+        matvec_i2s_a8_f32_into(&layer.attn_o, &attn_pool_norm, &mut attn_out)
             .expect("attn_o shape");
 
         // g. Residual + FFN + residual.
         for (dst, &src) in h.iter_mut().zip(attn_out.iter()) {
             *dst += src;
         }
-        rmsnorm_into(h.as_slice().unwrap(), &layer.ffn.ffn_norm, model.eps, &mut ffn_x_norm);
+        rmsnorm_into(
+            h.as_slice().unwrap(),
+            &layer.ffn.ffn_norm,
+            model.eps,
+            &mut ffn_x_norm,
+        );
         ffn_forward_after_input_norm(
             &layer.ffn,
             &ffn_x_norm,
@@ -1076,7 +1267,12 @@ pub fn decode_step(
 
     // h_final = output_norm(h)
     let mut h_final = vec![0.0f32; hidden];
-    rmsnorm_into(h.as_slice().unwrap(), &model.output_norm, model.eps, &mut h_final);
+    rmsnorm_into(
+        h.as_slice().unwrap(),
+        &model.output_norm,
+        model.eps,
+        &mut h_final,
+    );
     let h_arr = Array1::from(h_final);
     model.lm_head.dot(&h_arr).to_vec()
 }
@@ -1219,8 +1415,7 @@ fn stack_one_row(prev: &Array2<f32>, new_row: &Array1<f32>) -> Array2<f32> {
     let new_rows = prev.shape()[0] + 1;
     let mut out = Array2::<f32>::zeros((new_rows, cols));
     if !prev.is_empty() {
-        out.slice_mut(ndarray::s![..new_rows - 1, ..])
-            .assign(prev);
+        out.slice_mut(ndarray::s![..new_rows - 1, ..]).assign(prev);
     }
     out.row_mut(new_rows - 1).assign(new_row);
     out
@@ -1290,32 +1485,35 @@ fn run_full_forward(
             );
         }
         for i in 0..seq_len {
-            matvec_i2s_f32_into(
+            // Q/K/V share x_norm.row(i) — quantise to int8 once (A8) and reuse.
+            let (x_i8, x_scale) = quantize_activation_i8(x_norm.row(i).as_slice().unwrap());
+            matvec_i2s_a8_into(
                 &layer.attn_q,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 q.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_q shape");
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_into(
                 &layer.attn_k,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 k.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_k shape");
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_into(
                 &layer.attn_v,
-                x_norm.row(i).as_slice().unwrap(),
+                &x_i8,
+                x_scale,
                 v.row_mut(i).as_slice_mut().unwrap(),
             )
             .expect("attn_v shape");
         }
 
-        let q_rot = larql_compute::attention::rope::apply_rope(
-            &q, n_q_heads, head_dim, model.rope_base,
-        );
-        let k_rot = larql_compute::attention::rope::apply_rope(
-            &k, n_kv_heads, head_dim, model.rope_base,
-        );
+        let q_rot =
+            larql_compute::attention::rope::apply_rope(&q, n_q_heads, head_dim, model.rope_base);
+        let k_rot =
+            larql_compute::attention::rope::apply_rope(&k, n_kv_heads, head_dim, model.rope_base);
 
         attn_pool.fill(0.0);
         scaled_dot_product_attention_gqa(
@@ -1342,7 +1540,7 @@ fn run_full_forward(
                 model.eps,
                 attn_pool_norm.row_mut(i).as_slice_mut().unwrap(),
             );
-            matvec_i2s_f32_into(
+            matvec_i2s_a8_f32_into(
                 &layer.attn_o,
                 attn_pool_norm.row(i).as_slice().unwrap(),
                 attn_out.row_mut(i).as_slice_mut().unwrap(),
@@ -1564,7 +1762,8 @@ mod kv_cache_tests {
     #[test]
     fn generate_empty_prompt_returns_empty() {
         let model = tiny_model();
-        let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+        let tok_json =
+            r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
         let tokenizer =
             larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
         let out = generate(&model, &tokenizer, &[], 5, None);
@@ -1713,17 +1912,18 @@ pub fn load_bitnet_model(vindex_path: &std::path::Path) -> Result<BitnetModel, B
     let inter = config.intermediate_size;
     let mut layers = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
-        let attn_norm =
-            take_norm(&dense, &format!("layers.{i}.input_layernorm.weight"), hidden)?;
-        let attn_sub_norm =
-            take_norm(&dense, &format!("layers.{i}.attn_sub_norm.weight"), hidden)?;
+        let attn_norm = take_norm(
+            &dense,
+            &format!("layers.{i}.input_layernorm.weight"),
+            hidden,
+        )?;
+        let attn_sub_norm = take_norm(&dense, &format!("layers.{i}.attn_sub_norm.weight"), hidden)?;
         let ffn_norm = take_norm(
             &dense,
             &format!("layers.{i}.post_attention_layernorm.weight"),
             hidden,
         )?;
-        let ffn_sub_norm =
-            take_norm(&dense, &format!("layers.{i}.ffn_sub_norm.weight"), inter)?;
+        let ffn_sub_norm = take_norm(&dense, &format!("layers.{i}.ffn_sub_norm.weight"), inter)?;
 
         let get_bitlinear = |suffix: &str| -> Result<BitLinearWeight, BitnetLoadError> {
             let key = format!("layers.{i}.{suffix}.weight");
@@ -1973,7 +2173,6 @@ mod streaming_tests {
         assert_eq!(legacy, sampled);
     }
 
-
     /// Seeded temperature sampling is reproducible: same seed +
     /// same prompt = same token stream.
     #[test]
@@ -2023,9 +2222,7 @@ mod streaming_tests {
     fn top_k_one_is_deterministic() {
         let model = tiny_model();
         let prompt = vec![0u32, 1];
-        let cfg = SamplingConfig::temperature(2.0)
-            .with_top_k(1)
-            .with_seed(7);
+        let cfg = SamplingConfig::temperature(2.0).with_top_k(1).with_seed(7);
         let a = generate_sampled(&model, &prompt, 4, cfg, None);
         let b = generate_sampled(&model, &prompt, 4, cfg, None);
         assert_eq!(a, b);
@@ -2055,7 +2252,10 @@ mod streaming_tests {
             assert!(!text.is_empty(), "empty delta for token {id}");
         }
         let concat: String = events.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(!concat.is_empty(), "concatenated stream surface form was empty");
+        assert!(
+            !concat.is_empty(),
+            "concatenated stream surface form was empty"
+        );
     }
 
     /// EOS token id halts the stream before emitting that token.
@@ -2299,8 +2499,7 @@ mod walk_tests {
         let model = tiny_model();
         let tok = tiny_tokenizer();
         let tokens = vec![0u32, 1, 2];
-        let (preds, residuals) =
-            predict_bitnet_with_residuals(&model, &tok, &tokens, 3);
+        let (preds, residuals) = predict_bitnet_with_residuals(&model, &tok, &tokens, 3);
         assert_eq!(preds.len(), 3);
         assert_eq!(residuals.len(), model.layers.len());
         for (i, (layer_idx, r)) in residuals.iter().enumerate() {

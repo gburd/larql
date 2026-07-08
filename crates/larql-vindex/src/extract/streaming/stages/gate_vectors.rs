@@ -171,16 +171,13 @@ impl<'a> StreamingContext<'a> {
                 //    (shape [num_features, hidden]) — fine for low-expert-count
                 //    MoE (Mixtral's 8 per layer = ~1.8 GB/layer at hidden=4096).
                 //
-                //  • Summary: when LARQL_SUMMARY_FEATURES_PER_EXPERT is set
-                //    to a positive integer K, do a top-K randomized SVD of
-                //    each expert's gate_proj and write only the top-K right
+                //  • Summary: when `--summary-features-per-expert` is a
+                //    positive integer K, do a top-K randomized SVD of each
+                //    expert's gate_proj and write only the top-K right
                 //    singular vectors (K × hidden floats per expert). Required
                 //    for many-experts MoE (DeepSeek-V4 family at 256-384
                 //    experts/layer would otherwise produce 100s of GB).
-                let summary_k = std::env::var("LARQL_SUMMARY_FEATURES_PER_EXPERT")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+                let summary_k = self.summary_features_per_expert;
 
                 let mut total_features = 0usize;
                 let mut layer_bytes = 0u64;

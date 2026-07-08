@@ -64,7 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut h_cpu = h.clone();
     for layer in 0..weights.num_layers {
         let (h_pa, _, _) = larql_inference::attention::run_attention_block_gpu(
-            weights, &h_cpu, layer, false, None,
+            larql_inference::WeightsView::dense(weights),
+            &h_cpu,
+            layer,
+            false,
+            None,
         )
         .unwrap();
         let (h_out, _) =

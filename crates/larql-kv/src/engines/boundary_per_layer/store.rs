@@ -61,6 +61,13 @@ pub struct RsStorePerLayer {
     pub stored: Vec<Array2<f32>>,
     pub cold_encoded: Option<Vec<PerLayerEncodedColdLayer>>,
     pub cold_kv: Option<Vec<SharedKV>>,
+    /// W2 hot-K/V cache (twin of `markov_residual`). When there is no cold
+    /// tier (unbounded window), this holds the FULL K/V and the decode walk
+    /// appends to it IN PLACE instead of `recompute_kv`-ing the whole hot tier
+    /// every step. It is a **droppable derivative** of the canonical hot
+    /// residuals (`stored`): set it to `None` and the next step rebuilds it.
+    /// Excluded from `memory_bytes` for that reason (matches markov).
+    pub hot_kv: Option<Vec<SharedKV>>,
     pub cold_abs_start: usize,
     pub next_position: usize,
     pub max_window: Option<usize>,
@@ -179,6 +186,7 @@ mod tests {
             stored,
             cold_encoded: None,
             cold_kv: None,
+            hot_kv: None,
             cold_abs_start: 0,
             next_position: seq_len,
             max_window: None,

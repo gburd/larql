@@ -47,7 +47,9 @@ fn q4k_fixture_unblocks_insert_q4k_layer_tensors() {
     let patched = model.patched.blocking_read();
     let index = patched.base();
 
-    let inserted = larql_inference::vindex::insert_q4k_layer_tensors(weights, index, 0);
+    let mut scratch = larql_inference::DequantScratch::new();
+    let inserted =
+        larql_inference::vindex::insert_q4k_layer_tensors(&mut scratch, weights, index, 0);
     assert!(
         inserted.is_ok(),
         "insert_q4k_layer_tensors must succeed on the Q4K fixture; got {inserted:?}"

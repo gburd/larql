@@ -129,6 +129,7 @@ fn run_extract(model_dir: &Path, output_dir: &Path) {
         "test/resume",
         output_dir,
         5,
+        0, // summary_features_per_expert (off)
         ExtractLevel::Browse,
         StorageDtype::F32,
         QuantFormat::None,

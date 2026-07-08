@@ -127,7 +127,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── GQA attention (one layer) ──
     let t0 = Instant::now();
     for _ in 0..10 {
-        let _ = larql_inference::attention::run_attention_block(weights, &h, 0, false);
+        let _ = larql_inference::attention::run_attention_block(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            0,
+            false,
+        );
     }
     let attn_ms = t0.elapsed().as_secs_f64() * 1000.0 / 10.0;
     println!("Attention block:  {attn_ms:.1}ms  (proj + norm + RoPE + fused attn + residual)");
@@ -135,8 +140,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Full layer (attention + FFN) ──
     let t0 = Instant::now();
     for _ in 0..10 {
-        let (h_post_attn, _, _) =
-            larql_inference::attention::run_attention_block(weights, &h, 0, false).unwrap();
+        let (h_post_attn, _, _) = larql_inference::attention::run_attention_block(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            0,
+            false,
+        )
+        .unwrap();
         let h_ffn = apply_norm(
             weights,
             &h_post_attn,

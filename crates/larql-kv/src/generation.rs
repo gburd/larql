@@ -316,7 +316,7 @@ where
         Err(_) => return Vec::new(),
     };
 
-    let first = match argmax_next_token(weights, tokenizer, &last_hidden) {
+    let first = match argmax_next_token_resident(weights, tokenizer, index, &last_hidden) {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -334,7 +334,7 @@ where
             Ok(h) => h,
             Err(_) => break,
         };
-        let (id, tok_str) = match argmax_next_token(weights, tokenizer, &h_step) {
+        let (id, tok_str) = match argmax_next_token_resident(weights, tokenizer, index, &h_step) {
             Some(t) => t,
             None => break,
         };
@@ -450,7 +450,7 @@ where
 /// state to get logits.
 #[allow(clippy::too_many_arguments)]
 pub fn kv_prefill_run(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     window: Option<usize>,
@@ -466,25 +466,25 @@ pub fn kv_prefill_run(
         None => KvCache::with_layers(num_layers),
     };
 
-    let mut h = embed_tokens_pub(weights, prompt_ids);
+    let mut h = embed_tokens_pub(&weights, prompt_ids);
     // Per-Layer Embedding inputs for Gemma-4 archs. Returns empty Vec
     // for non-PLE archs (`ple_inputs.get(layer)` then yields `None` and
     // `apply_per_layer_embedding` is a no-op).
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, prompt_ids);
+    let ple_inputs = precompute_per_layer_inputs(&weights, &h, prompt_ids);
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h);
 
         let (mut h_post_attn, k_rope, v) =
-            run_attention_with_kv_backend(weights, &h, layer, backend)?;
+            run_attention_with_kv_backend(weights, &h, layer, backend, None)?;
         cache.layers[layer] = Some((k_rope, v));
         cache.clip_layer(layer);
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
-        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_post_ffn, _) = run_ffn(&weights, &h_post_attn, layer, ffn, false);
         let mut h_out =
-            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
-        apply_layer_scalar(weights, &mut h_out, layer);
+            apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(&weights, &mut h_out, layer);
 
         hook.on_post_layer(layer, &mut h_out);
         h = h_out;
@@ -526,7 +526,7 @@ pub fn kv_decode_step_run(
 
         let kv_entry = cache.layers[layer].as_ref();
         let (mut h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-            weights,
+            larql_inference::WeightsView::dense(weights),
             &h_step,
             layer,
             kv_entry,
@@ -567,11 +567,17 @@ fn generate_cached_hooked_inner(
     }
 
     // ── Phase 1: prefill ──
-    let (last_hidden, mut cache) =
-        match kv_prefill_run(weights, ffn, prompt_ids, window, backend, hook) {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
+    let (last_hidden, mut cache) = match kv_prefill_run(
+        larql_inference::WeightsView::dense(weights),
+        ffn,
+        prompt_ids,
+        window,
+        backend,
+        hook,
+    ) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
 
     let first = match argmax_next_token(weights, tokenizer, &last_hidden) {
         Some(t) => t,
@@ -632,6 +638,49 @@ fn argmax_next_token(
     Some((id, decoded))
 }
 
+/// `LARQL_Q4K_LM_HEAD=1` routes the resident-path lm_head matvec through
+/// the vindex's Q4_K lm_head view (synthesised from f16 embeddings at load
+/// for tied-embedding models) instead of the f32 row-parallel sgemv. On a
+/// 262K-vocab head this drops lm_head bandwidth ~4× (e.g. 2.95 GB → 0.42 GB
+/// per step on Gemma 4 26B-A4B). **Default on** (`LARQL_Q4K_LM_HEAD=0` opts
+/// out); falls back to the f32 path when no Q4_K head view exists.
+fn q4k_lm_head_enabled() -> bool {
+    larql_compute::options::q4k_lm_head_enabled()
+}
+
+/// Resident-path argmax: like [`argmax_next_token`] but with the vindex at
+/// hand, so the lm_head matvec can run Q4_K-direct under
+/// `LARQL_Q4K_LM_HEAD=1`. Falls back to the f32 path when the flag is off
+/// or the vindex has no Q4_K lm_head view (untied model without
+/// `lm_head_q4.bin`).
+fn argmax_next_token_resident(
+    weights: &ModelWeights,
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+    index: &larql_inference::larql_vindex::VectorIndex,
+    h_single: &Array2<f32>,
+) -> Option<(u32, String)> {
+    if q4k_lm_head_enabled() && index.vocab_size > 0 {
+        if let Some(q4_bytes) = index.storage.lm_head_kquant_view() {
+            let _t_lmhead = std::time::Instant::now();
+            // Argmax-only fast path: skips the full-vocab softmax + top-k
+            // temporaries (scaling/softcap/temperature are monotone, so the
+            // selected token is identical to the softmax route).
+            let result = larql_inference::forward::predict::q4_lm_head_argmax(
+                weights,
+                h_single,
+                q4_bytes.as_ref(),
+                index.vocab_size,
+                tokenizer,
+            );
+            larql_inference::decode_stages::record_lmhead(_t_lmhead.elapsed().as_nanos());
+            if let Some((id, decoded)) = result {
+                return Some((id, decoded));
+            }
+        }
+    }
+    argmax_next_token(weights, tokenizer, h_single)
+}
+
 fn is_stop_token_str(s: &str) -> bool {
     matches!(
         s,
@@ -679,8 +728,13 @@ where
 
     let mut h = embed_tokens_pub(weights, prompt_ids);
     for layer in 0..num_layers {
-        let (h_post_attn, k_rope, v) = match run_attention_with_kv_backend(weights, &h, layer, None)
-        {
+        let (h_post_attn, k_rope, v) = match run_attention_with_kv_backend(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            layer,
+            None,
+            None,
+        ) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -712,7 +766,7 @@ where
         for layer in 0..num_layers {
             let kv_entry = cache.layers[layer].as_ref();
             let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
-                weights,
+                larql_inference::WeightsView::dense(weights),
                 &h_step,
                 layer,
                 kv_entry,
@@ -829,12 +883,19 @@ mod tests {
                     details: "test stub: fail_prefill set".into(),
                 });
             }
-            let (hidden, cache) =
-                kv_prefill_run(weights, ffn, token_ids, None, None, &mut NoopHook).ok_or_else(
-                    || larql_inference::kv_engine::EngineError::BackendFailure {
-                        details: "kv_prefill_run returned None".into(),
-                    },
-                )?;
+            let (hidden, cache) = kv_prefill_run(
+                larql_inference::WeightsView::dense(weights),
+                ffn,
+                token_ids,
+                None,
+                None,
+                &mut NoopHook,
+            )
+            .ok_or_else(|| {
+                larql_inference::kv_engine::EngineError::BackendFailure {
+                    details: "kv_prefill_run returned None".into(),
+                }
+            })?;
             self.cache = Some(cache);
             Ok(hidden)
         }
@@ -884,10 +945,19 @@ mod tests {
                 });
             }
             let ids: Vec<u32> = (0..initial_hidden.nrows() as u32).collect();
-            let (hidden, cache) = kv_prefill_run(weights, ffn, &ids, None, None, &mut NoopHook)
-                .ok_or_else(|| larql_inference::kv_engine::EngineError::BackendFailure {
+            let (hidden, cache) = kv_prefill_run(
+                larql_inference::WeightsView::dense(weights),
+                ffn,
+                &ids,
+                None,
+                None,
+                &mut NoopHook,
+            )
+            .ok_or_else(|| {
+                larql_inference::kv_engine::EngineError::BackendFailure {
                     details: "kv_prefill_run returned None".into(),
-                })?;
+                }
+            })?;
             self.cache = Some(cache);
             Ok(hidden)
         }
@@ -1222,9 +1292,15 @@ mod tests {
         let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
         let ffn = WeightFfn { weights: &weights };
         let prompt = [0u32, 1, 2];
-        let (last_hidden, cache) =
-            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
-                .expect("PLE-arch prefill should not fail");
+        let (last_hidden, cache) = kv_prefill_run(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+            &mut NoopHook,
+        )
+        .expect("PLE-arch prefill should not fail");
         assert_eq!(last_hidden.shape(), &[1, weights.hidden_size]);
         assert!(
             last_hidden.iter().all(|v| v.is_finite()),
@@ -1244,9 +1320,15 @@ mod tests {
         let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
         let ffn = WeightFfn { weights: &weights };
         let prompt = [0u32, 1];
-        let (_h_prefill, mut cache) =
-            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
-                .expect("PLE-arch prefill should not fail");
+        let (_h_prefill, mut cache) = kv_prefill_run(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+            &mut NoopHook,
+        )
+        .expect("PLE-arch prefill should not fail");
 
         for step in 0..3 {
             let h_step = kv_decode_step_run(&weights, &ffn, &mut cache, 0u32, None, &mut NoopHook)

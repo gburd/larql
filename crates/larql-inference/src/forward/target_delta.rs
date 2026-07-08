@@ -354,7 +354,11 @@ pub fn optimise_target_delta(
     }
 
     // Baseline forward (no perturbation) for KL regulariser.
-    let baseline = crate::forward::predict::forward_raw_logits(weights, tokens, None);
+    let baseline = crate::forward::predict::forward_raw_logits(
+        larql_models::WeightsView::dense(weights),
+        tokens,
+        None,
+    );
     let base_probs = softmax_1d(&baseline.logits);
     let baseline_loss = {
         let (l, _) = cross_entropy_and_grad(baseline.logits.view(), target_id);
@@ -373,7 +377,7 @@ pub fn optimise_target_delta(
     let mut final_loss = f32::NAN;
     for step in 1..=opts.steps {
         let out = crate::forward::predict::forward_raw_logits(
-            weights,
+            larql_models::WeightsView::dense(weights),
             tokens,
             Some((install_layer, delta.view())),
         );

@@ -29,7 +29,7 @@
 //! Usage: `cargo run --release --example fr1_topk_fuzzy_router -- [VINDEX_DIR] [N]`
 //! Writes `bench/aim-validation/fr1_topk_router_gemma3-4b.json`.
 
-use larql_inference::vindex::insert_q4k_layer_tensors;
+use larql_inference::vindex::insert_q4k_layer_tensors_resident;
 use larql_inference::{capture_residuals, load_tokenizer};
 use larql_vindex::KnnStore;
 use std::collections::HashMap;
@@ -303,7 +303,7 @@ fn main() {
     let tok = load_tokenizer(&dir).expect("tokenizer");
     eprintln!("Dequantising {} layers to f32 ...", weights.num_layers);
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant");
     }
 
     // Capture residuals for all three phrasings at the layer sweep, one forward

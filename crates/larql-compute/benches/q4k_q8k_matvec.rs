@@ -34,7 +34,12 @@ use larql_compute::cpu::ops::q4k_q8k_dot::{
 // at their definitions); importing them unconditionally breaks the x86_64 build
 // (CI runs benches via `--all-targets`). Gate the import + their bench arms.
 #[cfg(target_arch = "aarch64")]
-use larql_compute::cpu::ops::q4k_q8k_dot::{q4k_q8k_matvec_asm, q4k_q8k_matvec_neon};
+use larql_compute::cpu::ops::q4_common::quantize_q6_k;
+#[cfg(target_arch = "aarch64")]
+use larql_compute::cpu::ops::q4k_q8k_dot::{
+    q4k_q8k_gate_up_asm, q4k_q8k_gate_up_neon, q4k_q8k_matvec_asm, q4k_q8k_matvec_neon,
+    q6k_q8k_matvec_asm, q6k_q8k_matvec_neon,
+};
 
 const BLOCK_BYTES: usize = 144;
 const ELEMS_PER_BLOCK: usize = 256;
@@ -133,7 +138,296 @@ fn bench_q4k_q8k(c: &mut Criterion) {
     }
 
     group.finish();
+
+    // Fused gate+up pair (C12): the kernel `kquant_ffn_forward_layer` and the
+    // remote expert server's q8k_wire path call. Same Gemma 3 4B gate/up
+    // shape; throughput counts BOTH weight streams (the fusion shares the
+    // activation loads, not the weight bytes).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let rows = 10240usize;
+        let cols = 2560usize;
+        let g_q4 = quantize_q4_k(&synth(rows * cols, 0.3));
+        let u_q4 = quantize_q4_k(&synth(rows * cols, 0.9));
+        let x = synth(cols, 1.1);
+        let q8: Q8KActivation = quantize_x_to_q8k(&x);
+        let mut g_out = vec![0.0f32; rows];
+        let mut u_out = vec![0.0f32; rows];
+
+        let mut group = c.benchmark_group("q4k_q8k_gate_up");
+        group.sample_size(60);
+        group.throughput(Throughput::Bytes(2 * weight_bytes(rows, cols)));
+        group.bench_with_input(BenchmarkId::new("neon", "ffn_gate_up"), &(), |b, _| {
+            b.iter(|| {
+                q4k_q8k_gate_up_neon(&mut g_out, &mut u_out, &q8, &g_q4, &u_q4, rows, cols);
+                std::hint::black_box(g_out[0] + u_out[0]);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("asm", "ffn_gate_up"), &(), |b, _| {
+            b.iter(|| {
+                q4k_q8k_gate_up_asm(&mut g_out, &mut u_out, &q8, &g_q4, &u_q4, rows, cols);
+                std::hint::black_box(g_out[0] + u_out[0]);
+            });
+        });
+        group.finish();
+    }
+
+    // Q6_K matvec (C12): the `down`-projection / attention-V format. Gemma 3
+    // 4B down shape; throughput on the 210-byte/256-elem Q6_K stream.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let rows = 2560usize;
+        let cols = 10240usize;
+        let w_q6 = quantize_q6_k(&synth(rows * cols, 0.3));
+        let x = synth(cols, 1.1);
+        let q8: Q8KActivation = quantize_x_to_q8k(&x);
+        let mut out = vec![0.0f32; rows];
+
+        let mut group = c.benchmark_group("q6k_q8k_matvec");
+        group.sample_size(60);
+        group.throughput(Throughput::Bytes(
+            (rows * (cols / ELEMS_PER_BLOCK) * 210) as u64,
+        ));
+        group.bench_with_input(BenchmarkId::new("neon", "ffn_down"), &(), |b, _| {
+            b.iter(|| {
+                q6k_q8k_matvec_neon(&mut out, &q8, &w_q6, rows, cols);
+                std::hint::black_box(out[0]);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("asm", "ffn_down"), &(), |b, _| {
+            b.iter(|| {
+                q6k_q8k_matvec_asm(&mut out, &q8, &w_q6, rows, cols);
+                std::hint::black_box(out[0]);
+            });
+        });
+        group.finish();
+    }
 }
 
+/// C12 decomposition: split the per-super-block cost of `q4k_q8k_matvec_asm`
+/// into (a) the `asm!` block itself and (b) the per-block Rust glue
+/// (`unpack_scales_mins` + the i32 scale array + the scalar `sum2` loop + 2×
+/// f16→f32 + the f32 epilogue). The full matvec measures (a)+(b) with
+/// whatever out-of-order overlap the core finds; comparing the three numbers
+/// says whether the glue is exposed (worth folding into the asm) or already
+/// hidden (only intra-asm instruction-count reduction can pay).
+#[cfg(target_arch = "aarch64")]
+fn bench_sb_decomposition(c: &mut Criterion) {
+    use larql_compute::cpu::ops::q4_common::f16_to_f32;
+    use larql_compute::cpu::ops::q4k_q8k_dot::{q4k_sb_sum1_asm, unpack_scales_mins};
+
+    // One row's worth of super-blocks, attn_proj-like width, repeated over a
+    // weight buffer big enough to defeat L1 but stay in the same cache regime
+    // as the full-matvec bench (~3.7 MB).
+    let cols = 2560usize;
+    let rows = 1024usize;
+    let n_sb_per_row = cols / ELEMS_PER_BLOCK;
+    let n_sb = rows * n_sb_per_row;
+    let w_q4 = quantize_q4_k(&synth(rows * cols, 0.3));
+    let x = synth(cols, 1.1);
+    let q8: Q8KActivation = quantize_x_to_q8k(&x);
+
+    // Pre-extracted per-SB inputs for the asm-only arm (the extraction IS
+    // the glue — it must not be timed inside this arm).
+    let sb_scales: Vec<[i32; 8]> = (0..n_sb)
+        .map(|i| {
+            let block = &w_q4[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+            let (sc, _mn) = unpack_scales_mins(&block[4..16]);
+            [
+                sc[0] as i32,
+                sc[1] as i32,
+                sc[2] as i32,
+                sc[3] as i32,
+                sc[4] as i32,
+                sc[5] as i32,
+                sc[6] as i32,
+                sc[7] as i32,
+            ]
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("q4k_sb_decomposition");
+    group.sample_size(60);
+    // Throughput in super-blocks so criterion reports per-SB time directly.
+    group.throughput(Throughput::Elements(n_sb as u64));
+
+    group.bench_function("asm_only", |b| {
+        b.iter(|| {
+            let mut acc = 0i64;
+            for i in 0..n_sb {
+                let sb_in_row = i % n_sb_per_row;
+                let quants = w_q4[i * BLOCK_BYTES + 16..].as_ptr();
+                let act = q8.qs[sb_in_row * ELEMS_PER_BLOCK..].as_ptr();
+                // SAFETY: same contracts as the production caller.
+                let s = unsafe { q4k_sb_sum1_asm(quants, act, sb_scales[i].as_ptr()) };
+                acc += s as i64;
+            }
+            std::hint::black_box(acc)
+        });
+    });
+
+    group.bench_function("glue_only", |b| {
+        b.iter(|| {
+            let mut acc = 0.0f32;
+            for i in 0..n_sb {
+                let sb_in_row = i % n_sb_per_row;
+                let block = &w_q4[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+                let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                let (scales, mins) = unpack_scales_mins(&block[4..16]);
+                let sc = [
+                    scales[0] as i32,
+                    scales[1] as i32,
+                    scales[2] as i32,
+                    scales[3] as i32,
+                    scales[4] as i32,
+                    scales[5] as i32,
+                    scales[6] as i32,
+                    scales[7] as i32,
+                ];
+                std::hint::black_box(sc.as_ptr());
+                let q8_sums = &q8.sums[sb_in_row * 8..sb_in_row * 8 + 8];
+                let d_y = q8.d[sb_in_row];
+                let mut sum2_acc: i32 = 0;
+                for s in 0..8 {
+                    sum2_acc += mins[s] as i32 * q8_sums[s] as i32;
+                }
+                // Fake sum1 stands in for the asm result; the epilogue math is
+                // the real per-SB f32 work.
+                let sum1 = i as i32;
+                acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2_acc as f32;
+            }
+            std::hint::black_box(acc)
+        });
+    });
+
+    group.bench_function("full_matvec", |b| {
+        let mut out = vec![0.0f32; rows];
+        b.iter(|| {
+            q4k_q8k_matvec_asm(&mut out, &q8, &w_q4, rows, cols);
+            std::hint::black_box(out[0]);
+        });
+    });
+
+    group.bench_function("full_matvec_v2", |b| {
+        use larql_compute::cpu::ops::q4k_q8k_dot::q4k_q8k_matvec_asm_v2;
+        let mut out = vec![0.0f32; rows];
+        b.iter(|| {
+            q4k_q8k_matvec_asm_v2(&mut out, &q8, &w_q4, rows, cols);
+            std::hint::black_box(out[0]);
+        });
+    });
+
+    group.bench_function("full_matvec_v3", |b| {
+        use larql_compute::cpu::ops::q4k_q8k_dot::q4k_q8k_matvec_asm_v3;
+        let mut out = vec![0.0f32; rows];
+        b.iter(|| {
+            q4k_q8k_matvec_asm_v3(&mut out, &q8, &w_q4, rows, cols);
+            std::hint::black_box(out[0]);
+        });
+    });
+
+    group.finish();
+}
+
+/// Effective-bandwidth shape sweep (C12, post-roofline-crossover): the SAME
+/// rayon-chunked matvec the production decode path runs (par_chunks_mut(32)
+/// over rows → single-thread asm kernel per chunk), measured at the real
+/// per-layer shapes. If GB/s climbs steeply with matrix size, the per-call
+/// fork-join tax on small per-layer matvecs is where DRAM goes idle — the
+/// 26B decode issues ~180 of these sections per token.
+#[cfg(target_arch = "aarch64")]
+fn bench_mt_shapes(c: &mut Criterion) {
+    use larql_compute::cpu::ops::q4k_q8k_dot::q4k_q8k_matvec_asm_v3;
+    use rayon::prelude::*;
+
+    // (label, rows, cols) — production 26B shapes plus a big amortised
+    // reference. K/V 2048×2816 (3.2 MB), Q 4096×2816, O 2816×4096,
+    // dense gate/up 2112×2816, lm_head-class 65536×2816 (~104 MB).
+    let cases: &[(&str, usize, usize)] = &[
+        ("kv_proj_2048x2816", 2048, 2816),
+        ("q_proj_4096x2816", 4096, 2816),
+        ("o_proj_2816x4096", 2816, 4096),
+        ("dense_gu_2112x2816", 2112, 2816),
+        ("big_65536x2816", 65536, 2816),
+    ];
+
+    let mut group = c.benchmark_group("q8k_mt_shapes");
+    group.sample_size(30);
+
+    for &(label, rows, cols) in cases {
+        let w_q4 = quantize_q4_k(&synth(rows * cols, 0.3));
+        let x = synth(cols, 1.1);
+        let q8: Q8KActivation = quantize_x_to_q8k(&x);
+        let bytes_per_row = (cols / ELEMS_PER_BLOCK) * BLOCK_BYTES;
+        let mut out = vec![0.0f32; rows];
+
+        group.throughput(Throughput::Bytes((rows * bytes_per_row) as u64));
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                // Mirror q8k_direct_proj / matvec_q4k_or_q6k_q8k exactly:
+                // 32-row chunks, one single-thread kernel call per chunk.
+                out.par_chunks_mut(32).enumerate().for_each(|(ci, chunk)| {
+                    let row_start = ci * 32;
+                    let n = chunk.len().min(rows.saturating_sub(row_start));
+                    if n == 0 {
+                        return;
+                    }
+                    let w = &w_q4[row_start * bytes_per_row..(row_start + n) * bytes_per_row];
+                    q4k_q8k_matvec_asm_v3(&mut chunk[..n], &q8, w, n, cols);
+                });
+                std::hint::black_box(out[0]);
+            });
+        });
+    }
+
+    // Expert-granularity arm: 8 parallel tasks (top-8 experts), each a
+    // SEQUENTIAL gate+up+down for one expert (single-thread kernels) — the
+    // production cpu_moe_forward shape. 8 tasks on 8 threads = any straggler
+    // idles a core; compare GB/s against the row-chunked arms above.
+    {
+        let inter = 704usize;
+        let hidden = 2816usize;
+        let n_experts = 8usize;
+        let gu_rows = 2 * inter; // gate+up stacked
+        let per_expert_gu = quantize_q4_k(&synth(gu_rows * hidden, 0.3));
+        let per_expert_dn = quantize_q4_k(&synth(hidden * 768, 0.7)); // 704→768 padded
+        let x = synth(hidden, 1.1);
+        let q8: Q8KActivation = quantize_x_to_q8k(&x);
+        let act = synth(768, 0.5);
+        let q8_act: Q8KActivation = quantize_x_to_q8k(&act);
+        let total_bytes = n_experts
+            * (gu_rows * (hidden / ELEMS_PER_BLOCK) * BLOCK_BYTES
+                + hidden * (768 / ELEMS_PER_BLOCK) * BLOCK_BYTES);
+
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+        group.bench_function("experts_8x_gate_up_down", |b| {
+            b.iter(|| {
+                let acc: f32 = (0..n_experts)
+                    .into_par_iter()
+                    .map(|_| {
+                        let mut gu_out = vec![0.0f32; gu_rows];
+                        let mut dn_out = vec![0.0f32; hidden];
+                        q4k_q8k_matvec_asm_v3(&mut gu_out, &q8, &per_expert_gu, gu_rows, hidden);
+                        q4k_q8k_matvec_asm_v3(&mut dn_out, &q8_act, &per_expert_dn, hidden, 768);
+                        gu_out[0] + dn_out[0]
+                    })
+                    .sum();
+                std::hint::black_box(acc)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(target_arch = "aarch64")]
+criterion_group!(
+    benches,
+    bench_q4k_q8k,
+    bench_sb_decomposition,
+    bench_mt_shapes
+);
+#[cfg(not(target_arch = "aarch64"))]
 criterion_group!(benches, bench_q4k_q8k);
 criterion_main!(benches);

@@ -270,7 +270,7 @@ pub(super) fn run_oracle_roundtrip(
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
 
         let baseline_hidden =
-            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
 
@@ -414,7 +414,7 @@ pub(super) fn run_oracle_lowrank(
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
 
         let baseline_hidden =
-            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);

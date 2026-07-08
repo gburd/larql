@@ -432,7 +432,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         // mantissa region.
         let lz = (mant as u16).leading_zeros() - 6; // 0..=9
         let new_mant = (mant << (lz + 14)) & 0x7F_FFFF;
-        let new_exp = (127u32 - 14 - lz) << 23;
+        // Leading one sits at mantissa bit (9 - lz), so the value is
+        // 1.f × 2^(9 - lz - 24) = 1.f × 2^(-15 - lz) → biased exponent
+        // 127 - 15 - lz. (Was `127 - 14 - lz`, which decoded every f16
+        // subnormal 2× too large — and the exhaustive test never caught
+        // it because a test-local `f16_to_f32` shadowed this one.)
+        let new_exp = (127u32 - 15 - lz) << 23;
         return f32::from_bits(sign | new_exp | new_mant);
     }
     if exp == 31 {
@@ -578,34 +583,30 @@ pub fn q4k_matvec_into(out: &mut [f32], x: &[f32], w: &[u8], rows: usize, cols: 
     // for Q4_K) is large enough to amortise rayon's join overhead by
     // 100×+. Empirically on M3 Max this drops a 2560-row decode from
     // ~70ms → ~10ms (≈ 7× across 11 perf cores).
-    use rayon::prelude::*;
     let sum_x_ref = &sum_x[..];
     let w_ref = w;
     let x_ref = x;
     // par_chunks_mut(CHUNK_ROWS) instead of per-row par_iter_mut: each
-    // rayon task processes a contiguous block of rows sequentially.
-    // Cuts the number of work-stealing units from `rows` (10K+) down
-    // to ~rows/CHUNK_ROWS, reducing scheduler overhead while keeping
-    // enough granularity for the 11 perf cores on M3 Max to load-
-    // balance.
+    // task processes a contiguous block of rows sequentially. Cuts the
+    // number of work-stealing units from `rows` (10K+) down to
+    // ~rows/CHUNK_ROWS, reducing scheduler overhead while keeping enough
+    // granularity for the 11 perf cores on M3 Max to load-balance.
     const CHUNK_ROWS: usize = 32;
-    out.par_chunks_mut(CHUNK_ROWS)
-        .enumerate()
-        .for_each(|(chunk_idx, chunk_slots)| {
-            let row_base_chunk = chunk_idx * CHUNK_ROWS;
-            for (local_r, out_slot) in chunk_slots.iter_mut().enumerate() {
-                let r = row_base_chunk + local_r;
-                if r >= rows {
-                    break;
-                }
-                let row_base = r * row_bytes;
-                let mut acc = 0.0f32;
-                for sb in 0..n_blocks {
-                    acc += process_q4k_superblock(w_ref, x_ref, sum_x_ref, row_base, sb);
-                }
-                *out_slot = acc;
+    crate::cpu::spin_pool::par_chunks_mut(out, CHUNK_ROWS, |chunk_idx, chunk_slots| {
+        let row_base_chunk = chunk_idx * CHUNK_ROWS;
+        for (local_r, out_slot) in chunk_slots.iter_mut().enumerate() {
+            let r = row_base_chunk + local_r;
+            if r >= rows {
+                break;
             }
-        });
+            let row_base = r * row_bytes;
+            let mut acc = 0.0f32;
+            for sb in 0..n_blocks {
+                acc += process_q4k_superblock(w_ref, x_ref, sum_x_ref, row_base, sb);
+            }
+            *out_slot = acc;
+        }
+    });
 }
 
 /// Per-super-block dot contribution for a Q4_K row. Returned scalar
@@ -655,6 +656,282 @@ fn process_q4k_superblock(w: &[u8], x: &[f32], sum_x: &[f32], row_base: usize, s
         acc += sc_hi * dot_hi - mn_hi * sumy_hi;
     }
     acc
+}
+
+/// Decode one Q4_K super-block (256 elements, 144 bytes) of row `row_base`
+/// into `wf` as full f32 weight values. Per element the dequant is
+/// `d * scale[sb] * q - dmin * min[sb]` — identical arithmetic to
+/// [`process_q4k_superblock`], but materialised per element so the decoded
+/// weights can be reused across many activation columns instead of folded
+/// into a single dot. Nibble packing mirrors the matvec: each of the 4
+/// 32-byte groups holds sub-block `2g` in the low nibble and `2g+1` in the
+/// high nibble.
+#[inline(always)]
+fn decode_q4k_superblock_into(w: &[u8], row_base: usize, sb: usize, wf: &mut [f32; 256]) {
+    const BLOCK_BYTES: usize = 144;
+    let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let p = &block[4..16];
+    let mut scales = [0u8; 8];
+    let mut mins = [0u8; 8];
+    for j in 0..4 {
+        scales[j] = p[j] & 0x3F;
+        mins[j] = p[j + 4] & 0x3F;
+        scales[j + 4] = (p[j + 8] & 0x0F) | ((p[j] >> 6) << 4);
+        mins[j + 4] = (p[j + 8] >> 4) | ((p[j + 4] >> 6) << 4);
+    }
+    let quants = &block[16..144];
+    for g in 0..4 {
+        let sb_lo = 2 * g;
+        let sb_hi = 2 * g + 1;
+        let sc_lo = d * scales[sb_lo] as f32;
+        let sc_hi = d * scales[sb_hi] as f32;
+        let mn_lo = dmin * mins[sb_lo] as f32;
+        let mn_hi = dmin * mins[sb_hi] as f32;
+        let chunk = &quants[g * 32..(g + 1) * 32];
+        for i in 0..32 {
+            wf[sb_lo * 32 + i] = sc_lo * (chunk[i] & 0x0F) as f32 - mn_lo;
+            wf[sb_hi * 32 + i] = sc_hi * (chunk[i] >> 4) as f32 - mn_hi;
+        }
+    }
+}
+
+/// Decode one Q6_K super-block (256 elements, 210 bytes) of row `row_base` into
+/// `wf` as full f32 weight values — mirrors [`larql_models::quant::ggml`]'s
+/// `dequantize_q6_k` per-block math: a 4-bit low nibble (`ql`) plus a 2-bit high
+/// part (`qh`), biased by −32, times the per-16-element int8 scale and the f16
+/// super-block scale.
+#[inline(always)]
+fn decode_q6k_superblock_into(w: &[u8], row_base: usize, sb: usize, wf: &mut [f32; 256]) {
+    const BLOCK_BYTES: usize = 210;
+    let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    for (j, &sc_byte) in scales.iter().enumerate() {
+        let sc = d * (sc_byte as i8) as f32;
+        for i in 0..16 {
+            let idx = j * 16 + i;
+            let lo4 = if idx % 2 == 0 {
+                ql[idx / 2] & 0x0F
+            } else {
+                (ql[idx / 2] >> 4) & 0x0F
+            };
+            let hi2 = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x03;
+            let val = ((lo4 as i32) | ((hi2 as i32) << 4)) - 32;
+            wf[idx] = sc * val as f32;
+        }
+    }
+}
+
+/// Dot of a decoded 256-element f32 weight block against a 256-element f32
+/// activation slice — the inner of the amortised k-quant matmul. Dispatches to
+/// NEON on aarch64; portable multi-accumulator fallback elsewhere.
+#[inline]
+fn dot_256_f32(wf: &[f32; 256], xs: &[f32]) -> f32 {
+    debug_assert!(xs.len() >= 256);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is in the aarch64 base ISA; `wf` is 256 f32 and `xs` has
+        // ≥256 contiguous f32 (the caller slices exactly one super-block).
+        unsafe { dot_256_f32_neon(wf, xs) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_256_f32_scalar(wf, xs)
+    }
+}
+
+/// Portable reference: 8 independent accumulators so the reduction isn't a
+/// scalar fp-add chain (Rust f32 add isn't associative). Also the parity oracle
+/// for the NEON path. On aarch64 it's reached only from tests (the NEON path
+/// serves the lib), so allow it to be otherwise-unused there.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline]
+fn dot_256_f32_scalar(wf: &[f32; 256], xs: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for c in 0..256 / 8 {
+        for l in 0..8 {
+            acc[l] += wf[c * 8 + l] * xs[c * 8 + l];
+        }
+    }
+    acc.iter().sum::<f32>()
+}
+
+/// NEON: 8 `float32x4` accumulators (32 elems/iter × 8 iters = 256). Eight
+/// independent accumulators keep the FMA units busy across M-series' ~4-cycle
+/// FMA latency (one accumulator would serialise at ~25% of peak).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_256_f32_neon(wf: &[f32; 256], xs: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let wp = wf.as_ptr();
+    let xp = xs.as_ptr();
+    let mut a0 = vdupq_n_f32(0.0);
+    let mut a1 = vdupq_n_f32(0.0);
+    let mut a2 = vdupq_n_f32(0.0);
+    let mut a3 = vdupq_n_f32(0.0);
+    let mut a4 = vdupq_n_f32(0.0);
+    let mut a5 = vdupq_n_f32(0.0);
+    let mut a6 = vdupq_n_f32(0.0);
+    let mut a7 = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+    while i < 256 {
+        a0 = vfmaq_f32(a0, vld1q_f32(wp.add(i)), vld1q_f32(xp.add(i)));
+        a1 = vfmaq_f32(a1, vld1q_f32(wp.add(i + 4)), vld1q_f32(xp.add(i + 4)));
+        a2 = vfmaq_f32(a2, vld1q_f32(wp.add(i + 8)), vld1q_f32(xp.add(i + 8)));
+        a3 = vfmaq_f32(a3, vld1q_f32(wp.add(i + 12)), vld1q_f32(xp.add(i + 12)));
+        a4 = vfmaq_f32(a4, vld1q_f32(wp.add(i + 16)), vld1q_f32(xp.add(i + 16)));
+        a5 = vfmaq_f32(a5, vld1q_f32(wp.add(i + 20)), vld1q_f32(xp.add(i + 20)));
+        a6 = vfmaq_f32(a6, vld1q_f32(wp.add(i + 24)), vld1q_f32(xp.add(i + 24)));
+        a7 = vfmaq_f32(a7, vld1q_f32(wp.add(i + 28)), vld1q_f32(xp.add(i + 28)));
+        i += 32;
+    }
+    let s = vaddq_f32(
+        vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)),
+        vaddq_f32(vaddq_f32(a4, a5), vaddq_f32(a6, a7)),
+    );
+    vaddvq_f32(s)
+}
+
+/// Amortised Q4_K × f32 matmul: `out[s, r] = sum_k W[r, k] * X[s, k]`.
+///
+/// `w` is `[rows, hidden]` Q4_K (144-byte super-blocks), `x` is
+/// `[seq, hidden]` f32 row-major, `out` is `[seq, rows]` f32 row-major.
+///
+/// The win over the alternatives prefill could use:
+/// * vs `seq ×` [`q4k_matvec_into`]: each weight super-block is decoded to
+///   f32 **once** and reused across all `seq` columns, so the Q4_K bytes
+///   are read once instead of `seq` times (the per-position matvec loop
+///   re-reads every weight `seq` times — ~50× slower than f32 sgemm at
+///   long context).
+/// * vs dequant-whole-layer + BLAS sgemm: never materialises the full f32
+///   weight matrix (4× the bytes of Q4_K), so it skips the per-layer
+///   dequant that dominates short-prompt prefill.
+///
+/// Shape errors (zero dims, `hidden` not a multiple of 256, short `w`)
+/// zero the output rather than panic, mirroring [`q4k_matvec_into`].
+pub fn q4k_matmul_into(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[u8],
+    rows: usize,
+    hidden: usize,
+    seq: usize,
+) {
+    kquant_matmul_into(
+        out,
+        x,
+        w,
+        rows,
+        hidden,
+        seq,
+        144,
+        decode_q4k_superblock_into,
+    );
+}
+
+/// Amortised Q6_K × f32 matmul — the Q6_K twin of [`q4k_matmul_into`], used for
+/// the `down_proj` (Q6_K is the default down format in a q4k vindex). Same
+/// `[seq, rows]` output contract; reads the Q6_K weight once instead of
+/// dequantising the whole matrix to f32 first.
+pub fn q6k_matmul_into(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[u8],
+    rows: usize,
+    hidden: usize,
+    seq: usize,
+) {
+    kquant_matmul_into(
+        out,
+        x,
+        w,
+        rows,
+        hidden,
+        seq,
+        210,
+        decode_q6k_superblock_into,
+    );
+}
+
+/// Shared amortised k-quant matmul: `out[s, r] = sum_k W[r, k] * X[s, k]`,
+/// `out` is `[seq, rows]` row-major. Each weight super-block is decoded to f32
+/// **once** via `decode` and FMA'd across all `seq` columns, so the quantised
+/// weight is read once (not `seq×`) and never fully materialised as f32. q4k
+/// and q6k differ only in `block_bytes` and the per-block `decode`.
+///
+/// Shape errors (zero dims, `hidden` not a 256-multiple, short `w`) zero the
+/// output (defensive, mirroring `q4k_matvec_into`); callers keep the dims valid
+/// (the `use_q4k_ffn` gate, the down padding).
+#[allow(clippy::too_many_arguments)]
+fn kquant_matmul_into(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[u8],
+    rows: usize,
+    hidden: usize,
+    seq: usize,
+    block_bytes: usize,
+    decode: impl Fn(&[u8], usize, usize, &mut [f32; 256]) + Sync,
+) {
+    debug_assert_eq!(out.len(), seq * rows);
+    debug_assert_eq!(x.len(), seq * hidden);
+    const ELEMS_PER_BLOCK: usize = 256;
+    // Shape errors zero the output (defensive, mirrors `q4k_matvec_into` — see
+    // `q4k_matmul_rejects_non_multiple_of_256`); callers keep the dims valid.
+    if rows == 0 || seq == 0 || hidden == 0 || !hidden.is_multiple_of(ELEMS_PER_BLOCK) {
+        out.iter_mut().for_each(|v| *v = 0.0);
+        return;
+    }
+    let n_blocks = hidden / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * block_bytes;
+    if w.len() < rows * row_bytes {
+        out.iter_mut().for_each(|v| *v = 0.0);
+        return;
+    }
+
+    // Accumulate into a row-major scratch `[rows, seq]` (each row's `seq`
+    // outputs contiguous) so the hot loop is row-parallel and write-local;
+    // transpose to the `[seq, rows]` contract afterwards. The transpose
+    // touches `rows * seq` f32 once — cheap next to the matmul, and it
+    // never re-reads the weights.
+    let mut tmp = vec![0.0f32; rows * seq];
+    const CHUNK_ROWS: usize = 32;
+    let x_ref = x;
+    let w_ref = w;
+    let decode_ref = &decode;
+    crate::cpu::spin_pool::par_chunks_mut(&mut tmp, CHUNK_ROWS * seq, |chunk_idx, chunk_slots| {
+        let row_base_chunk = chunk_idx * CHUNK_ROWS;
+        let mut wf = [0.0f32; ELEMS_PER_BLOCK];
+        for local_r in 0..CHUNK_ROWS {
+            let r = row_base_chunk + local_r;
+            if r >= rows {
+                break;
+            }
+            let out_row = &mut chunk_slots[local_r * seq..local_r * seq + seq];
+            let row_base = r * row_bytes;
+            for sb in 0..n_blocks {
+                decode_ref(w_ref, row_base, sb, &mut wf);
+                let x_off = sb * ELEMS_PER_BLOCK;
+                for (s, slot) in out_row.iter_mut().enumerate() {
+                    let xs = &x_ref[s * hidden + x_off..s * hidden + x_off + ELEMS_PER_BLOCK];
+                    // `wf` was decoded once above; dot it against this column.
+                    // NEON (8 f32x4 accumulators to hide FMA latency) on
+                    // aarch64, portable multi-accumulator fallback elsewhere.
+                    *slot += dot_256_f32(&wf, xs);
+                }
+            }
+        }
+    });
+
+    for r in 0..rows {
+        for s in 0..seq {
+            out[s * rows + r] = tmp[r * seq + s];
+        }
+    }
 }
 
 /// Fused two-weight Q4_K matvec sharing one input vector.
@@ -735,20 +1012,18 @@ pub fn q4k_dual_matvec_into(
     // each worker computes both outputs for its assigned row index.
     // Zip `out_a` and `out_b` so rayon stays simple and the two
     // writes hit different cache lines per row.
-    use rayon::prelude::*;
     let sum_x_ref = &sum_x[..];
     let w_a_ref = w_a;
     let w_b_ref = w_b;
     let x_ref = x;
-    // par_chunks_mut(CHUNK_ROWS) — same rationale as
-    // `q4k_matvec_into`. Fewer-but-larger work units reduce rayon
-    // work-stealing overhead.
+    // Fewer-but-larger work units (CHUNK_ROWS rows each) reduce
+    // work-stealing overhead; same rationale as `q4k_matvec_into`.
     const CHUNK_ROWS: usize = 32;
-    out_a
-        .par_chunks_mut(CHUNK_ROWS)
-        .zip(out_b.par_chunks_mut(CHUNK_ROWS))
-        .enumerate()
-        .for_each(|(chunk_idx, (chunk_a, chunk_b))| {
+    crate::cpu::spin_pool::par_chunks_mut2(
+        out_a,
+        out_b,
+        CHUNK_ROWS,
+        |chunk_idx, chunk_a, chunk_b| {
             let row_base_chunk = chunk_idx * CHUNK_ROWS;
             for (local_r, (out_a_slot, out_b_slot)) in
                 chunk_a.iter_mut().zip(chunk_b.iter_mut()).enumerate()
@@ -824,7 +1099,8 @@ pub fn q4k_dual_matvec_into(
                 *out_a_slot = acc_a;
                 *out_b_slot = acc_b;
             }
-        });
+        },
+    );
 }
 
 /// 32-element dual nibble dot product: returns
@@ -1168,6 +1444,197 @@ mod tests {
         assert_eq!(diffs, 0, "{diffs} f16 inputs decode to different f32 bits");
     }
 
+    // ── f16 subnormal regression battery (2026-06-12). The subnormal
+    // branch decoded 2× too large while the exhaustive test silently
+    // verified a test-local `f16_to_f32` that shadowed the production fn.
+    // Assertions below call through `super::` so a future shadow cannot
+    // re-mask the production path. ──
+
+    #[test]
+    fn f16_to_f32_subnormal_pinned_values() {
+        // IEEE 754 half subnormals: value = mant × 2^-24 exactly.
+        assert_eq!(
+            super::f16_to_f32(0x0001),
+            2f32.powi(-24),
+            "smallest subnormal"
+        );
+        assert_eq!(
+            super::f16_to_f32(0x03fe),
+            1022.0 * 2f32.powi(-24),
+            "the field case — the gemma3-4b L32 K-scale that exposed the 2× bug"
+        );
+        assert_eq!(
+            super::f16_to_f32(0x03ff),
+            1023.0 * 2f32.powi(-24),
+            "largest subnormal"
+        );
+        assert_eq!(super::f16_to_f32(0x0400), 2f32.powi(-14), "smallest normal");
+        assert_eq!(
+            super::f16_to_f32(0x8001),
+            -(2f32.powi(-24)),
+            "negative subnormal"
+        );
+    }
+
+    #[test]
+    fn f16_to_f32_strictly_monotonic_across_subnormal_boundary() {
+        // The 2× bug made f16(0x03ff) ≈ 1.22e-4 > f16(0x0400) = 6.1e-5 — a
+        // monotonicity violation at the subnormal/normal seam. Walk the
+        // positive seam region and require strict increase.
+        let mut prev = super::f16_to_f32(0x0000);
+        for bits in 0x0001u16..=0x0410 {
+            let v = super::f16_to_f32(bits);
+            assert!(
+                v > prev,
+                "f16 decode must be strictly increasing: bits={bits:#06x} gives {v:e}, prev {prev:e}"
+            );
+            prev = v;
+        }
+    }
+
+    /// Deterministic pseudo-random data at a chosen magnitude. Magnitude
+    /// ~4e-4 drives the per-super-block `d`/`dmin` f16 scales into the
+    /// subnormal range (< 2^-14), the regime the 2× bug corrupted.
+    fn seeded_data(n: usize, magnitude: f32, mut seed: u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * magnitude
+            })
+            .collect()
+    }
+
+    /// True if any Q4_K super-block in `bytes` carries a subnormal f16
+    /// `d` or `dmin` (exp bits zero, mantissa nonzero).
+    fn q4k_has_subnormal_scale(bytes: &[u8]) -> bool {
+        bytes.chunks_exact(144).any(|b| {
+            let d = u16::from_le_bytes([b[0], b[1]]);
+            let dmin = u16::from_le_bytes([b[2], b[3]]);
+            let sub = |v: u16| (v >> 10) & 0x1F == 0 && (v & 0x3FF) != 0;
+            sub(d) || sub(dmin)
+        })
+    }
+
+    /// Cross-crate seam test: same bytes, q4_common decoder vs the
+    /// larql-models decoder (which backs the vindex registry and the
+    /// staged/dequant path). These disagreed on every subnormal-scale
+    /// block until 2026-06-12 — same bytes, silently different weights.
+    #[test]
+    fn q4k_decode_matches_models_reference_incl_subnormal_scales() {
+        for (name, magnitude) in [("normal", 1.0f32), ("subnormal-scale", 4.0e-4)] {
+            let data = seeded_data(1024, magnitude, 0xA11C1);
+            let bytes = quantize_q4_k(&data);
+            if magnitude < 1e-3 {
+                assert!(
+                    q4k_has_subnormal_scale(&bytes),
+                    "fixture drift: {name} case no longer produces subnormal f16 scales"
+                );
+            }
+            let ours = dequantize_q4_k(&bytes, 1024);
+            let reference =
+                larql_models::quant::ggml::dequantize_q4_k(&bytes, 1024).expect("models decode");
+            for (i, (a, b)) in ours.iter().zip(reference.iter()).enumerate() {
+                let tol = 1e-5 * a.abs().max(b.abs()).max(1e-30);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{name}: decoders disagree at elem {i}: q4_common {a:e} vs models {b:e}"
+                );
+            }
+        }
+    }
+
+    /// Q6_K twin — its `d` is also an f16 scale, and the int8 Q6K matvec
+    /// reads it through the shared (previously buggy) `f16_to_f32`.
+    /// Reference decode comes from larql-models (independent f16 impl).
+    #[test]
+    fn q6k_int8_matvec_matches_models_reference_incl_tiny_scales() {
+        use crate::cpu::ops::q4k_q8k_dot::{
+            q6k_q8k_matvec_into, quantize_x_to_q8k_into, Q8KActivation,
+        };
+        let (rows, cols) = (2usize, 256usize);
+        for (name, magnitude) in [("normal", 1.0f32), ("tiny-scale", 4.0e-4)] {
+            let data = seeded_data(rows * cols, magnitude, 0xA11C2);
+            let bytes = quantize_q6_k(&data);
+            let x = seeded_data(cols, 1.0, 0xA11C5);
+            let reference = larql_models::quant::ggml::dequantize_q6_k(&bytes, rows * cols)
+                .expect("models decode");
+            let expected: Vec<f32> = (0..rows)
+                .map(|r| {
+                    reference[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+            let denom: f32 = expected.iter().map(|v| v.abs()).fold(1e-12, f32::max);
+            let mut x_q8k = Q8KActivation::with_capacity(cols);
+            quantize_x_to_q8k_into(&mut x_q8k, &x);
+            let mut out = vec![0.0f32; rows];
+            q6k_q8k_matvec_into(&mut out, &x_q8k, &bytes, rows, cols);
+            for (r, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() <= 2e-2 * denom,
+                    "{name}: Q6K int8 matvec row {r}: {got:e} vs models reference {want:e}"
+                );
+            }
+        }
+    }
+
+    /// Both Q4_K matvec kernels against the dequant·dot reference on the
+    /// same bytes, including subnormal-scale blocks. Pre-fix, affected
+    /// blocks contributed 2× — far outside either tolerance.
+    #[test]
+    fn q4k_matvecs_match_dequant_dot_incl_subnormal_scales() {
+        use crate::cpu::ops::q4k_q8k_dot::{
+            q4k_q8k_matvec_into, quantize_x_to_q8k_into, Q8KActivation,
+        };
+        let (rows, cols) = (4usize, 256usize);
+        for (name, magnitude) in [("normal", 1.0f32), ("subnormal-scale", 4.0e-4)] {
+            let data = seeded_data(rows * cols, magnitude, 0xA11C3);
+            let bytes = quantize_q4_k(&data);
+            if magnitude < 1e-3 {
+                assert!(q4k_has_subnormal_scale(&bytes), "fixture drift ({name})");
+            }
+            let x = seeded_data(cols, 1.0, 0xA11C4);
+            let deq = dequantize_q4_k(&bytes, rows * cols);
+            let expected: Vec<f32> = (0..rows)
+                .map(|r| {
+                    deq[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(w, v)| w * v)
+                        .sum()
+                })
+                .collect();
+            let denom: f32 = expected.iter().map(|v| v.abs()).fold(1e-12, f32::max);
+
+            // f32-activation kernel: decode-identical, tight tolerance.
+            let mut out_f32 = vec![0.0f32; rows];
+            q4k_matvec_into(&mut out_f32, &x, &bytes, rows, cols);
+            for (r, (got, want)) in out_f32.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() <= 1e-4 * denom,
+                    "{name}: f32-act matvec row {r}: {got:e} vs {want:e}"
+                );
+            }
+
+            // int8-activation kernel: Q8_K rounding allowed, 2× is not.
+            let mut x_q8k = Q8KActivation::with_capacity(cols);
+            quantize_x_to_q8k_into(&mut x_q8k, &x);
+            let mut out_i8 = vec![0.0f32; rows];
+            q4k_q8k_matvec_into(&mut out_i8, &x_q8k, &bytes, rows, cols);
+            for (r, (got, want)) in out_i8.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() <= 2e-2 * denom,
+                    "{name}: int8 matvec row {r}: {got:e} vs {want:e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn q8_quantize_round_trip() {
         let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
@@ -1332,6 +1799,200 @@ mod tests {
         assert!(max_diff < 5e-3, "multi-block diverged: max_diff={max_diff}");
     }
 
+    /// Amortised matmul must match dequantise→matmul for multiple rows AND
+    /// multiple sequence positions across several super-blocks. Exercises
+    /// the row-stride, the per-seq accumulation, and the [rows,seq] →
+    /// [seq,rows] transpose.
+    #[test]
+    fn q4k_matmul_matches_dequant_then_matmul() {
+        let rows = 5;
+        let hidden = 512; // 2 super-blocks per row
+        let seq = 4;
+        let n_elem = rows * hidden;
+        let weights: Vec<f32> = (0..n_elem)
+            .map(|i| (i as f32 * 0.0007).sin() * 0.9)
+            .collect();
+        let q4k = quantize_q4_k(&weights);
+        let dequant = dequantize_q4_k(&q4k, n_elem);
+
+        let x: Vec<f32> = (0..seq * hidden)
+            .map(|i| (i as f32 * 0.013).cos() * 0.5)
+            .collect();
+
+        // Reference: dequant → row-major matmul, out[s, r].
+        let mut reference = vec![0.0f32; seq * rows];
+        for s in 0..seq {
+            for r in 0..rows {
+                let mut acc = 0.0f32;
+                for k in 0..hidden {
+                    acc += dequant[r * hidden + k] * x[s * hidden + k];
+                }
+                reference[s * rows + r] = acc;
+            }
+        }
+
+        let mut got = vec![0.0f32; seq * rows];
+        q4k_matmul_into(&mut got, &x, &q4k, rows, hidden, seq);
+
+        let max_diff: f32 = reference
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff < 5e-3,
+            "q4k_matmul diverged from dequant→matmul: max_diff={max_diff}"
+        );
+    }
+
+    /// Each sequence row of the matmul must equal the single-vector
+    /// `q4k_matvec` for that activation. The two kernels share decode
+    /// arithmetic, so they must agree row-for-row — catches transpose /
+    /// offset bugs that a dequant reference could mask if both paths were
+    /// wrong the same way.
+    #[test]
+    fn q4k_matmul_rows_match_q4k_matvec() {
+        let rows = 6;
+        let hidden = 256;
+        let seq = 3;
+        let weights: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32 * 0.002) - 1.0) * 0.3)
+            .collect();
+        let q4k = quantize_q4_k(&weights);
+        let x: Vec<f32> = (0..seq * hidden)
+            .map(|i| (i as f32 * 0.017).sin())
+            .collect();
+
+        let mut mm = vec![0.0f32; seq * rows];
+        q4k_matmul_into(&mut mm, &x, &q4k, rows, hidden, seq);
+
+        for s in 0..seq {
+            let mut mv = vec![0.0f32; rows];
+            q4k_matvec_into(
+                &mut mv,
+                &x[s * hidden..(s + 1) * hidden],
+                &q4k,
+                rows,
+                hidden,
+            );
+            for r in 0..rows {
+                let diff = (mm[s * rows + r] - mv[r]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "matmul row s={s} r={r} != matvec: {} vs {}",
+                    mm[s * rows + r],
+                    mv[r]
+                );
+            }
+        }
+    }
+
+    /// Defensive shape guard: `hidden` not a multiple of 256 → zeroed
+    /// output (mirrors `q4k_matvec_into`).
+    #[test]
+    fn q4k_matmul_rejects_non_multiple_of_256() {
+        let mut out = vec![1.0f32; 2 * 3]; // seq=2, rows=3, pre-filled to detect zeroing
+        let x = vec![0.5f32; 2 * 100];
+        let w = vec![0u8; 3 * 144];
+        q4k_matmul_into(&mut out, &x, &w, 3, 100, 2);
+        assert_eq!(out, vec![0.0f32; 6]);
+    }
+
+    /// `dot_256_f32` (NEON on aarch64) must match the scalar reference and a
+    /// plain sequential dot.
+    #[test]
+    fn dot_256_f32_matches_reference() {
+        let wf: [f32; 256] = std::array::from_fn(|i| (i as f32 * 0.013).sin() * 0.5);
+        let xs: Vec<f32> = (0..256).map(|i| (i as f32 * 0.021).cos() * 0.7).collect();
+        let reference: f64 = (0..256).map(|i| (wf[i] * xs[i]) as f64).sum();
+        let got = dot_256_f32(&wf, &xs);
+        assert!(
+            (got as f64 - reference).abs() < 1e-3,
+            "dot_256_f32 diverged: {got} vs {reference}"
+        );
+        #[cfg(target_arch = "aarch64")]
+        {
+            let neon = unsafe { dot_256_f32_neon(&wf, &xs) };
+            let scalar = dot_256_f32_scalar(&wf, &xs);
+            assert!(
+                (neon - scalar).abs() < 1e-4,
+                "neon {neon} != scalar {scalar}"
+            );
+        }
+    }
+
+    /// Multi-chunk (rows > CHUNK_ROWS = 32, spans multiple parallel work
+    /// units) and seq = 1 — the two q4k_matmul paths the earlier tests missed.
+    #[test]
+    fn q4k_matmul_multi_chunk_and_seq1() {
+        for (rows, seq) in [(40usize, 3usize), (4, 1)] {
+            let hidden = 512;
+            let n_elem = rows * hidden;
+            let weights: Vec<f32> = (0..n_elem)
+                .map(|i| (i as f32 * 0.0005).sin() * 0.6)
+                .collect();
+            let q4k = quantize_q4_k(&weights);
+            let dequant = dequantize_q4_k(&q4k, n_elem);
+            let x: Vec<f32> = (0..seq * hidden)
+                .map(|i| (i as f32 * 0.011).cos() * 0.4)
+                .collect();
+            let mut reference = vec![0.0f32; seq * rows];
+            for s in 0..seq {
+                for r in 0..rows {
+                    let mut acc = 0.0f32;
+                    for k in 0..hidden {
+                        acc += dequant[r * hidden + k] * x[s * hidden + k];
+                    }
+                    reference[s * rows + r] = acc;
+                }
+            }
+            let mut got = vec![0.0f32; seq * rows];
+            q4k_matmul_into(&mut got, &x, &q4k, rows, hidden, seq);
+            let max: f32 = reference
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(max < 5e-3, "rows={rows} seq={seq} diverged: {max}");
+        }
+    }
+
+    /// Direct `q6k_matmul_into` kernel parity vs dequantise → matmul.
+    #[test]
+    fn q6k_matmul_matches_dequant_then_matmul() {
+        let rows = 5;
+        let hidden = 512;
+        let seq = 3;
+        let n_elem = rows * hidden;
+        let weights: Vec<f32> = (0..n_elem)
+            .map(|i| (i as f32 * 0.0007).sin() * 0.5)
+            .collect();
+        let q6k = quantize_q6_k(&weights);
+        let dq = crate::kquant_forward::dequant::dequantize_matrix(&q6k, "Q6_K", rows, hidden);
+        let dq = dq.as_slice().expect("contiguous");
+        let x: Vec<f32> = (0..seq * hidden)
+            .map(|i| (i as f32 * 0.009).cos() * 0.5)
+            .collect();
+        let mut reference = vec![0.0f32; seq * rows];
+        for s in 0..seq {
+            for r in 0..rows {
+                let mut acc = 0.0f32;
+                for k in 0..hidden {
+                    acc += dq[r * hidden + k] * x[s * hidden + k];
+                }
+                reference[s * rows + r] = acc;
+            }
+        }
+        let mut got = vec![0.0f32; seq * rows];
+        q6k_matmul_into(&mut got, &x, &q6k, rows, hidden, seq);
+        let max: f32 = reference
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(max < 5e-3, "q6k_matmul diverged: {max}");
+    }
+
     /// Defensive: caller passes a malformed `cols` (not multiple of 256).
     /// We zero the output rather than reading past the buffer, mirroring
     /// `dequantize_q4_k`'s `Vec::new()` shape-error contract.
@@ -1397,38 +2058,6 @@ mod tests {
             scores.iter().any(|&v| v.abs() > 0.01),
             "Q4 matvec should produce nonzero"
         );
-    }
-
-    /// Decode f16 bits to f32 (for test verification).
-    fn f16_to_f32(bits: u16) -> f32 {
-        let sign = ((bits >> 15) & 1) as u32;
-        let exp = ((bits >> 10) & 0x1F) as i32;
-        let mant = (bits & 0x3FF) as u32;
-        if exp == 0 {
-            if mant == 0 {
-                return if sign == 1 { -0.0 } else { 0.0 };
-            }
-            // Subnormal
-            let val = mant as f32 / 1024.0 * 2.0f32.powi(-14);
-            return if sign == 1 { -val } else { val };
-        }
-        if exp == 31 {
-            return if mant == 0 {
-                if sign == 1 {
-                    f32::NEG_INFINITY
-                } else {
-                    f32::INFINITY
-                }
-            } else {
-                f32::NAN
-            };
-        }
-        let val = (1.0 + mant as f32 / 1024.0) * 2.0f32.powi(exp - 15);
-        if sign == 1 {
-            -val
-        } else {
-            val
-        }
     }
 
     /// Test alias — dispatches to the canonical module-scope implementation.

@@ -639,3 +639,26 @@ For reviewers, the concrete file pointers this spec is built on:
 
 The 200 `larql-kv` tests passing today is the safety net for §8.2's
 trait widening — any widening that breaks them is wrong.
+
+## Addendum 2026-06-13 — the resident-path contract
+
+The `prefill_resident` / `decode_step_resident` trait methods (added for
+task #16's Q4K-direct attention) carry the vindex so the attention step can
+read packed bytes instead of f32 `weights.tensors`. Their trait DEFAULTS
+drop the index and forward to the plain methods — which silently kept every
+own-walk-loop engine on the f32 path while `StandardEngine` got the
+2026-06-11/12 CPU fast-path arc (q4k/int8 attention, asm kernels,
+append-in-place KV).
+
+**Contract going forward:** every cached-state engine MUST either override
+`decode_step_resident` (threading the index to
+`larql_compute::attention::run_attention_block_decode_step_auto`, the
+single-source q4k-vs-f32 dispatcher) or forward it to a wrapped engine that
+does (`boundary-kv` → inner `StandardEngine`). Intentional exceptions:
+`no_cache` and `apollo` (debug / bench-only full re-forward).
+
+Pinned by `larql-kv::engines::resident_identity_tests` — resident and plain
+paths must be bit-identical with the flags off, across 7 concrete engine
+specs, with a coverage-count floor so the matrix can't silently shrink.
+Prefill deliberately stays on the f32 BLAS gemm for all engines (the
+prefill-q4k falsification, `docs/diagnoses/q4k-direct-attention.md`).

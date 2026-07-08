@@ -370,14 +370,9 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             feature_major_down: args.feature_major_down,
         };
 
-        // Per-expert SVD-summary tier — opt-in via flag. Threaded as env var
-        // so the streaming gate path can read it without an API break.
-        if args.summary_features_per_expert > 0 {
-            std::env::set_var(
-                "LARQL_SUMMARY_FEATURES_PER_EXPERT",
-                args.summary_features_per_expert.to_string(),
-            );
-        }
+        // Per-expert SVD-summary tier (opt-in via `--summary-features-per-expert`)
+        // is threaded as a parameter to `build_vindex_streaming` below — see the
+        // `summary_features_per_expert` arg. (Was an env side-channel.)
 
         // Dispatch:
         //
@@ -458,6 +453,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 model_name,
                 output,
                 args.down_top_k,
+                args.summary_features_per_expert,
                 level,
                 dtype,
                 args.quant,

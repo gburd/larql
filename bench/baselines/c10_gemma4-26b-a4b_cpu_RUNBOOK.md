@@ -1,5 +1,24 @@
 # Runbook — Gemma 4 26B-A4B CPU baseline (the medium-term-tier pin)
 
+> **✅ COMPLETE 2026-06-10** — results in
+> `c10_gemma4-26b-a4b_cpu_reconciled.json`: llama.cpp 32.1 tok/s vs larql
+> in-process 7.1 (default) / 9.7 (`LARQL_Q4K_DIRECT_ATTN=1`) / loopback 7.3
+> (t=8, warm, n=128, drift-bracketed). Gap = f32-residency byte traffic
+> (~10 GB/tok vs ~2.1), not the kernel. Tier 62%→70%.
+>
+> **Corrections to this runbook learned in the run:**
+> - §2: serve with `--experts 0-127`, NOT `--ffn-only` (no expert endpoints →
+>   "bad expert response"). And `larql bench --moe-shards` still uses the
+>   pre-C1 path (fails on CPU, #146 signature) — use
+>   `larql run --moe-shards --engine standard` with `RAYON_NUM_THREADS=8`.
+> - §Method addition (mandatory): `pmset -g batt` must show AC/full charge,
+>   and bracket the matrix with a llama-bench drift check. The first session
+>   was invalidated by a silent battery drain (llama.cpp itself fell 34→1.05
+>   tok/s at 31% battery; ~30×, far beyond the thermal class) plus Spotlight
+>   churn after 30+ GB of model I/O.
+> - The 1.8-vs-4.4 question dissolves: both were artifacts (cold n=8 smoke vs
+>   cross-session conditions). Warm AC: in-process 7.1 ≈ loopback 7.3.
+
 Goal: produce `c10_gemma4-26b-a4b_cpu_reconciled.json` — the missing
 26B-A4B CPU decode number that pins the **medium-term achievability tier**
 (currently 62%, gate rule in `ROADMAP.md`: *"if 10 tok/s ≈ llama.cpp-on-26B-CPU

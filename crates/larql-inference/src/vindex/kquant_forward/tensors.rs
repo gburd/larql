@@ -1,16 +1,20 @@
-use larql_models::ModelWeights;
+use larql_models::{DequantScratch, ModelWeights};
 use larql_vindex::VectorIndex;
 
 use super::dequant::dequantize_matrix;
 
 /// Insert one Q4_K/Q6_K vindex layer's attention and dense FFN tensors into
-/// `weights.tensors` as dense f32 matrices.
+/// the engine-owned `scratch` as dense f32 matrices (`weights` stays
+/// immutable; readers resolve them via [`WeightsView::with_scratch`]).
+///
+/// [`WeightsView::with_scratch`]: larql_models::WeightsView::with_scratch
 ///
 /// This is the shared research/intervention primitive behind Q4K CPU forward
 /// and OV/RD-style experiments. Call [`remove_layer_tensors`] with the returned
 /// keys after the layer has run to keep peak f32 memory bounded.
 pub fn insert_q4k_layer_tensors(
-    weights: &mut ModelWeights,
+    scratch: &mut DequantScratch,
+    weights: &ModelWeights,
     index: &VectorIndex,
     layer: usize,
 ) -> Result<Vec<String>, String> {
@@ -38,27 +42,27 @@ pub fn insert_q4k_layer_tensors(
     let up_key = arch.ffn_up_key(layer);
     let down_key = arch.ffn_down_key(layer);
 
-    weights.tensors.insert(
+    scratch.insert(
         q_key.clone(),
         dequantize_matrix(attn[0].0, attn[0].1, q_dim, hidden).into_shared(),
     );
-    weights.tensors.insert(
+    scratch.insert(
         k_key.clone(),
         dequantize_matrix(attn[1].0, attn[1].1, kv_dim, hidden).into_shared(),
     );
-    weights.tensors.insert(
+    scratch.insert(
         v_key.clone(),
         dequantize_matrix(attn[2].0, attn[2].1, kv_dim, hidden).into_shared(),
     );
-    weights.tensors.insert(
+    scratch.insert(
         o_key.clone(),
         dequantize_matrix(attn[3].0, attn[3].1, hidden, q_dim).into_shared(),
     );
-    weights.tensors.insert(
+    scratch.insert(
         gate_key.clone(),
         dequantize_matrix(ffn[0].0, ffn[0].1, intermediate, hidden).into_shared(),
     );
-    weights.tensors.insert(
+    scratch.insert(
         up_key.clone(),
         dequantize_matrix(ffn[1].0, ffn[1].1, intermediate, hidden).into_shared(),
     );
@@ -71,15 +75,43 @@ pub fn insert_q4k_layer_tensors(
     } else {
         dequantize_matrix(ffn[2].0, ffn[2].1, hidden, intermediate)
     };
-    weights
-        .tensors
-        .insert(down_key.clone(), w_down.into_shared());
+    scratch.insert(down_key.clone(), w_down.into_shared());
 
     Ok(vec![q_key, k_key, v_key, o_key, gate_key, up_key, down_key])
 }
 
 /// Remove tensor keys previously returned by [`insert_q4k_layer_tensors`].
-pub fn remove_layer_tensors(weights: &mut ModelWeights, keys: Vec<String>) {
+pub fn remove_layer_tensors(scratch: &mut DequantScratch, keys: Vec<String>) {
+    for key in keys {
+        scratch.remove(&key);
+    }
+}
+
+/// Resident variant of [`insert_q4k_layer_tensors`] — dequantises **into
+/// `weights.tensors`** (mutating `weights`) rather than an engine scratch.
+///
+/// For dev/research drivers (the `ov_rd` CLI tooling, the relation resolver,
+/// standalone examples) that run their own per-layer forward against canonical
+/// `weights.tensors` and don't thread a [`WeightsView`]. The production decode
+/// path uses the scratch-based [`insert_q4k_layer_tensors`] +
+/// [`WeightsView::with_scratch`] so `ModelWeights` stays immutable/`Arc`-able.
+///
+/// [`WeightsView`]: larql_models::WeightsView
+/// [`WeightsView::with_scratch`]: larql_models::WeightsView::with_scratch
+pub fn insert_q4k_layer_tensors_resident(
+    weights: &mut ModelWeights,
+    index: &VectorIndex,
+    layer: usize,
+) -> Result<Vec<String>, String> {
+    let mut scratch = DequantScratch::new();
+    let inserted = insert_q4k_layer_tensors(&mut scratch, weights, index, layer)?;
+    weights.tensors.extend(scratch);
+    Ok(inserted)
+}
+
+/// Resident variant of [`remove_layer_tensors`] — removes the keys from
+/// `weights.tensors` (the [`insert_q4k_layer_tensors_resident`] counterpart).
+pub fn remove_layer_tensors_resident(weights: &mut ModelWeights, keys: Vec<String>) {
     for key in keys {
         weights.tensors.remove(&key);
     }

@@ -140,102 +140,138 @@ pub fn cpu_moe_forward(
     }
 
     use rayon::prelude::*;
-    let expert_out = expert_indices
-        .par_iter()
-        .zip(expert_weights.par_iter())
-        .filter(|(_, &w)| w != 0.0)
-        .fold(
-            || vec![0.0f32; hidden],
-            |mut acc, (&ei, &w)| {
-                let Some(&gate_up_bytes) = moe.experts_gate_up.get(ei) else {
-                    return acc;
-                };
-                let Some(&down_bytes) = moe.experts_down.get(ei) else {
-                    return acc;
-                };
+    // Add expert `ei`'s weighted contribution (`w * down(act(gate·x)·up·x)`)
+    // into `dst`. Shared by the rayon fold and the spin-pool path so both
+    // compute the identical arithmetic; only the parallel *schedule* differs.
+    let add_expert = |ei: usize, w: f32, dst: &mut [f32]| {
+        let Some(&gate_up_bytes) = moe.experts_gate_up.get(ei) else {
+            return;
+        };
+        let Some(&down_bytes) = moe.experts_down.get(ei) else {
+            return;
+        };
+        SCRATCH.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let scratch =
+                borrow.get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
+            if scratch.gate_out.len() != inter
+                || scratch.act.len() != inter_padded
+                || scratch.out.len() != hidden
+            {
+                *scratch = ExpertScratch::new(hidden, inter, inter_padded);
+            }
 
-                SCRATCH.with(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let scratch = borrow
-                        .get_or_insert_with(|| ExpertScratch::new(hidden, inter, inter_padded));
-                    if scratch.gate_out.len() != inter
-                        || scratch.act.len() != inter_padded
-                        || scratch.out.len() != hidden
-                    {
-                        *scratch = ExpertScratch::new(hidden, inter, inter_padded);
-                    }
-
-                    if let Some(q8k) = expert_input_q8k.as_ref() {
-                        // Q4_K direct path — single source of truth in
-                        // `expert::run_single_expert_q4k_q8k_into`.  Reuses
-                        // the scratch's act_q8k buffer too.
-                        let h2 = run_single_expert_q4k_q8k_into(
-                            scratch,
-                            q8k,
-                            gate_up_bytes,
-                            down_bytes,
-                            inter,
-                            activation,
-                        );
-                        for (a, &v) in acc.iter_mut().zip(h2.iter()) {
-                            *a += w * v;
-                        }
-                        return;
-                    }
-
-                    // Fallback: BF16 / F32 / Q4_K-with-disable — original
-                    // f32 cache path.  Inlined here to avoid pulling the
-                    // per-call rms_norm / format dispatch from the legacy
-                    // `run_single_expert_into` that doesn't share scratch.
-                    let gate_up_w = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
-                        .unwrap_or_else(|err| panic!("{err}"));
-                    if gate_up_w.is_empty() {
-                        return;
-                    }
-                    let gate_w = &gate_up_w[..inter * hidden];
-                    let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
-
-                    let gate_out = matmul_vec(&expert_input, gate_w, inter, hidden);
-                    let up_out = matmul_vec(&expert_input, up_w, inter, hidden);
-
-                    for j in 0..inter {
-                        let g = gate_out[j];
-                        let u = up_out[j];
-                        scratch.act[j] = match activation {
-                            crate::Activation::GeluTanh => gelu_tanh(g) * u,
-                            _ => silu(g) * u,
-                        };
-                    }
-
-                    // Within-expert feature routing (aim-validation probe);
-                    // no-op unless a schedule is installed. Mirrors the
-                    // Q4_K-direct path so the f32-fallback (LARQL_DISABLE_Q4K_DIRECT)
-                    // measures the same object.
-                    super::within_expert::prune_act(&mut scratch.act, inter);
-
-                    let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
-                        .unwrap_or_else(|err| panic!("{err}"));
-                    if down_w.is_empty() {
-                        return;
-                    }
-                    let expert_contribution =
-                        matmul_vec(&scratch.act, &down_w, hidden, inter_padded);
-                    for (a, &v) in acc.iter_mut().zip(expert_contribution.iter()) {
-                        *a += w * v;
-                    }
-                });
-                acc
-            },
-        )
-        .reduce(
-            || vec![0.0f32; hidden],
-            |mut a, b| {
-                for (x, &y) in a.iter_mut().zip(b.iter()) {
-                    *x += y;
+            if let Some(q8k) = expert_input_q8k.as_ref() {
+                // Q4_K direct path — single source of truth in
+                // `expert::run_single_expert_q4k_q8k_into`.  Reuses the
+                // scratch's act_q8k buffer too.
+                let h2 = run_single_expert_q4k_q8k_into(
+                    scratch,
+                    q8k,
+                    gate_up_bytes,
+                    down_bytes,
+                    inter,
+                    activation,
+                );
+                for (a, &v) in dst.iter_mut().zip(h2.iter()) {
+                    *a += w * v;
                 }
-                a
-            },
-        );
+                return;
+            }
+
+            // Fallback: BF16 / F32 / Q4_K-with-disable — original f32 cache
+            // path.  Inlined here to avoid pulling the per-call rms_norm /
+            // format dispatch from the legacy `run_single_expert_into` that
+            // doesn't share scratch.
+            let gate_up_w = try_cached_dequant(gate_up_bytes, format, 2 * inter * hidden)
+                .unwrap_or_else(|err| panic!("{err}"));
+            if gate_up_w.is_empty() {
+                return;
+            }
+            let gate_w = &gate_up_w[..inter * hidden];
+            let up_w = &gate_up_w[inter * hidden..2 * inter * hidden];
+
+            let gate_out = matmul_vec(&expert_input, gate_w, inter, hidden);
+            let up_out = matmul_vec(&expert_input, up_w, inter, hidden);
+
+            for j in 0..inter {
+                let g = gate_out[j];
+                let u = up_out[j];
+                scratch.act[j] = match activation {
+                    crate::Activation::GeluTanh => gelu_tanh(g) * u,
+                    _ => silu(g) * u,
+                };
+            }
+
+            // Within-expert feature routing (aim-validation probe); no-op
+            // unless a schedule is installed. Mirrors the Q4_K-direct path so
+            // the f32-fallback (LARQL_DISABLE_Q4K_DIRECT) measures the same
+            // object.
+            super::within_expert::prune_act(&mut scratch.act, inter);
+
+            let down_w = try_cached_dequant(down_bytes, format, hidden * inter_padded)
+                .unwrap_or_else(|err| panic!("{err}"));
+            if down_w.is_empty() {
+                return;
+            }
+            let expert_contribution = matmul_vec(&scratch.act, &down_w, hidden, inter_padded);
+            for (a, &v) in dst.iter_mut().zip(expert_contribution.iter()) {
+                *a += w * v;
+            }
+        });
+    };
+
+    let expert_out = if crate::cpu::spin_pool::enabled() {
+        // Spin-pool path: one chunk per active (non-zero-weight) expert, each
+        // accumulating into its own disjoint `hidden`-wide slot; summed after.
+        // Keeps all decode sections on one hot pool (no rayon/spin two-pool
+        // contention). Sum order differs from the rayon tree-reduce by fp
+        // reordering only — within the experts' tolerance parity.
+        let active: Vec<(usize, f32)> = expert_indices
+            .iter()
+            .copied()
+            .zip(expert_weights.iter().copied())
+            .filter(|(_, w)| *w != 0.0)
+            .collect();
+        let mut contribs = vec![0.0f32; active.len() * hidden];
+        let active_ref = &active[..];
+        let add_expert_ref = &add_expert;
+        crate::cpu::spin_pool::par_chunks_mut(&mut contribs, hidden, |ci, slot| {
+            let (ei, w) = active_ref[ci];
+            add_expert_ref(ei, w, slot);
+        });
+        let mut acc = vec![0.0f32; hidden];
+        for ci in 0..active.len() {
+            for (a, &v) in acc
+                .iter_mut()
+                .zip(contribs[ci * hidden..(ci + 1) * hidden].iter())
+            {
+                *a += v;
+            }
+        }
+        acc
+    } else {
+        expert_indices
+            .par_iter()
+            .zip(expert_weights.par_iter())
+            .filter(|(_, &w)| w != 0.0)
+            .fold(
+                || vec![0.0f32; hidden],
+                |mut acc, (&ei, &w)| {
+                    add_expert(ei, w, &mut acc);
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0f32; hidden],
+                |mut a, b| {
+                    for (x, &y) in a.iter_mut().zip(b.iter()) {
+                        *x += y;
+                    }
+                    a
+                },
+            )
+    };
 
     let t_par = t_par_start.elapsed();
     let t_sum = std::time::Duration::ZERO;
@@ -461,33 +497,22 @@ mod tests {
         );
     }
 
-    // ENV_LOCK protects tests that set process-wide env vars. The cpu_moe_forward
-    // hot path reads `LARQL_SKIP_MOE`, `LARQL_MOE_DEBUG`, and (once per thread,
-    // through a TLS cache) `LARQL_MOE_FWD_TIMING`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // Override env flags on the current thread (`LARQL_SKIP_MOE`,
+    // `LARQL_MOE_DEBUG`, `LARQL_MOE_FWD_TIMING` — all read via the override-aware
+    // `options::env_flag`) WITHOUT `std::env::set_var`, which races concurrent
+    // `getenv` → SIGSEGV. Per-thread, cleared on drop → no lock, no leakage.
     fn with_env<T>(vars: &[(&'static str, Option<&'static str>)], f: impl FnOnce() -> T) -> T {
-        // Recover from prior-test panics so an unrelated failure in one
-        // env-sensitive test doesn't cascade-fail the others.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                crate::options::clear_fast_path_overrides();
+            }
+        }
+        let _clear = Clear;
         for (name, value) in vars {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
+            crate::options::set_env_override(name, *value);
         }
-        let result = f();
-        for (name, value) in previous {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-        result
+        f()
     }
 
     fn trivial_moe_inputs() -> (usize, usize, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>) {

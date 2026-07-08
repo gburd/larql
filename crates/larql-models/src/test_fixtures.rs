@@ -613,6 +613,44 @@ pub fn make_test_q4k_weights_layers(num_layers: usize) -> ModelWeights {
         "hidden_activation": "gelu_pytorch_tanh",
         "rope_theta": 10000.0,
     });
+    q4k_test_weights_from_json(arch_json, num_layers)
+}
+
+/// Rope-scaled sibling of [`make_test_q4k_weights`]: Gemma-3 arch at the
+/// same Q4_K-compatible dims, with `sliding_window` + flat linear
+/// `rope_scaling` (factor 8) and **6 layers**, so the 5:1 local:global
+/// pattern puts a full-attention layer (position divisor 8) inside the
+/// model. This is the fixture for direct-vs-staged decode parity on the
+/// scaled-RoPE path — [`make_gemma3_rope_scaled_test_weights`] covers the
+/// same arch shape but at hidden=16, below Q4_K's 256-element super-block
+/// floor, so it cannot drive the direct-matvec kernels.
+pub fn make_test_q4k_weights_rope_scaled() -> ModelWeights {
+    let num_q = 4usize;
+    let num_kv = 2usize;
+    let head_dim = Q4K_TEST_HIDDEN / num_q;
+    let num_layers = 6usize;
+
+    let arch_json = serde_json::json!({
+        "model_type": "gemma3_text",
+        "hidden_size": Q4K_TEST_HIDDEN,
+        "num_hidden_layers": num_layers,
+        "intermediate_size": Q4K_TEST_INTER,
+        "head_dim": head_dim,
+        "num_attention_heads": num_q,
+        "num_key_value_heads": num_kv,
+        "vocab_size": Q4K_TEST_VOCAB,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "rope_theta": 10000.0,
+        "sliding_window": 512,
+        "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+    });
+    q4k_test_weights_from_json(arch_json, num_layers)
+}
+
+fn q4k_test_weights_from_json(arch_json: serde_json::Value, num_layers: usize) -> ModelWeights {
+    let num_q = 4usize;
+    let num_kv = 2usize;
+    let head_dim = Q4K_TEST_HIDDEN / num_q;
     let arch = detect_from_json(&arch_json);
 
     let mut tensors: HashMap<String, WeightArray> = HashMap::new();

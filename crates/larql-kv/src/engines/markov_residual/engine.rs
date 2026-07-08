@@ -27,6 +27,12 @@ pub struct MarkovResidualEngine {
     /// Position counter used by `coarse_decode_step_with_state` for RoPE.
     /// Tracks `prompt_len + steps_already_decoded`.
     pub(super) abs_position: usize,
+    /// Engine-owned f32 dequant scratch for the per-layer walk fallback —
+    /// `prefill_quant`/`decode_step_quant` populate it; the walk resolves
+    /// attention through a `WeightsView::with_scratch` over it. Empty on the
+    /// W1-GPU/coarse path. Keeps `weights` immutable (no `weights.tensors`
+    /// mutation).
+    pub(super) dequant_scratch: larql_inference::DequantScratch,
 }
 
 impl MarkovResidualEngine {
@@ -43,6 +49,7 @@ impl MarkovResidualEngine {
             profile: EngineProfiler::default(),
             kv_handle: None,
             abs_position: 0,
+            dequant_scratch: larql_inference::DequantScratch::new(),
         }
     }
 
@@ -60,6 +67,53 @@ impl MarkovResidualEngine {
 // `decode_step_via_dispatch`) live in [`super::dispatch`] as an
 // additional `impl MarkovResidualEngine` block. They mutate the
 // `pub(super)` fields above.
+
+impl MarkovResidualEngine {
+    /// Shared body for `decode_step` / `decode_step_resident` — `index`
+    /// reaches the attention step's Q4K-direct route when present.
+    fn decode_step_impl(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Result<Array2<f32>, EngineError> {
+        let rs = self
+            .store
+            .take()
+            .ok_or_else(|| EngineError::InvariantViolation {
+                what: "decode_step called before prefill (store missing)".into(),
+            })?;
+        let (hidden, new_rs) = if self.profiling {
+            rs_decode_step_profiled(
+                larql_inference::WeightsView::dense(weights),
+                token_id,
+                rs,
+                self.backend.as_ref(),
+                &mut self.profile,
+                Some(ffn),
+                index,
+            )
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "rs_decode_step_profiled returned None".into(),
+            })?
+        } else {
+            rs_decode_step(
+                larql_inference::WeightsView::dense(weights),
+                token_id,
+                rs,
+                self.backend.as_ref(),
+                Some(ffn),
+                index,
+            )
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "rs_decode_step returned None".into(),
+            })?
+        };
+        self.store = Some(new_rs);
+        Ok(hidden)
+    }
+}
 
 impl KvEngine for MarkovResidualEngine {
     fn name(&self) -> &str {
@@ -93,7 +147,7 @@ impl KvEngine for MarkovResidualEngine {
             return Err(EngineError::EmptyPrompt);
         }
         let result = rs_prefill(
-            weights,
+            larql_inference::WeightsView::dense(weights),
             token_ids,
             self.window_size,
             self.backend.as_ref(),
@@ -110,33 +164,21 @@ impl KvEngine for MarkovResidualEngine {
         ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        let rs = self
-            .store
-            .take()
-            .ok_or_else(|| EngineError::InvariantViolation {
-                what: "decode_step called before prefill (store missing)".into(),
-            })?;
-        let (hidden, new_rs) = if self.profiling {
-            rs_decode_step_profiled(
-                weights,
-                token_id,
-                rs,
-                self.backend.as_ref(),
-                &mut self.profile,
-                Some(ffn),
-            )
-            .ok_or_else(|| EngineError::BackendFailure {
-                details: "rs_decode_step_profiled returned None".into(),
-            })?
-        } else {
-            rs_decode_step(weights, token_id, rs, self.backend.as_ref(), Some(ffn)).ok_or_else(
-                || EngineError::BackendFailure {
-                    details: "rs_decode_step returned None".into(),
-                },
-            )?
-        };
-        self.store = Some(new_rs);
-        Ok(hidden)
+        self.decode_step_impl(weights, ffn, token_id, None)
+    }
+
+    /// Resident-path decode: threads `index` down to the walk's attention
+    /// step so the Q4K-direct projections (`LARQL_Q4K_DIRECT_ATTN` family)
+    /// can fire — the structural gap that left non-standard engines on the
+    /// f32 path after the standard engine got the fast attention.
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.decode_step_impl(weights, ffn, token_id, Some(index))
     }
 
     fn memory_bytes(&self) -> usize {
@@ -160,7 +202,7 @@ impl KvEngine for MarkovResidualEngine {
 
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_ids: &[u32],
@@ -179,8 +221,9 @@ impl KvEngine for MarkovResidualEngine {
         if let Some(hidden) = self.try_prefill_via_dispatch(weights, index, token_ids) {
             return Ok(hidden);
         }
-        ensure_attn_tensors_dequantised(weights, index);
-        let result = rs_prefill_walk(weights, index, token_ids, self.window_size, backend);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
+        let result = rs_prefill_walk(view, index, token_ids, self.window_size, backend);
         let hidden = result.hidden.clone();
         self.store = Some(result.store);
         self.kv_handle = None; // ensure dispatch path is not used for subsequent decode
@@ -190,7 +233,7 @@ impl KvEngine for MarkovResidualEngine {
 
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_id: u32,
@@ -206,7 +249,8 @@ impl KvEngine for MarkovResidualEngine {
                     details: "decode_step_via_dispatch returned None".into(),
                 });
         }
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
         let rs = self
             .store
             .take()
@@ -214,7 +258,7 @@ impl KvEngine for MarkovResidualEngine {
                 what: "decode_step_quant called before prefill (store missing)".into(),
             })?;
         let prof = self.profiling.then_some(&mut self.profile);
-        let (hidden, new_rs) = rs_decode_step_walk(weights, index, token_id, rs, backend, prof)
+        let (hidden, new_rs) = rs_decode_step_walk(view, index, token_id, rs, backend, prof)
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "rs_decode_step_walk returned None".into(),
             })?;
@@ -235,7 +279,7 @@ impl KvEngine for MarkovResidualEngine {
 
     fn prefill_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
@@ -259,7 +303,7 @@ impl KvEngine for MarkovResidualEngine {
 
         // Q4K attn weights need dequant once before the per-layer
         // executor can drive f32 attention against them.
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
 
         let backend = executor.backend();
         let num_layers = weights.num_layers;
@@ -274,7 +318,12 @@ impl KvEngine for MarkovResidualEngine {
             // the layer's K/V — residual-stream contract recomputes K/V
             // per decode step from the stored residuals.
             let (h_out, _kv) = executor
-                .run_prefill_layer(weights, layer, &h, ffn)
+                .run_prefill_layer(
+                    larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
+                    layer,
+                    &h,
+                    ffn,
+                )
                 .ok_or_else(|| EngineError::BackendFailure {
                     details: "executor.run_prefill_layer returned None".into(),
                 })?;
@@ -307,8 +356,15 @@ impl KvEngine for MarkovResidualEngine {
         if cold.first().map_or(0, |c| c.shape()[0]) > 0 {
             let cold_kv: Vec<SharedKV> = (0..num_layers)
                 .map(|layer| {
-                    recompute_kv(weights, &cold[layer], layer, 0, backend, Some(index))
-                        .expect("cold K/V pre-computation failed")
+                    recompute_kv(
+                        larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
+                        &cold[layer],
+                        layer,
+                        0,
+                        backend,
+                        Some(index),
+                    )
+                    .expect("cold K/V pre-computation failed")
                 })
                 .collect();
             // 2026-05-19 audit fix: doubling-capacity append.
@@ -327,7 +383,7 @@ impl KvEngine for MarkovResidualEngine {
 
     fn decode_step_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
@@ -343,7 +399,7 @@ impl KvEngine for MarkovResidualEngine {
             return self.decode_step_quant(weights, ffn, index, token_id, executor.backend());
         }
 
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
 
         let backend = executor.backend();
         let rs = self
@@ -367,11 +423,17 @@ impl KvEngine for MarkovResidualEngine {
             // and runs the layer.
             let prior_kv: SharedKV = if let Some(cold_kv) = &rs.cold_kv {
                 let (k_cold, v_cold) = &cold_kv[layer];
-                let (k_hot, v_hot) =
-                    recompute_kv(weights, h_hot, layer, hot_abs_start, backend, Some(index))
-                        .ok_or_else(|| EngineError::BackendFailure {
-                            details: "recompute_kv (hot) returned None".into(),
-                        })?;
+                let (k_hot, v_hot) = recompute_kv(
+                    larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
+                    h_hot,
+                    layer,
+                    hot_abs_start,
+                    backend,
+                    Some(index),
+                )
+                .ok_or_else(|| EngineError::BackendFailure {
+                    details: "recompute_kv (hot) returned None".into(),
+                })?;
                 let c = k_cold.shape()[0];
                 let kv_dim = k_cold.shape()[1];
                 let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
@@ -395,7 +457,7 @@ impl KvEngine for MarkovResidualEngine {
                     _ => (h_hot.clone(), hot_abs_start),
                 };
                 recompute_kv(
-                    weights,
+                    larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
                     &h_full,
                     layer,
                     full_abs_start,
@@ -410,7 +472,14 @@ impl KvEngine for MarkovResidualEngine {
             new_stored.push(h_new.clone());
             // Run the layer through the executor.
             let (h_out, _new_kv) = executor
-                .run_decode_layer(weights, layer, &h_new, &prior_kv, abs_position, ffn)
+                .run_decode_layer(
+                    larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
+                    layer,
+                    &h_new,
+                    &prior_kv,
+                    abs_position,
+                    ffn,
+                )
                 .ok_or_else(|| EngineError::BackendFailure {
                     details: "executor.run_decode_layer returned None".into(),
                 })?;
@@ -651,7 +720,7 @@ mod tests {
     #[test]
     fn prefill_q4k_cpu_fallback_runs_walk_path() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         // `NullFfn` satisfies the trait without borrowing `weights`, which is
@@ -659,7 +728,7 @@ mod tests {
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let h = engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill_quant cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > 0);
@@ -668,17 +737,17 @@ mod tests {
     #[test]
     fn decode_step_q4k_cpu_fallback_extends_store() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill_quant");
         let mem_before = engine.memory_bytes();
         let h = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode_step_quant cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(
@@ -697,13 +766,13 @@ mod tests {
     #[test]
     fn prefill_quant_walk_with_window_populates_cold_kv() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill_quant with overflow");
         // window=2 + 4 prompt tokens → cold tier populated → walk.rs
         // lines 67-75 fire.
@@ -719,7 +788,7 @@ mod tests {
     #[test]
     fn decode_step_quant_w2_cached_matches_recompute_from_residuals() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
@@ -727,32 +796,32 @@ mod tests {
         // Cached path (W2 default): prefill captures K/V, decode reuses.
         let mut cached = MarkovResidualEngine::new(None);
         cached
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill cached");
         let h_cached_1 = cached
-            .decode_step_quant(&mut weights, &ffn, &index, 3, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 3, &*backend)
             .expect("decode cached 1");
         let h_cached_2 = cached
-            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 4, &*backend)
             .expect("decode cached 2");
 
         // Recompute path: same engine, but force hot_kv = None after
         // prefill so the fallback recompute fires for every step.
         let mut recompute = MarkovResidualEngine::new(None);
         recompute
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill recompute");
         if let Some(s) = recompute.store.as_mut() {
             s.hot_kv = None;
         }
         let h_recompute_1 = recompute
-            .decode_step_quant(&mut weights, &ffn, &index, 3, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 3, &*backend)
             .expect("decode recompute 1");
         if let Some(s) = recompute.store.as_mut() {
             s.hot_kv = None;
         }
         let h_recompute_2 = recompute
-            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 4, &*backend)
             .expect("decode recompute 2");
 
         // Bit-equivalence: both paths run the same projection matmuls
@@ -782,7 +851,7 @@ mod tests {
     #[test]
     fn decode_step_quant_w2_cached_hot_and_cold_steady_state() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
@@ -790,7 +859,7 @@ mod tests {
         // populating cold_kv from the evicted hot_kv slice.
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill with overflow");
         let store = engine.store.as_ref().unwrap();
         assert!(store.hot_kv.is_some());
@@ -801,7 +870,7 @@ mod tests {
         // merge into cold_kv via the W2 evicted-K/V flow.
         for tok in 4u32..8 {
             let h = engine
-                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .decode_step_quant(&weights, &ffn, &index, tok, &*backend)
                 .expect("decode");
             assert_eq!(h.shape(), &[1, weights.hidden_size]);
         }
@@ -826,18 +895,18 @@ mod tests {
     #[test]
     fn decode_step_quant_w2_falls_back_when_hot_kv_dropped() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill");
         // Drop hot_kv — forces the recompute path that mirrors pre-W2.
         engine.store.as_mut().unwrap().hot_kv = None;
         let h = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 4, &*backend)
             .expect("decode via fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -848,14 +917,14 @@ mod tests {
     #[test]
     fn decode_step_quant_w2_overflow_merges_into_cold_kv() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
 
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill within window");
         // After prefill: hot_kv populated (2 rows), no cold_kv.
         assert!(engine.store.as_ref().unwrap().hot_kv.is_some());
@@ -863,7 +932,7 @@ mod tests {
         // Decode a token → no overflow yet (still 2 rows after step
         // since window=2, the new row pushes the oldest out).
         let _ = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode 1");
         // Overflow fired this step: oldest row evicted from hot_kv,
         // merged into cold_kv.
@@ -884,21 +953,21 @@ mod tests {
     #[test]
     fn decode_step_q4k_walk_with_profiling_populates_summary() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2)).with_profiling(true);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill");
         // First decode: cold_kv branch (hot recompute timing arm).
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 4, &*backend)
             .expect("decode 1");
         // Second decode: cold_residuals branch (cold recompute timing arm).
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 5, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 5, &*backend)
             .expect("decode 2");
         let summary = engine
             .stage_summary()
@@ -919,21 +988,21 @@ mod tests {
         // Some(overflow)`. Fires when prefill didn't overflow (cold = None)
         // but the first decode does (window cap exceeded mid-decode).
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         // window=2, prefill=1 token → no overflow on prefill (cold=None).
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32], &*backend)
             .expect("prefill_quant");
         // Decode until hot exceeds window → first-time cold population.
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 1, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 1, &*backend)
             .expect("decode 1");
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode 2 — triggers first-overflow None branch");
         // After overflow, cold tier is populated.
         assert!(engine.cold_bytes() > 0);
@@ -942,23 +1011,23 @@ mod tests {
     #[test]
     fn decode_step_quant_walk_after_overflow_hits_cold_residuals_branch() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill_quant");
         // First decode: exercises walk.rs cold_kv branch (lines 132-161).
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 4, &*backend)
             .expect("first decode_step_quant");
         // Second decode: cold_kv was cleared by overflow at the first
         // decode (walk.rs line 309), so this hits the cold_residuals
         // recompute branch (lines 162-187).
         let h = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 5, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 5, &*backend)
             .expect("second decode_step_quant");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -969,14 +1038,14 @@ mod tests {
     fn prefill_quant_via_executor_runs_through_local_walk() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let h = engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2])
             .expect("executor prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > 0);
@@ -986,18 +1055,18 @@ mod tests {
     fn decode_step_quant_via_executor_extends_store() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1])
             .expect("prefill");
         let mem_before = engine.memory_bytes();
         let h = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 2)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > mem_before);
@@ -1035,7 +1104,7 @@ mod tests {
         // WalkFfn internally (the legacy bug we're fixing) the counter
         // stays at zero.
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
@@ -1046,7 +1115,7 @@ mod tests {
         };
         let mut engine = MarkovResidualEngine::new(None);
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2])
             .expect("prefill via executor");
 
         let call_count = ffn.calls.load(std::sync::atomic::Ordering::SeqCst);
@@ -1064,14 +1133,14 @@ mod tests {
     fn prefill_quant_via_executor_with_window_populates_cold_tier() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
             .expect("prefill with overflow");
         assert!(engine.window_tokens() <= 2);
         assert!(engine.cold_bytes() > 0);
@@ -1085,18 +1154,18 @@ mod tests {
     fn decode_step_quant_via_executor_uses_cold_kv_branch() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
             .expect("prefill overflow → cold_kv populated");
         // First decode reads cold_kv branch (rs.cold_kv = Some(_)).
         let h = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 4)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 4)
             .expect("decode via cold_kv branch");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -1109,23 +1178,23 @@ mod tests {
     fn decode_step_quant_via_executor_hits_cold_residuals_branch() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
             .expect("prefill");
         // First decode clears cold_kv via overflow.
         engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 4)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 4)
             .expect("first decode");
         // Second decode: cold_kv is None, exercises the recompute_kv
         // from cold_residuals branch.
         let h = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 5)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 5)
             .expect("decode via cold_residuals recompute");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -1151,7 +1220,7 @@ mod tests {
     #[test]
     fn fused_executor_falls_back_to_legacy_quant_path() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let exec = FusedStubExecutor {
             backend: larql_compute::CpuBackend,
@@ -1159,11 +1228,11 @@ mod tests {
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let h = engine
-            .prefill_quant_via_executor(&mut weights, &exec, &ffn, &index, &[0u32, 1])
+            .prefill_quant_via_executor(&weights, &exec, &ffn, &index, &[0u32, 1])
             .expect("fused fallback prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         let h2 = engine
-            .decode_step_quant_via_executor(&mut weights, &exec, &ffn, &index, 2)
+            .decode_step_quant_via_executor(&weights, &exec, &ffn, &index, 2)
             .expect("fused fallback decode");
         assert_eq!(h2.shape(), &[1, weights.hidden_size]);
     }
@@ -1187,13 +1256,13 @@ mod tests {
         }
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let h = engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("dispatch-path prefill on Q4K vindex");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         // Dispatch path populates kv_handle + abs_position.
@@ -1213,18 +1282,18 @@ mod tests {
     fn decode_via_dispatch_grows_buffers_in_place() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill dispatch");
         let mem_after_prefill = engine.memory_bytes();
         for tok in 2..6u32 {
             let h = engine
-                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .decode_step_quant(&weights, &ffn, &index, tok, &*backend)
                 .expect("dispatch decode step");
             assert_eq!(h.shape(), &[1, weights.hidden_size]);
         }
@@ -1243,19 +1312,19 @@ mod tests {
         }
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None).with_profiling(true);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill");
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode 1");
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 3, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 3, &*backend)
             .expect("decode 2");
         // W10 instrumentation: dispatch path bumps state_capture +
         // state_materialise + state_append + decode_total on every step.
@@ -1284,13 +1353,13 @@ mod tests {
         // populated from snapshot_evicted_hot_kv).
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
             .expect("prefill with window");
         let store = engine.store.as_ref().expect("store");
         assert!(store.cold_residuals.is_some());
@@ -1307,17 +1376,17 @@ mod tests {
         // K/V already exists and the eviction concatenates.
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(Some(2));
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill at window cap");
         for tok in 3..6u32 {
             engine
-                .decode_step_quant(&mut weights, &ffn, &index, tok, &*backend)
+                .decode_step_quant(&weights, &ffn, &index, tok, &*backend)
                 .expect("dispatch decode with overflow");
         }
         let store = engine.store.as_ref().expect("store");
@@ -1370,13 +1439,13 @@ mod tests {
     fn prefill_quant_returns_empty_prompt_error_on_empty_input() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let err = engine
-            .prefill_quant(&mut weights, &ffn, &index, &[], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[], &*backend)
             .unwrap_err();
         assert_eq!(err, larql_inference::kv_engine::EngineError::EmptyPrompt);
     }
@@ -1385,13 +1454,13 @@ mod tests {
     fn decode_step_quant_returns_invariant_violation_before_prefill() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let err = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 0, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 0, &*backend)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1417,14 +1486,14 @@ mod tests {
     fn prefill_quant_via_executor_returns_empty_prompt_error_on_empty_input() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::CpuBackend;
         let executor = larql_inference::layer_executor::LocalWalkExecutor::new(&backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let err = engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[])
             .unwrap_err();
         assert_eq!(err, larql_inference::kv_engine::EngineError::EmptyPrompt);
     }
@@ -1433,14 +1502,14 @@ mod tests {
     fn decode_step_quant_via_executor_returns_invariant_violation_before_prefill() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::CpuBackend;
         let executor = larql_inference::layer_executor::LocalWalkExecutor::new(&backend);
         let ffn = NullFfn;
         let mut engine = MarkovResidualEngine::new(None);
         let err = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 0)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 0)
             .unwrap_err();
         assert!(matches!(
             err,

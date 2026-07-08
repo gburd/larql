@@ -25,7 +25,7 @@ impl TurboQuantEngine {
     /// entries (one per model layer) for the engine's contract.
     pub(super) fn try_prefill_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &VectorIndex,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
@@ -67,7 +67,7 @@ impl TurboQuantEngine {
     /// buffer (append-only — 2026-05-19 perf fix).
     pub(super) fn decode_step_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &VectorIndex,
         token_id: u32,
     ) -> Option<Array2<f32>> {
@@ -166,9 +166,9 @@ mod tests {
 
     #[test]
     fn prefill_via_dispatch_compresses_per_layer_kv() {
-        let (mut engine, mut weights, index) = fixture();
+        let (mut engine, weights, index) = fixture();
         let h = engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2])
             .expect("prefill via dispatch");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert_eq!(engine.layers.len(), weights.num_layers);
@@ -194,9 +194,9 @@ mod tests {
             weights.hidden_size,
         );
         let mut engine = TurboQuantEngine::with_backend(4, cpu_engine_backend());
-        let mut w = weights;
+        let w = weights;
         assert!(engine
-            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .try_prefill_via_dispatch(&w, &empty_index, &[0u32, 1])
             .is_none());
         assert!(engine.kv_handle.is_none());
         assert!(engine.layers.is_empty());
@@ -206,22 +206,22 @@ mod tests {
     fn prefill_via_dispatch_returns_none_on_empty_prompt() {
         // Empty token slice routes through CpuBackend's empty-tokens
         // guard in `coarse_prefill_with_state` → None.
-        let (mut engine, mut weights, index) = fixture();
+        let (mut engine, weights, index) = fixture();
         assert!(engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[])
+            .try_prefill_via_dispatch(&weights, &index, &[])
             .is_none());
         assert!(engine.kv_handle.is_none());
     }
 
     #[test]
     fn decode_step_via_dispatch_appends_one_position() {
-        let (mut engine, mut weights, index) = fixture();
+        let (mut engine, weights, index) = fixture();
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         let bytes_before: usize = engine.layers.iter().map(|l| l.compressed_k.len()).sum();
         let h = engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert_eq!(engine.abs_position, 3);
@@ -239,22 +239,22 @@ mod tests {
 
     #[test]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
-        let (mut engine, mut weights, index) = fixture();
+        let (mut engine, weights, index) = fixture();
         // kv_handle is None → early return at `self.kv_handle.as_mut()?`.
         assert!(engine
-            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .decode_step_via_dispatch(&weights, &index, 0)
             .is_none());
     }
 
     #[test]
     fn decode_step_via_dispatch_with_profiling_records_stages() {
-        let (engine, mut weights, index) = fixture();
+        let (engine, weights, index) = fixture();
         let mut engine = engine.with_profiling(true);
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode");
         // The decode_total / state_capture / recompute_hot timers
         // should all have at least one observation.

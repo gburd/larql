@@ -10,12 +10,9 @@
 //! typically on backends/vindexes lacking direct-matvec decode.
 
 use larql_compute::ComputeBackend;
-use larql_inference::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend, SharedKV,
-};
+use larql_inference::attention::{run_attention_with_kv_backend, SharedKV};
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::embed_tokens_pub;
-use larql_inference::model::ModelWeights;
 use ndarray::{s, Array2};
 
 use crate::engines::boundary_per_layer::cold_tier::{
@@ -28,7 +25,7 @@ use crate::engines::markov_residual::recompute_kv;
 /// Run a full prefill through the dense walk. Returns
 /// `(last_hidden, new_store)` — caller owns the store.
 pub(super) fn run_prefill(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     ffn: &dyn FfnBackend,
     backend: &dyn ComputeBackend,
     policy: &BoundaryLayerPolicy,
@@ -37,15 +34,21 @@ pub(super) fn run_prefill(
 ) -> Option<(Array2<f32>, RsStorePerLayer)> {
     let num_layers = weights.num_layers;
     let seq_len = token_ids.len();
-    let mut h = embed_tokens_pub(weights, token_ids);
+    let mut h = embed_tokens_pub(&weights, token_ids);
     let mut stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     let be = Some(backend);
 
     for layer in 0..num_layers {
         stored.push(h.clone());
         let (h_post_attn, _k, _v) =
-            run_attention_with_kv_backend(weights, &h, layer, be).expect("attention failed");
-        let h_out = crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, ffn, Some(ffn));
+            run_attention_with_kv_backend(weights, &h, layer, be, None).expect("attention failed");
+        let h_out = crate::engines::layer_ffn_or_moe(
+            weights.canonical(),
+            &h_post_attn,
+            layer,
+            ffn,
+            Some(ffn),
+        );
         h = h_out;
     }
 
@@ -53,6 +56,7 @@ pub(super) fn run_prefill(
         stored,
         cold_encoded: None,
         cold_kv: None,
+        hot_kv: None,
         cold_abs_start: 0,
         next_position: seq_len,
         max_window: window_size,
@@ -86,71 +90,187 @@ pub(super) fn run_prefill(
 
 /// Run one decode step through the dense walk. Consumes `rs`, returns
 /// the new store alongside the hidden output.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_decode(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     ffn: &dyn FfnBackend,
     backend: &dyn ComputeBackend,
     policy: &BoundaryLayerPolicy,
     mut rs: RsStorePerLayer,
     token_id: u32,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, RsStorePerLayer)> {
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
-    let mut h_new = embed_tokens_pub(weights, &[token_id]);
+    let mut h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
 
-    for layer in 0..num_layers {
-        let h_hot = &rs.stored[layer];
-        let s_hot = h_hot.shape()[0];
-        let hot_abs_start = abs_position.saturating_sub(s_hot);
+    // W2 hot-K/V cache (twin of markov_residual_codec). When unbounded with no
+    // cold tier, `hot_kv` holds the full K/V and the steady state (step 2+)
+    // appends the new row IN PLACE + attends over views — instead of
+    // `recompute_kv`-ing the whole hot tier AND rebuilding an owned `[ctx+1]`
+    // concat every layer every step (the pre-W2 cost this engine carried). The
+    // canonical state is still `stored` (the per-layer residuals); `hot_kv` is a
+    // droppable derivative. The in-place / owned-concat choice is gated by the
+    // shared `LARQL_MARKOV_INPLACE_KV` toggle (default on); both are
+    // bit-identical (engine-level A/B test). Windowed/cold configs (the engine's
+    // primary purpose) are NOT cache_eligible and keep the recompute path.
+    let cache_eligible =
+        rs.max_window.is_none() && rs.cold_encoded.is_none() && rs.cold_kv.is_none();
+    let mut step_new_kv: Vec<SharedKV> = Vec::with_capacity(num_layers);
+    let mut hot_kv_store = rs.hot_kv.take();
+    let had_hot_kv = hot_kv_store.is_some();
+    let idx_kv: Option<&dyn larql_compute::KvIndex> =
+        index.map(|v| v as &dyn larql_compute::KvIndex);
+    let inplace_enabled = crate::engines::markov_residual::compute::markov_inplace_kv_enabled();
 
-        let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
-            let (k_cold, v_cold) = &cold_kv[layer];
-            let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend, None)?;
-            let c = k_cold.shape()[0];
-            let kv_dim = k_cold.shape()[1];
-            let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
-            k_combined.slice_mut(s![..c, ..]).assign(k_cold);
-            k_combined.slice_mut(s![c.., ..]).assign(&k_hot);
-            let mut v_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
-            v_combined.slice_mut(s![..c, ..]).assign(v_cold);
-            v_combined.slice_mut(s![c.., ..]).assign(&v_hot);
-            (k_combined, v_combined)
-        } else {
-            let (h_full, full_abs_start) = if let Some(cold_layers) = &rs.cold_encoded {
-                let enc = &cold_layers[layer];
-                if enc.n_positions > 0 {
-                    let decoded = enc.decode();
-                    let hidden = h_hot.shape()[1];
-                    let mut combined = Array2::<f32>::zeros((decoded.shape()[0] + s_hot, hidden));
-                    combined
-                        .slice_mut(s![..decoded.shape()[0], ..])
-                        .assign(&decoded);
-                    combined
-                        .slice_mut(s![decoded.shape()[0].., ..])
-                        .assign(h_hot);
-                    (combined, rs.cold_abs_start)
-                } else {
-                    (h_hot.clone(), hot_abs_start)
-                }
-            } else {
-                (h_hot.clone(), hot_abs_start)
-            };
-            recompute_kv(weights, &h_full, layer, full_abs_start, backend, None)?
-        };
+    for layer in 0..num_layers {
+        // `stored` is push_row-grown, so `shape()[0]` IS the logical hot length.
+        let s_hot = rs.stored[layer].shape()[0];
+        let hot_abs_start = abs_position.saturating_sub(s_hot);
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) = run_attention_block_decode_step_backend(
-            weights,
-            &h_new,
-            layer,
-            Some(&(k_full, v_full)),
-            abs_position,
-            Some(backend),
-        )?;
+        let h_post_attn = if cache_eligible && had_hot_kv {
+            // STEADY STATE (step 2+): append in place into the doubling-capacity
+            // `hot_kv` buffer and attend over the `[..s_hot+1]` views.
+            let bufs = hot_kv_store.as_mut().expect("had_hot_kv");
+            #[cfg(debug_assertions)]
+            {
+                // f32-path parity gate (the Q4K route's projections differ from
+                // f32 `recompute_kv` by >1e-2; it has its own A/B oracle).
+                if !larql_compute::options::q4k_direct_attn_enabled() {
+                    let (k_buf, v_buf) = &bufs[layer];
+                    if let Some((rk, rv)) = recompute_kv(
+                        weights,
+                        &rs.stored[layer],
+                        layer,
+                        hot_abs_start,
+                        backend,
+                        None,
+                    ) {
+                        let kd = k_buf
+                            .slice(s![..s_hot, ..])
+                            .iter()
+                            .zip(rk.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        let vd = v_buf
+                            .slice(s![..s_hot, ..])
+                            .iter()
+                            .zip(rv.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        debug_assert!(kd < 1e-2, "boundary-per-layer hot_kv K diverged: {kd}");
+                        debug_assert!(vd < 1e-2, "boundary-per-layer hot_kv V diverged: {vd}");
+                    }
+                }
+            }
+            let (k_buf, v_buf) = &mut bufs[layer];
+            let inplace = if inplace_enabled {
+                larql_inference::attention::run_attention_block_decode_step_auto_inplace(
+                    weights,
+                    &h_new,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    s_hot,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
+                )
+            } else {
+                None
+            };
+            match inplace {
+                Some(h) => h,
+                None => {
+                    // Q4K-direct off (flags-off parity) or no attn bytes: owned
+                    // concat over the buffer view, then replace.
+                    let prior: SharedKV = (
+                        k_buf.slice(s![..s_hot, ..]).to_owned(),
+                        v_buf.slice(s![..s_hot, ..]).to_owned(),
+                    );
+                    let (h, new_kv) =
+                        larql_inference::attention::run_attention_block_decode_step_auto(
+                            weights,
+                            &h_new,
+                            layer,
+                            Some(&prior),
+                            abs_position,
+                            Some(backend),
+                            idx_kv,
+                        )?;
+                    *k_buf = new_kv.0;
+                    *v_buf = new_kv.1;
+                    h
+                }
+            }
+        } else {
+            // FIRST STEP (cache None → seed) or windowed/cold tier: recompute the
+            // prior K/V, let attention concat the new row, collect it (the
+            // cache_eligible first step seeds `hot_kv`).
+            let h_hot = &rs.stored[layer];
+            let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
+                let (k_cold, v_cold) = &cold_kv[layer];
+                let (k_hot, v_hot) =
+                    recompute_kv(weights, h_hot, layer, hot_abs_start, backend, None)?;
+                let c = k_cold.shape()[0];
+                let kv_dim = k_cold.shape()[1];
+                let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
+                k_combined.slice_mut(s![..c, ..]).assign(k_cold);
+                k_combined.slice_mut(s![c.., ..]).assign(&k_hot);
+                let mut v_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
+                v_combined.slice_mut(s![..c, ..]).assign(v_cold);
+                v_combined.slice_mut(s![c.., ..]).assign(&v_hot);
+                (k_combined, v_combined)
+            } else {
+                let (h_full, full_abs_start) = if let Some(cold_layers) = &rs.cold_encoded {
+                    let enc = &cold_layers[layer];
+                    if enc.n_positions > 0 {
+                        let decoded = enc.decode();
+                        let hidden = h_hot.shape()[1];
+                        let mut combined =
+                            Array2::<f32>::zeros((decoded.shape()[0] + s_hot, hidden));
+                        combined
+                            .slice_mut(s![..decoded.shape()[0], ..])
+                            .assign(&decoded);
+                        combined
+                            .slice_mut(s![decoded.shape()[0].., ..])
+                            .assign(h_hot);
+                        (combined, rs.cold_abs_start)
+                    } else {
+                        (h_hot.clone(), hot_abs_start)
+                    }
+                } else {
+                    (h_hot.clone(), hot_abs_start)
+                };
+                recompute_kv(weights, &h_full, layer, full_abs_start, backend, None)?
+            };
 
-        let h_out = crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, ffn, Some(ffn));
+            let (h_post_attn, new_kv) =
+                larql_inference::attention::run_attention_block_decode_step_auto(
+                    weights,
+                    &h_new,
+                    layer,
+                    Some(&(k_full, v_full)),
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
+                )?;
+            if cache_eligible {
+                step_new_kv.push(new_kv);
+            }
+            h_post_attn
+        };
+
+        let h_out = crate::engines::layer_ffn_or_moe(
+            weights.canonical(),
+            &h_post_attn,
+            layer,
+            ffn,
+            Some(ffn),
+        );
         h_new = h_out;
     }
 
@@ -162,6 +282,17 @@ pub(super) fn run_decode(
             .expect("push_row shape mismatch");
     }
     rs.next_position = abs_position + 1;
+    // Step 2+ mutated `hot_kv_store` in place; the first step seeds it. Cleared
+    // for windowed/cold configs (the recompute path stays canonical there).
+    rs.hot_kv = if cache_eligible {
+        if had_hot_kv {
+            hot_kv_store
+        } else {
+            Some(step_new_kv)
+        }
+    } else {
+        None
+    };
 
     let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
@@ -216,8 +347,15 @@ mod tests {
         let backend = CpuBackend;
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (hidden, rs) = run_prefill(&weights, &ffn, &backend, &policy, None, &[0, 1, 2])
-            .expect("prefill should succeed");
+        let (hidden, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            None,
+            &[0, 1, 2],
+        )
+        .expect("prefill should succeed");
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs.next_position, 3);
         assert!(rs.cold_encoded.is_none());
@@ -233,7 +371,15 @@ mod tests {
         let backend = CpuBackend;
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            Some(2),
+            &[0, 1, 2],
+        )
+        .unwrap();
         assert!(rs.cold_encoded.is_some(), "overflow → cold_encoded");
         assert!(rs.cold_kv.is_some(), "overflow → cold_kv pre-computed");
         let cold_kv = rs.cold_kv.as_ref().unwrap();
@@ -248,10 +394,27 @@ mod tests {
         let backend = CpuBackend;
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(4), &[0]).unwrap();
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            Some(4),
+            &[0],
+        )
+        .unwrap();
         assert!(rs.cold_encoded.is_none());
 
-        let (hidden, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 1).unwrap();
+        let (hidden, rs_after) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            rs,
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs_after.next_position, 2);
         for slab in &rs_after.stored {
@@ -275,8 +438,15 @@ mod tests {
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
 
         // First build a normal state with overflow.
-        let (_, mut rs) =
-            run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        let (_, mut rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            Some(2),
+            &[0, 1, 2],
+        )
+        .unwrap();
         // Now wipe the pre-computed cold_kv. cold_encoded stays
         // populated. Decode should recompute K/V from the decoded
         // cold residuals.
@@ -285,9 +455,82 @@ mod tests {
         assert!(rs.cold_encoded.as_ref().unwrap()[0].n_positions > 0);
 
         let _ = ColdResidualCodec::Bf16; // keep import live
-        let (hidden, _) = run_decode(&weights, &ffn, &backend, &policy, rs, 3)
-            .expect("decode should succeed without cold_kv");
+        let (hidden, _) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            rs,
+            3,
+            None,
+        )
+        .expect("decode should succeed without cold_kv");
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// Flags-ON parity gate for the W2 in-place hot-K/V fast path: an A/B of the
+    /// in-place steady state vs the owned-concat reference, both with Q4K-direct
+    /// attention live. Twin of the markov/codec tests — the two paths must
+    /// produce bit-identical hidden states every step. Serialised on
+    /// `Q4K_FLAG_ENV_LOCK`; the path is selected via the shared
+    /// `LARQL_MARKOV_INPLACE_KV` thread-local override.
+    #[test]
+    fn run_decode_inplace_matches_owned_concat_flags_on() {
+        use crate::engines::markov_residual::compute::set_markov_env_override;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+        let _q4k = crate::engines::Q4kFlagGuard::set(&[
+            (larql_compute::options::ENV_Q4K_DIRECT_ATTN, true),
+            (larql_compute::options::ENV_Q4K_ATTN_INT8, false),
+        ]);
+
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+
+        let run = |inplace: bool| -> (Vec<Vec<u32>>, usize) {
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
+            let (_, mut rs) = run_prefill(
+                larql_inference::WeightsView::dense(&weights),
+                &ffn,
+                &backend,
+                &policy,
+                None,
+                &[0u32, 1, 2],
+            )
+            .unwrap();
+            let mut hiddens = Vec::new();
+            for tok in 3u32..=12 {
+                let (h, rs2) = run_decode(
+                    larql_inference::WeightsView::dense(&weights),
+                    &ffn,
+                    &backend,
+                    &policy,
+                    rs,
+                    tok,
+                    Some(&index),
+                )
+                .unwrap();
+                assert!(h.iter().all(|v| v.is_finite()));
+                hiddens.push(h.iter().map(|v| v.to_bits()).collect());
+                rs = rs2;
+            }
+            (hiddens, rs.next_position)
+        };
+
+        let (a, a_pos) = run(true);
+        let (b, b_pos) = run(false);
+        assert_eq!(a_pos, 13, "3 prompt + 10 decode");
+        assert_eq!(a_pos, b_pos);
+        assert_eq!(
+            a, b,
+            "boundary-per-layer in-place vs owned-concat hidden states diverged"
+        );
     }
 
     #[test]
@@ -298,7 +541,15 @@ mod tests {
         let backend = CpuBackend;
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            Some(2),
+            &[0, 1, 2],
+        )
+        .unwrap();
         let initial = rs
             .cold_encoded
             .as_ref()
@@ -306,7 +557,16 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(initial, 1);
 
-        let (_, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 3).unwrap();
+        let (_, rs_after) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            rs,
+            3,
+            None,
+        )
+        .unwrap();
         let after = rs_after
             .cold_encoded
             .as_ref()
@@ -314,5 +574,54 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(after, 2);
         assert_eq!(rs_after.next_position, 4);
+    }
+
+    /// First-overflow cold-tier initialisation. A prefill that fills the
+    /// window exactly leaves `cold_encoded = None`; the first decode
+    /// pushes past the window, so its overflow row must *initialise*
+    /// `cold_encoded` (the `None` match arm) rather than append to an
+    /// existing one.
+    #[test]
+    fn run_decode_initialises_cold_tier_on_first_overflow() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+
+        // window=2, exactly 2 prompt tokens → fills the window, no overflow.
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            Some(2),
+            &[0, 1],
+        )
+        .unwrap();
+        assert!(
+            rs.cold_encoded.is_none(),
+            "a window-filling prefill must not overflow yet"
+        );
+
+        // First decode overflows by one row → initialises cold_encoded.
+        let (_, rs_after) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &backend,
+            &policy,
+            rs,
+            2,
+            None,
+        )
+        .unwrap();
+        assert!(
+            rs_after.cold_encoded.is_some(),
+            "first decode overflow must initialise the cold tier"
+        );
+        assert_eq!(
+            rs_after.cold_encoded.as_ref().unwrap()[0].n_positions,
+            1,
+            "exactly one row evicted to cold"
+        );
     }
 }

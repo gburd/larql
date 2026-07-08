@@ -16,10 +16,15 @@ enum Stride32Mode {
     First,
 }
 
+/// Our own `LARQL_*` flag — read through `larql_compute::options` so the
+/// thread-local override applies (no `std::env::set_var` in tests, which
+/// races concurrent `getenv` on the decode path → SIGSEGV).
+const ENV_LM_HEAD_STRIDE32: &str = "LARQL_LM_HEAD_STRIDE32";
+
 fn lm_head_stride32_mode() -> Stride32Mode {
-    match std::env::var("LARQL_LM_HEAD_STRIDE32") {
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes") => Stride32Mode::First,
-        Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Stride32Mode::Disabled,
+    match larql_compute::options::env_value(ENV_LM_HEAD_STRIDE32).as_deref() {
+        Some("1") | Some("true") | Some("on") | Some("yes") => Stride32Mode::First,
+        Some("0") | Some("false") | Some("off") | Some("no") => Stride32Mode::Disabled,
         _ => Stride32Mode::Fallback,
     }
 }
@@ -446,39 +451,30 @@ mod tests {
 
     // ── lm_head_stride32_mode ──
 
-    /// RAII env-var override for LARQL_LM_HEAD_STRIDE32. Restores prior
-    /// value on drop.
-    struct EnvSet {
-        prev: Option<String>,
-    }
+    /// RAII override for `LARQL_LM_HEAD_STRIDE32` via the larql-compute
+    /// thread-local override (NOT `std::env::set_var`, which races the
+    /// concurrent `getenv` every parallel decode test does → SIGSEGVs
+    /// libc). Thread-local, so no `#[serial]` needed; cleared on drop.
+    struct EnvSet;
     impl EnvSet {
         fn set(value: Option<&str>) -> Self {
-            let prev = std::env::var("LARQL_LM_HEAD_STRIDE32").ok();
-            match value {
-                Some(v) => std::env::set_var("LARQL_LM_HEAD_STRIDE32", v),
-                None => std::env::remove_var("LARQL_LM_HEAD_STRIDE32"),
-            }
-            Self { prev }
+            larql_compute::options::set_env_override(ENV_LM_HEAD_STRIDE32, value);
+            Self
         }
     }
     impl Drop for EnvSet {
         fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("LARQL_LM_HEAD_STRIDE32", v),
-                None => std::env::remove_var("LARQL_LM_HEAD_STRIDE32"),
-            }
+            larql_compute::options::clear_fast_path_overrides();
         }
     }
 
     #[test]
-    #[serial_test::serial]
     fn stride32_mode_unset_falls_back() {
         let _g = EnvSet::set(None);
         assert_eq!(lm_head_stride32_mode(), Stride32Mode::Fallback);
     }
 
     #[test]
-    #[serial_test::serial]
     fn stride32_mode_truthy_values_select_first() {
         for val in ["1", "true", "on", "yes"] {
             let _g = EnvSet::set(Some(val));
@@ -487,7 +483,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn stride32_mode_falsy_values_select_disabled() {
         for val in ["0", "false", "off", "no"] {
             let _g = EnvSet::set(Some(val));
@@ -500,7 +495,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn stride32_mode_unknown_value_falls_back() {
         let _g = EnvSet::set(Some("maybe"));
         assert_eq!(lm_head_stride32_mode(), Stride32Mode::Fallback);
@@ -515,7 +509,6 @@ mod tests {
     // f32 fallback fires when neither Q4 nor f16 is loaded.
 
     #[test]
-    #[serial_test::serial]
     fn lm_head_knn_backend_falls_back_to_f32_when_no_q4_or_f16() {
         // Stride-32 disabled so the backend tries f16 (none) → f32.
         let _g = EnvSet::set(Some("0"));
@@ -532,7 +525,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn lm_head_knn_backend_skip_q4k_falls_back_to_f32() {
         let _g = EnvSet::set(Some("0"));
         let lm_head: Vec<f32> = vec![
@@ -551,7 +543,6 @@ mod tests {
     /// is loaded on the storage façade. Exercised through the public
     /// `lm_head_knn_backend` with stride32 enabled.
     #[test]
-    #[serial_test::serial]
     fn lm_head_stride32_path_returns_none_without_q4_mmap() {
         let _g = EnvSet::set(Some("1"));
         let lm_head: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
@@ -569,7 +560,6 @@ mod tests {
     /// We force the path by populating the f16 mmap then setting
     /// vocab_size = 0 — the early-return on `vocab > 0` fires.
     #[test]
-    #[serial_test::serial]
     fn lm_head_f16_path_returns_none_when_vocab_zero() {
         let _g = EnvSet::set(Some("0")); // skip stride32
 

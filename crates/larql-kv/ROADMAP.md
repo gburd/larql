@@ -1,5 +1,189 @@
 # Roadmap — larql-kv
 
+## Spin-barrier pool — CPU MoE decode caught llama.cpp (2026-06-13)
+
+After residency closed the byte-traffic gap (06-11/12), a `/usr/bin/sample` of
+live 26B decode showed the remaining ~1.15× was **rayon fork-join overhead**,
+not kernels. The decode driver runs *outside* the global rayon pool, so each of
+the ~211 parallel sections/token took the cold path (`in_worker_cold →
+LockLatch::wait_and_reset → __psynch_cvwait`) and workers slept between sections
+— ~40% of thread-time in wait states.
+
+**Built** [`larql_compute::cpu::spin_pool`](../../larql-compute/src/cpu/spin_pool.rs):
+a llama.cpp-style persistent spin-barrier pool. Workers spin on an epoch counter
+and only `park` after a long idle gap; the dispatcher participates as the n-th
+worker; **static strided chunk ownership** makes `completed == num_chunks` a
+sound barrier (no shared resettable cursor → no stale re-claim across
+back-to-back dispatches — a concurrent-dispatcher test caught that bug); a
+dispatch `Mutex` + thread-local reentrancy guard make it safe for
+`--concurrent`/multi-threaded tests. `par_chunks_mut` / `par_chunks_mut2`
+helpers route a row-chunked parallel-for through the pool, or rayon when
+`LARQL_SPIN_POOL=0`. **Default-on** (see "Decode fast path default-on" — the
+whole Q4K stack ships on, opt out per stage with `=0`); both paths are
+numerically identical, only the threading differs.
+
+**Centralized** the four byte-identical `par_chunks_mut` Q4_K/Q6_K×Q8_K matvec
+copies (larql-compute `cached.rs`, larql-inference `cached.rs`, lm_head ×2 in
+`dense.rs` — the prior "consolidation hazard") into one
+`q4k_q8k_matvec_parallel`, and routed every hot decode section (attention int8
+Q/K/V/O, GQA, dense FFN gate/up/down, geglu, expert fold, lm_head q4 + f32)
+through it — so when enabled the whole token runs on one hot pool.
+
+- **Parity:** 704 compute + 1220 inference + 756 kv green, flags-off AND
+  flags-on (incl. the `predict_kquant` oracles). clippy clean.
+- **Profile after:** rayon eliminated from the hot path — `in_worker_cold`
+  2682→0, `join_context` 10300→0, `wait_until_cold` 4463→9.
+- **Measured** (M3 Max, t=8, warm, tight A/B bracket, flags **inline**):
+  26B short-ctx OFF ~26.9 → ON **33–35**; n=256 OFF ~27.4 → ON **~34.9
+  (+28%)** — vs llama.cpp recorded **32.1** ⇒ ~9% ahead.
+- **Default-on + safe (2026-06-13):** shipped a spin→yield→park backoff (spin
+  the proven window during active decode → yield once a wait outlives a token →
+  park when idle, ~0 CPU; dispatcher unparks on dispatch) so the pool doesn't
+  peg cores between requests — what makes on-by-default safe on a shared box.
+  Also fixed a panic-safety bug (a panicking chunk killed a worker → the
+  barrier spun forever): `catch_unwind` per chunk + re-raise on the dispatcher.
+- **Caveat:** the pool spins during active decode (the win on a dedicated box);
+  under a transient mid-decode load spike a run can still regress (an n=512 ON
+  run hit 10.7 once) — `LARQL_SPIN_POOL=0` falls back to rayon if needed.
+
+## CPU resident fast-path — all engines pluggable into it (2026-06-13)
+
+The 2026-06-11/12 CPU fast-path arc (Q4K-direct + int8 attention, q4k
+lm_head/dense residency, hand-asm kernels, KV append-in-place — see
+`bench/baselines/c10_gemma4-26b-a4b_cpu_reconciled.json`) initially landed
+only on `StandardEngine`: the `KvEngine::decode_step_resident` trait default
+DROPPED the index (`let _ = index`), so every own-walk-loop engine stayed on
+f32 attention. **Fixed:**
+
+- New single-source dispatcher
+  `larql_compute::attention::run_attention_block_decode_step_auto` — makes
+  the same q4k-direct-vs-f32 per-layer choice as
+  `CpuBackend::attention_step`, for callers that own `SharedKV` caches.
+- `markov-rs`, `markov-rs-codec`, `turbo-quant`, `unlimited-context`,
+  `boundary_per_layer` now override `decode_step_resident` and thread the
+  vindex down their walk loops to `_auto`. `boundary-kv` forwards both
+  resident methods to its inner `StandardEngine` (was silently dropping to
+  the f32 path). `no_cache`/`apollo` keep the default by design (debug /
+  bench-only full re-forward).
+- Regression pin: `engines::resident_identity_tests` — for 7 concrete
+  engine specs, `prefill/decode_step_resident` must be BIT-IDENTICAL to
+  `prefill/decode_step` with the flags off, and the covered-engine count
+  must not shrink.
+- **Absolute matrix + slow-engine fixes 2026-06-13** (26B, default-on incl.
+  spin pool, M3 Max t=8 warm n=128). First measured: unlimited 31.8 / standard
+  30.5 / boundary-kv 27.1 (**0.80×→0.89×**, its resident-forwarding fix) /
+  turbo 9.4 / markov 7.8 / codec 7.3 — the recompute/codec engines sat at
+  **~0.24–0.31×** because the spin pool sped up the shared attention/FFN/matvec
+  but not their per-step machinery. **Then fixed all three, feature intact:**
+  - **turbo-quant 9.4 → ~24** — `decompress_matrix`'s per-vector WHT decode was
+    *serial on the driver* (~35% of it); fanned across the spin pool. Still
+    3-4-bit compressed (decoded every step, now parallel) — no memory tradeoff.
+  - **markov-rs 7.8 → 27.9, markov-rs-codec 7.3 → 27.7** — ported the W2 hot-K/V
+    cache to the **resident walk** (`rs_decode_step_inner`/`_codec`): read the
+    cached `hot_kv` and append the free `new_kv` from the attention step instead
+    of `recompute_kv`-ing every position each step. Gated `cache_eligible =
+    max_window.is_none() && no-cold` so it never tracks a window-clip
+    transition; the residual `stored` stays the canonical, re-derivable state
+    (the engine's point), the K/V is a droppable derivative. Parity gate:
+    `#[cfg(debug_assertions)]` assert cached K/V ≡ `recompute_kv` (≤1e-2),
+    exercised by `resident_identity_tests` (extended to a 10-step decode).
+  Final matrix: standard 34.5 / unlimited 32.1 / markov 27.9 / codec 27.7 /
+  boundary-kv 27.4 / turbo 21.1 — all **0.6–1.0× of standard** (was 0.24–0.31×
+  for the slow three). 756 kv tests green debug+release, clippy clean.
+- **Comparative bottleneck review + walk allocation fix 2026-06-14.** Profiled
+  each engine's driver vs standard: the **shared** wall is the Q6_K expert
+  matvec (all engines inherit it); each engine's *delta* is its feature
+  machinery. markov/codec's −19/−20% was NOT the residual-store memcpy (~0.8% of
+  the driver) — it was **per-step allocation churn**: the resident walk's
+  `Array2::zeros((s_old+1, h))` rebuild + the cached-K/V `to_owned`
+  (`__bzero`+`szone_malloc` ≈ 2450 driver samples, idling the worker pool at 48%
+  vs standard's 80%). **Fixed:** the cache_eligible walk now `append_row`s
+  `stored` in place into the W8.2 doubling-capacity buffer (mirrors dispatch.rs)
+  and borrows `hot_kv` into attention via `Cow` instead of copying. Churn
+  collapsed 2450→150 samples (~16×); **markov/standard ratio 0.81×→0.975×, codec
+  0.80×→~1.0×** (same battery state, back-to-back). Parity: resident_identity
+  (markov+codec, 10-step, buffer doubles) bit-exact + debug K/V assert. turbo's
+  −39% is **inherent** (must decode compressed K/V to attend; already
+  parallelized); boundary-kv/unlimited deltas are small (frame-emit/windowing).
+  Remaining markov/codec ~2.5% = walk-attention serial work (shared walk
+  frontier — full K/V concat + generic GQA vs standard's in-place handle).
+- **In-place hot-K/V on the resident walk 2026-06-14 (closes the concat half).**
+  The named ~2.5% above was the walk-attention **owned concat**: the resident
+  walk drove `run_attention_block_decode_step_q4k_direct`, which allocates a
+  fresh `[ctx+1, kv_dim]` K *and* V every layer every step and copies the whole
+  prior cache into it before attending — **O(L²)** cache copy over an L-token
+  generation, vs `standard`'s in-place append handle (O(L)). The split
+  project→append→attend halves already existed for the dispatch path; the walk
+  just didn't use them. **Built** `run_attention_block_decode_step_{q4k_direct,
+  auto}_inplace` (larql-compute `attention/decode.rs`): projects the new row,
+  appends it into the caller's **doubling-capacity** K/V buffer (grows like
+  `stored`), and attends over the `[..len+1]` views — no concat. **Wired**
+  markov_residual + markov_residual_codec resident walks: step-1 still
+  recompute-seeds `hot_kv`; steps 2+ append in place (the steady state). The
+  windowed/cold tiers and the flags-off f32 path keep the owned concat
+  unchanged. Gated `LARQL_MARKOV_INPLACE_KV` (default on; `=0` → owned concat,
+  the A/B reference + escape hatch). **Parity (bit-exact, 4 gates):** compute-
+  level `inplace ≡ q4k_direct` concat across a capacity doubling; engine-level
+  in-place-vs-owned-concat A/B with Q4K-direct **on** for markov *and* codec
+  (hidden states bit-identical every step); `resident_identity` flags-off still
+  green (in-place branch's None-fallback = owned concat); 758 kv + 705 compute +
+  1220 inference green debug & opt, clippy clean. (The debug `hot_kv ≡
+  recompute_kv` assert is gated to the f32 path — the Q4K route's projections
+  differ from `recompute_kv` by >1e-2 even in f32-act; its oracle is the A/B.)
+  The two q4k-flag-mutating tests serialise on `Q4K_FLAG_ENV_LOCK` (those flags
+  read process env on the driver thread — no thread-local). **Perf is
+  structural** (eliminates the O(L²) per-step copy; the win grows with context —
+  it's the long-ctx tax behind the C10 1.29× vs short 1.15×). **Measured (26B,
+  CPU MoE in-process, M3 Max t=8, n=128 warm, `LARQL_MARKOV_INPLACE_KV` A/B,
+  same engine ordering):** markov 32.5→34.5, codec 32.5→34.6 with in-place on —
+  and the three untouched controls (standard/unlimited/turbo) drifted *down*
+  −3/−8/−6% across the A/B (machine warming), so drift-corrected the change is
+  **~+11–12%**. Final warm matrix (in-place on = production default): codec
+  **36.5** / standard 36.0 / markov **36.0** / unlimited 33.3 / boundary-kv 36.5
+  p50 (mean skewed by frame-emit spikes) / turbo 21.2 (inherent) — **markov/codec
+  now AT parity with standard** (was 0.81× at the arc's start), the whole cached
+  cluster **~12% ahead of llama.cpp's 32.1**. Caveat: bench box was at ~58%
+  charging (not cool-dedicated); ordering + A/B *direction* are robust, absolutes
+  drifted ~5–8% run-to-run — a cool-box rerun would firm them. (NB: the first
+  engine in a fresh process eats the 30GB page-in — standard read 21.8 cold,
+  34–36 warm; warm runs are the fair matrix.)
+- **Propagated the in-place lever to the two remaining walk engines + faithfulness
+  audit 2026-06-14.** A full cross-engine spec/contract audit (all 9 engines vs
+  `state-policy.md`'s `(canonical, derivative, contract)` triple) found every
+  engine faithful, and flagged the two siblings still paying the O(L²) owned
+  concat the markov/codec in-place change eliminated:
+  - **boundary_per_layer (was the one NEEDS-FIX)** — carried NO `hot_kv` at all:
+    it `recompute_kv`'d the whole hot tier *and* rebuilt an owned `[ctx+1]` concat
+    every layer every step (worse than markov *pre*-W2). Added a `hot_kv`
+    derivative + the W2-cache + `run_attention_block_decode_step_auto_inplace`
+    steady state, mirroring its twin codec — only active in the `cache_eligible`
+    (unbounded, no cold) path, like codec; the windowed/cold path (its primary
+    purpose) is untouched. `hot_kv` is excluded from `memory_bytes` (droppable
+    derivative, matches markov). Engine-level in-place-vs-owned-concat A/B (q4k on)
+    bit-identical; f32-gated debug `hot_kv ≈ recompute_kv` assert.
+  - **unlimited_context** — its CPU window walk (`extend.rs`) passed the whole
+    window K/V by value → backend re-concats `[n+1]` per layer per step (its own
+    doc admitted "O(window²) total"). Added `rs_extend_inplace` (appends into the
+    window's doubling-capacity buffer, attends over views), wired into
+    `extend_current` only when eligible (index + toggle + q4k); `replay_window` /
+    quant / executor / tests keep the owned concat. The engine's existing
+    `current_window_kv_len` counter already treated the buffers as over-allocated
+    (the dispatch path did), so `close_window`/`current_kv_bytes` needed no change.
+    A/B (q4k on) bit-identical; `resident_identity` flags-off still green.
+  Both reuse the shared `LARQL_MARKOV_INPLACE_KV` toggle + `Q4K_FLAG_ENV_LOCK`.
+  Also: **apollo footgun guard** — `injection_layer < crystal_layer` silently
+  no-ops the retrieval-injection (the compressed forward starts at `crystal`);
+  added a one-time runtime warning in `prepare_injection` (experimental engine,
+  warn-don't-fail). Doc-drift swept: boundary-kv spec now flags `resume` as
+  NOT-IMPLEMENTED (emit half only), apollo spec `KvEngine`→`RetrievalEngine`,
+  `state-policy.md` `fallback_mode` marked retired (per its own §8 resolution).
+  760 kv tests green debug + opt, clippy clean. (Same caveat as above: turbo's
+  −39% is inherent; boundary-kv inherits standard's opts via resident forwarding.)
+
+Prefill stays on the f32 BLAS gemm for all engines deliberately (the task
+#16 prefill falsification: q4k repeated-matvec loses ~20× to AMX at
+prefill shapes).
+
 ## Hardening — codebase review 2026-05-28
 
 From the whole-codebase review ([`docs/audits/codebase-review-2026-05-28.md`](../../../docs/audits/codebase-review-2026-05-28.md)):
@@ -195,6 +379,188 @@ config-injection refactor.
 
 ## Open work
 
+### P0 — codebase-health frontier (audit 2026-06-14)
+
+A whole-codebase review (engine faithfulness audit + clippy/coverage sweep)
+surfaced four "finish-the-started-refactor" items. None is greenfield — the
+ROADMAP already points at #7 and the `LayerExecutor` migration. Ordered by
+risk/leverage; the first is a live correctness bug.
+
+1. **Spin pool under heavy oversubscription — INVESTIGATED, pool is SOUND
+   (2026-06-14).** On a heavily-loaded host (the spin-barrier pool spinning while
+   the user's work pinned every core), the parallel test suite showed *rare*
+   intermittent failures across diverse tests — clean with `LARQL_SPIN_POOL=0`
+   (faster too) and single-threaded, which read as a contention correctness bug.
+   **It is not.** The pool's synchronization was falsified-as-buggy two ways:
+   (a) code analysis — the completion barrier's `completed.fetch_add(Release)` /
+   `load(Acquire)`-on-the-final-count and the `epoch.fetch_add(Release)` /
+   `load(Acquire)` task publication are a correct release/acquire pair, and the
+   static strided ownership + the barrier make the dispatcher wait for every
+   worker before advancing (so `data`/`tramp` can't go stale and cross-dispatch
+   read-after-write is visible); (b) two new stress guards in `spin_pool.rs` —
+   disjoint-write under EXTREME oversubscription (2× burner threads + N
+   concurrent dispatchers + 4000 rounds) and **cross-dispatch read-after-write**
+   under oversubscription — both stayed correct. Several of the "failures" were
+   also misreads: `--nocapture` surfaces `#[should_panic]` and
+   internally-`catch_unwind`'d expected panics (e.g. the empty-haystack
+   `embed` test) that are NOT failures. **ROOT CAUSE FOUND — it was the env
+   race, not the pool.** The decode path reads the q4k flags via `getenv`
+   (`larql_compute::options::fast_path_on`) on every token; several TESTS toggled
+   those flags with `std::env::set_var`, and concurrent `setenv`/`getenv`
+   SIGSEGVs libc (and, short of a crash, returns an *inconsistent* flag mid-test
+   → e.g. the in-place form reads int8-on while the owned-concat form reads
+   int8-off → a bit-identity test "diverges"). Reproduced deterministically:
+   `larql-compute`'s `q4k_direct_decode_step_matches_dequant_path` `set_var`s
+   `LARQL_Q4K_ATTN_INT8` and flaked the sibling `q4k_direct_inplace_is_bit_identical`
+   test. **Fixed:** all q4k `set_var` test sites in BOTH crates (5 in larql-kv,
+   3 in larql-compute) moved to a **thread-local override**
+   (`set_fast_path_override` / `FastPathGuard` / `Q4kFlagGuard`); no test mutates
+   process env for these flags anymore. Both suites now pass clean 3× in parallel
+   (706 compute + 765 kv) under load. The spin pool just amplified the window by
+   slowing runs. **Remaining:** the generic `with_env*` helpers (moe/options
+   tests) still `set_var` *other* vars — same class, folded into the env-sprawl
+   item below. Two spin-pool stress guards (disjoint-write + cross-dispatch
+   read-after-write under oversubscription) stay as regression pins.
+
+2. **Env-var sprawl.** ~141 `LARQL_*` literals across 9 crates, **5 partial
+   registries** with 3 different patterns, no single source. The
+   `set_var`-in-tests pattern is also a **segfault class** — concurrent
+   `setenv`/`getenv` SIGSEGVs libc.
+
+   **Phase 1 — decode fast-path flags registry: DONE (2026-06-14).** Folded the
+   six decode fast-path flags (`LARQL_Q4K_DIRECT_ATTN`/`_ATTN_INT8`/`_LM_HEAD`/
+   `_DIRECT_FFN`/`_ASM`, `LARQL_SPIN_POOL`) — four former per-token `getenv`s +
+   two ad-hoc per-stage `OnceLock`s — into ONE typed `larql_compute::options::
+   DecodeOptions`, `from_env()` once and cached (`decode_options()`); the
+   `*_enabled()` accessors read it (no per-token `getenv`). Tests toggle stages
+   via a **thread-local override** (`set_fast_path_override` / `FastPathGuard` /
+   larql-kv `Q4kFlagGuard`), which wins over the cache — so no test mutates
+   process env for these flags. **All `set_var` sites of these flags migrated**
+   workspace-wide (5 larql-kv + 3 larql-compute + 1 larql-inference) → the
+   segfault/flake class is gone for the decode path; compute 706 + kv 765 +
+   inference 1220 green, stable 3× in parallel, clippy clean.
+
+   **Phase 2a — general override + larql-compute fully migrated: DONE
+   (2026-06-14).** Generalised the thread-local override to ALL of
+   `larql_compute::options`' env helpers (`env_flag`/`env_opt_out`/`env_opt_in`/
+   `env_usize`/`env_value`/`env_nonempty_value`/`env_not_zero_or_default`) via a
+   single `ENV_OVERRIDES` map + an `env_effective(name)` choke point; extracted
+   the `"0"/"true"/…` vocabulary into pure `is_opt_{out,in}_value` parsers
+   (directly unit-tested). Added `set_env_override(name, Option<&str>)` (value
+   override; `set_fast_path_override` is now a bool wrapper). Migrated **every
+   remaining `set_var` test helper in larql-compute** to it — `options`'
+   `with_env_vars`, `moe/forward`'s `with_env`, `moe/expert`'s
+   `with_env_in_thread` (sets the override *inside* the spawned thread so the
+   TLS-cached `Q4K_DIRECT`/`EXPERT_TIMING` reads see it), `dump_config` (now reads
+   via `env_value`/`env_usize`). **larql-compute src now has ZERO `env::set_var`**;
+   707 tests stable 3× in parallel, clippy clean. The crate where the SIGSEGV was
+   demonstrated is now race-free for env.
+
+   **Phase 2b — our-flag migration extended: largely DONE (2026-06-15).**
+   Migrated the our-flag `set_var` test sites in larql-inference (chat,
+   layer_graph/{generate/lm_head,grid/config}, vindex/{walk_ffn,kquant_forward/
+   hidden}, plus the already-done dequant) and larql-lql (executor + compile
+   into_model/into_vindex) to the override (routing raw `std::env::var` reads
+   through `options::*` where needed). compute 707 + kv 765 + inference 1220 +
+   lql 726 + server 306 green, workspace builds + clippy clean.
+
+   **Phase 2b — the remaining `set_var` is NOT override-addressable** (the key
+   finding). ~59 of the ~74 remaining sites are **external/process-global env**:
+   larql-vindex HF (`HF_HOME`/`HF_TOKEN`/`HF_HUB_CACHE`/`HOME`, read by the HF
+   client) and larql-models loading. The thread-local override **cannot** reach
+   them — an external reader uses real `getenv` — so they MUST use `set_var`;
+   they're already **serialised via a per-module `ENV_LOCK` Mutex**, which is the
+   correct (and only) mechanism for process-global env. Leave them (the residual
+   `HOME`-vs-unrelated-`getenv` race is inherent to testing process-global env,
+   not fixable by us). The small genuinely-remaining our-flag tail is all **cold
+   diagnostic/config**, low-risk: `residual_diff/{stages,capture}` (dump-dir +
+   env-save/restore-semantics tests — migrating changes what they test, do with
+   care), cli `diagnostics/parity` (cross-backend: CPU dump vars are now
+   override-aware via `DumpConfig`, the Metal dump var is read by larql-metal so
+   it'd need metal-side routing), server `env_flags` (its own OnceLock-cached
+   accessors — route through `options::*` or accept read-once), and metal
+   `options` `DecodeFlags` tests (separate platform-gated binary). The one PRODUCTION
+   smell — `larql-cli extract_index_cmd.rs` set `LARQL_SUMMARY_FEATURES_PER_EXPERT`
+   as an env **side-channel** into the streaming gate path — is **FIXED**: threaded
+   as a `summary_features_per_expert: usize` parameter from CLI →
+   `build_vindex_streaming` → `StreamingContext` → `down_meta`/`gate_vectors`
+   stages (the ~26 call-site API ripple the env hack was avoiding). The
+   `SummaryEnvGuard` test scaffold and its `#[serial]` are gone; the summary-tier
+   test passes K directly. No `LARQL_SUMMARY_FEATURES_PER_EXPERT` remains anywhere.
+
+   **Phase 2c+ (open, lower-value).** markov cluster: own thread-local override
+   (`read_markov_env`), per-layer uncached but cheap-when-unset — fold into a
+   cached struct + unify with `ENV_OVERRIDES`. `LARQL_MOE_TIMING` read in 4
+   places; collapse the ~7 timing flags → `LARQL_TIMING=…`, dump flags →
+   `LARQL_DUMP*` (user-facing → aliases). `SKIP_MOE` vs `LARQL_SKIP_MOE` are
+   **two different names** (compute `LARQL_SKIP_MOE`, inference `runtime.rs`
+   unprefixed `SKIP_MOE`) — back-compat alias, not a rename. (NB: `LARQL_W10_HONLY`
+   is **NOT** dead — live in the W10 mask cascade; an earlier audit mis-flagged
+   it.) Optional purity: thread `DecodeOptions` through engine signatures to drop
+   the global.
+
+3. **Quantization meshing — finish deferred ROADMAP #7 (`FormatRoute`).**
+   `QuantFormat` exists with helpers (`packed_matrix_bytes`, `packed_block_layout`,
+   `is_kquant_family`) and a clean dispatch point (`backend.quant_matvec`), but
+   hand-rolled fast paths bypass them and re-mesh magic numbers.
+
+   **Step 1 (magic-numbers→helper) — DONE 2026-06-17.** Three production sites that
+   re-derived the packed row stride as `(cols/256)*144`/`*210` now ask the format:
+   - `attention/decode.rs` `q8k_direct_proj` → `packed_matrix_bytes(1, in_dim)`
+     (path already requires `in_dim % 256 == 0`, so identical).
+   - `cpu/ops/q4k_q8k_dot.rs` `q4k_q8k_matvec_parallel` (the *centralized* matvec
+     twin) and `kquant_forward/cached.rs` `matvec_q4k_or_q6k_q8k` — both were
+     **string-keyed** (`format: &str`), so the magic-number and string-table
+     problems converged there. Added `QuantFormat::from_registry_tag(&str)` (the
+     contained version of #7's named helper) and routed both through
+     `from_registry_tag` → `packed_block_layout`/`packed_matrix_bytes`. The
+     centralized twin now parses the tag once and keys its kernel dispatch off the
+     `QuantFormat` (not a second string match). No call-site signature changes.
+     `q4k_q8k_matvec_parallel` keeps the truncating `cols/block_elems` (no `%256`
+     guard there) via `packed_block_layout`; `cached.rs` uses `packed_matrix_bytes`
+     (it guards `%256`). Numerically identical — full larql-compute suite green
+     (33 q8k + 77 decode + 43 kquant + 2 new `from_registry_tag` tests), clippy clean.
+   - `larql-inference/src/vindex/kquant_forward/cached.rs` — the "consolidation
+     hazard twin" the compute dispatcher's own doc-comment names. Both its sites
+     (`matvec_q4k_or_q6k_q8k` row stride + the `down_sb_bytes` per-super-block
+     check) now route through `QuantFormat::from_registry_tag` so the two crates'
+     copies stay in sync. 60 kquant + 46 cached inference tests green.
+
+   *Lower-priority Step-1 tail (deferred, low value):* `q4_common.rs` is the packer
+   where 144/210 are legitimately *defined* (consumer-side strides at 344/350 could
+   still ask the format); the `*18` Q4_0 legacy-block sites (`q4_matvec.rs`,
+   `q4_common.rs:58`, `gpu.rs:512`) are the block-32 equivalent.
+
+   **Remaining offenders (Step 2 territory):** `cpu/ops/moe/expert.rs` is silently
+   **Q4_K-only** (`matches!(format, Q4_K)` + hardcoded `Q4_K_BLOCK_BYTES` at 274/453
+   — these are *named* constants, lesser offense; the real issue is the Q4_K-only
+   dispatch); `pipeline_layer.rs`'s twin `attn_str_to_format`/`ffn_str_to_format`
+   panicking string tables (now subsumable by `from_registry_tag`). **Step 2:** a
+   `QuantFormat::q8k_matvec_into_fn()` kernel table so a new format is ~3 edits, not
+   ~49 files — this generalizes the Q4_K-only dispatchers to any k-quant kernel.
+
+4. **Engine pluggability — finish the `LayerExecutor` migration.** A new engine
+   needs 4 required methods but **~8 boilerplate overrides** (the
+   `*_quant`/`*_resident`/`*_via_executor` cross-product, all of which every
+   shipped engine overrides) + **6 hand-synced registration sites** in
+   `lib.rs` (`EngineKind` variant / `from_name` / `display_name` /
+   `supported_names` / `build_with_profiling` / CLI) — one of them a **duplicate
+   `KvCacheKind` parser** in `larql-cli/run_cmd.rs`. Shared scaffolding exists
+   (`engines::layer_ffn_or_moe`, `run_attention_block_decode_step_auto`,
+   `LocalWalkExecutor`) but each engine still hand-wires its per-layer loop.
+   **Proposal:** one `decode_step_walk` + a `KvEngineState` policy trait (append/
+   read K/V + state-policy hooks) collapses the 8-method cross-product to thin
+   adapters; a `register_engine!` macro (or `inventory`) removes the 6 sites and
+   makes `engine_kind_supported_names_covers_every_variant` unnecessary; delete
+   the duplicate `KvCacheKind` (route `--kv-cache` through `EngineKind::from_name`,
+   which already accepts `standard`/`none`/`markov-bounded`). `AnyEngine`'s
+   hand-written sum-type forwarders should be macro/`enum_dispatch`-generated too.
+
+   **Quick wins** (low-risk, do-now candidates): quant Step 1
+   (magic-numbers→helper), retire `LARQL_W10_HONLY` + fold `SKIP_MOE`, delete the
+   `KvCacheKind` duplicate. The larger refactors (DecodeOptions threading, the
+   engine-walk collapse, the kernel-fn table) are scoped follow-ups.
+
 ### P1 — MoE-aware KV engines (C1) — new 2026-05-28
 
 The KvEngine layer is **dense-only today**: `do_prefill` / `do_decode_step`
@@ -317,16 +683,29 @@ for compressed KV memory at near-standard speed; `unlimited_context` for
 long-context windowed KV (slowest, bounded memory). `no_cache` / `apollo` are not a
 fit (re-forward multiplies round-trips).
 
-**Known limitation:** `unlimited_context`'s archived-window *replay*
-(`replay_window`, fires only on window eviction / long context) passes `None` for
-`moe_ffn` → dense FFN. Correct within a single window (the verified case); a
-long-context MoE run that evicts windows would need replay threaded too. This is the
-only remaining MoE-correctness gap. CLI guard allows the seven verified engines and
-rejects `no-cache` / `apollo` with a clear message.
+**Resolved (2026-06-13):** `unlimited_context::replay_window` now takes
+`moe_ffn` + `index` and threads them to `rs_extend_from_checkpoint_backend`
+(matching the live-window `extend_current` path), so an evicted MoE window
+replays with experts instead of silently falling back to dense FFN. It is a
+standalone utility (no decode-loop caller — the decode path attends to the
+current window + boundary checkpoints, never a full replay), so this was a
+*latent* correctness gap; it is now correct for any caller. Dense callers pass
+`None`/`None`. CLI guard allows the seven verified engines and rejects
+`no-cache` / `apollo` with a clear message.
 
-### ⏭ NEXT — Q4K-direct client decode path (remove the f32 tax) — top engineering lever
+### ✅ DONE / EXCEEDED — Q4K-direct decode path (remove the f32 tax)
 
-**Why now:** the bottleneck diagnosis
+**Status (2026-06-13):** done and the target was blown past. This section's exit
+was "~20–25 tok/s, within ~10% of the ~22 tok/s bandwidth ceiling." Reality:
+the residency stack (Q4K-direct attn/lm_head/ffn + int8 + asm) + KV
+append-in-place + the **spin-barrier pool** took the 26B in-process decode to
+**~35 tok/s — past llama.cpp (32.1)** — and the whole stack now ships
+**default-on** (see ROADMAP.md baseline table + "Spin-barrier pool" above). The
+last lever was *not* the f32→Q4K tax (that was the residency work); it was
+**rayon fork-join overhead** (driver outside the pool), closed by the spin pool.
+Original framing kept below for history.
+
+**Why now (historical):** the bottleneck diagnosis
 ([`docs/diagnoses/remote-moe-bottlenecks.md`](../../docs/diagnoses/remote-moe-bottlenecks.md),
 2026-05-29) measured the remote-MoE decode split on the 26B: **~60% is client-side
 f32 compute** (attention + lm_head + dense FFN, on the dequant-to-f32 BLAS path),

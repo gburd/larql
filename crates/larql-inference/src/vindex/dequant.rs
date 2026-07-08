@@ -23,21 +23,26 @@
 //! See `docs/specs/kv-dispatch-quantization.md`.
 
 use crate::model::ModelWeights;
+use larql_models::DequantScratch;
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 
-/// Dequantise attention Q4K weights (Q, K, V, O) for all layers into
-/// `weights.tensors`. Idempotent — skips layers whose `attn_q_key` is
-/// already present in `weights.tensors`.
+/// Dequantise attention Q4K weights (Q, K, V, O) for all layers into the
+/// engine-owned `scratch` (NOT `weights`, which stays immutable). Idempotent —
+/// skips layers already resolvable (in `scratch` or canonical `weights.tensors`).
 ///
 /// No-op for layers where `index.attn_kquant_layer_data(layer)` returns
 /// `None` (i.e., a layer with non-Q4K attention or no Q4K data at all).
-pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &VectorIndex) {
+pub fn ensure_attn_tensors_dequantised(
+    scratch: &mut DequantScratch,
+    weights: &ModelWeights,
+    index: &VectorIndex,
+) {
     let num_layers = weights.num_layers;
     for layer in 0..num_layers {
         let arch = &*weights.arch;
         let q_key = arch.attn_q_key(layer);
-        if weights.tensors.contains_key(&q_key) {
+        if scratch.contains_key(&q_key) || weights.tensors.contains_key(&q_key) {
             continue;
         }
         let Some(attn) = index.attn_kquant_layer_data(layer) else {
@@ -56,11 +61,25 @@ pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &Vecto
         let w_k = dequantize_matrix(attn[1].0, attn[1].1, kv_dim, hidden);
         let w_v = dequantize_matrix(attn[2].0, attn[2].1, kv_dim, hidden);
         let w_o = dequantize_matrix(attn[3].0, attn[3].1, hidden, q_dim);
-        weights.tensors.insert(q_key, w_q.into_shared());
-        weights.tensors.insert(k_key, w_k.into_shared());
-        weights.tensors.insert(v_key, w_v.into_shared());
-        weights.tensors.insert(o_key, w_o.into_shared());
+        scratch.insert(q_key, w_q.into_shared());
+        scratch.insert(k_key, w_k.into_shared());
+        scratch.insert(v_key, w_v.into_shared());
+        scratch.insert(o_key, w_o.into_shared());
     }
+}
+
+/// Resident variant of [`ensure_attn_tensors_dequantised`] — dequantises the
+/// attention tensors **into `weights.tensors`** (mutating `weights`) rather than
+/// an engine scratch. For the bulk f32-fallback drivers (the vision/image CLI
+/// path, dev tests) that run their forward against canonical `weights.tensors`
+/// and don't thread a [`WeightsView`]. The KvEngine decode path uses the
+/// scratch form + `WeightsView::with_scratch` to keep `ModelWeights` immutable.
+///
+/// [`WeightsView`]: larql_models::WeightsView
+pub fn ensure_attn_tensors_dequantised_resident(weights: &mut ModelWeights, index: &VectorIndex) {
+    let mut scratch = DequantScratch::new();
+    ensure_attn_tensors_dequantised(&mut scratch, weights, index);
+    weights.tensors.extend(scratch);
 }
 
 fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Array2<f32> {
@@ -82,6 +101,26 @@ fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Ar
 mod tests {
     use super::*;
     use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+    /// Pin `LARQL_Q4K_ATTN_INT8=0` for the f32-activation Q4K-direct parity
+    /// tests below: they assert the strict `<1e-3` weight bound, which only the
+    /// f32-activation route satisfies. The int8 route is on by default and
+    /// carries a looser (~2% scale-relative) bound by design. Uses the
+    /// thread-local override (NOT `std::env::set_var`, which races concurrent
+    /// `getenv` on the decode path → SIGSEGV); cleared on drop.
+    struct Int8OffGuard;
+    impl Drop for Int8OffGuard {
+        fn drop(&mut self) {
+            larql_compute::options::clear_fast_path_overrides();
+        }
+    }
+    fn pin_int8_off() -> Int8OffGuard {
+        larql_compute::options::set_fast_path_override(
+            larql_compute::options::ENV_Q4K_ATTN_INT8,
+            false,
+        );
+        Int8OffGuard
+    }
 
     /// `ensure_attn_tensors_dequantised` populates every layer's
     /// Q/K/V/O tensors when the vindex carries Q4K attention bytes.
@@ -111,7 +150,7 @@ mod tests {
             weights.tensors.remove(v);
             weights.tensors.remove(o);
         }
-        ensure_attn_tensors_dequantised(&mut weights, &index);
+        ensure_attn_tensors_dequantised_resident(&mut weights, &index);
         for (l, (q, k, v, o)) in keys.iter().enumerate() {
             assert!(weights.tensors.contains_key(q), "Q missing layer {l}");
             assert!(weights.tensors.contains_key(k), "K missing layer {l}");
@@ -128,13 +167,13 @@ mod tests {
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let q_key = weights.arch.attn_q_key(0);
-        ensure_attn_tensors_dequantised(&mut weights, &index);
+        ensure_attn_tensors_dequantised_resident(&mut weights, &index);
         let q_ptr_before = weights
             .tensors
             .get(&q_key)
             .expect("Q present after first dequant")
             .as_ptr();
-        ensure_attn_tensors_dequantised(&mut weights, &index);
+        ensure_attn_tensors_dequantised_resident(&mut weights, &index);
         let q_ptr_after = weights.tensors.get(&q_key).unwrap().as_ptr();
         assert_eq!(
             q_ptr_before, q_ptr_after,
@@ -155,7 +194,7 @@ mod tests {
         );
         let q_key = weights.arch.attn_q_key(0);
         weights.tensors.remove(&q_key);
-        ensure_attn_tensors_dequantised(&mut weights, &empty_index);
+        ensure_attn_tensors_dequantised_resident(&mut weights, &empty_index);
         assert!(
             !weights.tensors.contains_key(&q_key),
             "no Q4K data → no insert"
@@ -248,7 +287,7 @@ mod tests {
             deq_weights.tensors.remove(v);
             deq_weights.tensors.remove(o);
         }
-        ensure_attn_tensors_dequantised(&mut deq_weights, index);
+        ensure_attn_tensors_dequantised_resident(&mut deq_weights, index);
         deq_weights
     }
 
@@ -269,7 +308,7 @@ mod tests {
 
         for layer in 0..weights.num_layers {
             let (h_deq, (k_deq, v_deq)) = run_attention_block_decode_step_backend(
-                &deq_weights,
+                larql_models::WeightsView::dense(&deq_weights),
                 &h_new,
                 layer,
                 None,
@@ -310,6 +349,7 @@ mod tests {
     /// PARITY GATE (task #16, step 3) — all-Q4_K attn (Q/K/V/O).
     #[test]
     fn q4k_direct_decode_step_matches_q4k_dequant() {
+        let _int8_off = pin_int8_off();
         let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         assert_q4k_direct_matches_dequant(&index);
@@ -320,6 +360,7 @@ mod tests {
     /// dispatch + Q6_K reference dequant that the all-Q4_K fixture never hits.
     #[test]
     fn q4k_direct_decode_step_matches_dequant_with_q6k_v() {
+        let _int8_off = pin_int8_off();
         let weights = make_test_q4k_weights();
         let index = make_attn_vindex_v_as_q6k(&weights);
         assert_q4k_direct_matches_dequant(&index);
@@ -337,6 +378,7 @@ mod tests {
     /// Mixed V=Q6_K index so Q6_K compounds through both sides too.
     #[test]
     fn q4k_direct_decode_multistep_parity_compounds_within_noise() {
+        let _int8_off = pin_int8_off();
         use larql_compute::attention::{
             run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
             SharedKV,
@@ -361,7 +403,7 @@ mod tests {
                 (((j + step) % 11) as f32 - 5.0) * 0.03
             });
             let (h_deq, new_deq) = run_attention_block_decode_step_backend(
-                &deq_weights,
+                larql_models::WeightsView::dense(&deq_weights),
                 &h_new,
                 layer,
                 kv_deq.as_ref(),

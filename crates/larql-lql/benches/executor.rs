@@ -113,6 +113,7 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 

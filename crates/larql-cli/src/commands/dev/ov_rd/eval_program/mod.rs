@@ -254,15 +254,10 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             {
                 h
             } else {
-                larql_inference::vindex::predict_kquant_hidden(
-                    &mut weights,
-                    &token_ids,
-                    &index,
-                    None,
-                )
+                larql_inference::vindex::predict_kquant_hidden(&weights, &token_ids, &index, None)
             }
         } else {
-            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None)
+            larql_inference::vindex::predict_kquant_hidden(&weights, &token_ids, &index, None)
         };
         let baseline_logits = final_logits(&weights, &baseline_h);
         let baseline_logp = log_softmax(&baseline_logits);

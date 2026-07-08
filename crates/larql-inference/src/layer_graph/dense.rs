@@ -23,7 +23,7 @@ impl<'a> LayerGraph for DenseLayerGraph<'a> {
     ) -> Option<LayerOutput> {
         // Attention: dense matmul (Q·K·V), optionally GPU-accelerated
         let (h_post_attn, _attn_proj, attn_weights) = crate::attention::run_attention_block_gpu(
-            weights,
+            larql_models::WeightsView::dense(weights),
             h,
             layer,
             self.capture_attention,

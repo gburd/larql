@@ -39,6 +39,11 @@ pub(super) struct StreamingContext<'a> {
     pub(super) drop_gate_vectors: bool,
     pub(super) extract_level: crate::ExtractLevel,
     pub(super) down_top_k: usize,
+    /// Per-expert summary tier: when `> 0`, cap each expert's gate/down
+    /// feature columns to a top-K (SVD for gate) so many-experts MoE doesn't
+    /// explode. `0` = full per-expert features. Threaded from
+    /// `--summary-features-per-expert` (was an env side-channel).
+    pub(super) summary_features_per_expert: usize,
 
     // Architecture (owned, set in `new`)
     pub(super) arch: Box<dyn larql_models::ModelArchitecture>,
@@ -79,6 +84,7 @@ impl<'a> StreamingContext<'a> {
         model_name: &'a str,
         output_dir: &'a Path,
         down_top_k: usize,
+        summary_features_per_expert: usize,
         extract_level: crate::ExtractLevel,
         dtype: StorageDtype,
         quant: QuantFormat,
@@ -202,6 +208,7 @@ impl<'a> StreamingContext<'a> {
             drop_gate_vectors,
             extract_level,
             down_top_k,
+            summary_features_per_expert,
             arch,
             prefixes,
             num_layers,
@@ -367,5 +374,66 @@ mod tests {
             Err(VindexError::NoSafetensors(_)) => {}
             other => panic!("expected NoSafetensors, got {other:?}"),
         }
+    }
+
+    /// Write `len` filler bytes so size-comparison branches have something
+    /// to rank (the GGUF detector reads `metadata().len()` for the
+    /// largest-file fallback, never the contents).
+    fn write_filler(path: &Path, len: usize) {
+        std::fs::write(path, vec![0u8; len]).unwrap();
+    }
+
+    #[test]
+    fn detect_gguf_entry_returns_single_file_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("model.gguf");
+        write_filler(&gguf, 16);
+
+        let got = detect_gguf_entry(&gguf).unwrap();
+        assert_eq!(got.as_deref(), Some(gguf.as_path()));
+    }
+
+    #[test]
+    fn detect_gguf_entry_returns_none_for_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Path neither a file nor a directory.
+        let got = detect_gguf_entry(&tmp.path().join("does-not-exist")).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn detect_gguf_entry_returns_none_when_dir_has_no_gguf() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(&tmp.path().join("config.json"));
+        touch(&tmp.path().join("model.safetensors"));
+
+        let got = detect_gguf_entry(tmp.path()).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn detect_gguf_entry_prefers_shard1_when_multi_shard_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Shard 1 is deliberately the *smallest* so we prove the
+        // `-00001-of-` name wins over the largest-file fallback.
+        let shard1 = tmp.path().join("model-00001-of-00002.gguf");
+        let shard2 = tmp.path().join("model-00002-of-00002.gguf");
+        write_filler(&shard1, 8);
+        write_filler(&shard2, 512);
+
+        let got = detect_gguf_entry(tmp.path()).unwrap();
+        assert_eq!(got.as_deref(), Some(shard1.as_path()));
+    }
+
+    #[test]
+    fn detect_gguf_entry_falls_back_to_largest_without_shard_naming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let small = tmp.path().join("a.gguf");
+        let large = tmp.path().join("b.gguf");
+        write_filler(&small, 32);
+        write_filler(&large, 4096);
+
+        let got = detect_gguf_entry(tmp.path()).unwrap();
+        assert_eq!(got.as_deref(), Some(large.as_path()));
     }
 }

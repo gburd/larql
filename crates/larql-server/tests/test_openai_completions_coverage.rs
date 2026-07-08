@@ -154,13 +154,37 @@ async fn completions_batched_non_stream_runs_loop_branch() {
 
 #[tokio::test]
 async fn completions_streaming_single_prompt_returns_sse() {
-    let resp = post_completions(serde_json::json!({
-        "model": "synthetic",
-        "prompt": "x",
-        "max_tokens": 2,
-        "stream": true,
-    }))
-    .await;
+    // NB: unlike the buffered tests, the streaming handler returns its SSE
+    // response *before* generation runs — the `spawn_blocking` closure reads
+    // the model weights lazily while the client drains the body. So the model
+    // fixture (the temp weight files) MUST stay alive across the drain;
+    // `post_completions` drops it on return, which would delete the weights
+    // out from under the still-running generator and leave the entire
+    // streaming closure uncovered (the flaky-on-CI region). Hold `_fixture`
+    // explicitly here.
+    let (model, _fixture) = common::model_with_q4k_weights("synthetic");
+    let state = common::state(vec![model]);
+    let app = larql_server::routes::single_model_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model": "synthetic",
+                        "prompt": "x",
+                        "max_tokens": 2,
+                        "stream": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
     // Streaming starts as 200 with SSE content-type.
     assert_eq!(resp.status(), StatusCode::OK);
     let ct = resp
@@ -172,10 +196,9 @@ async fn completions_streaming_single_prompt_returns_sse() {
         ct.contains("event-stream"),
         "expected SSE content-type, got {ct}"
     );
-    // Drain the full body so spawn_blocking has time to emit every
-    // chunk through ReceiverStream — without a complete drain the
-    // background task drops early and the per-token branches stay
-    // uncovered.
+    // Drain the full body so the spawn_blocking generator runs to completion
+    // (emitting every chunk through ReceiverStream) with the weights still on
+    // disk — this is what covers the streaming closure's per-token branches.
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -185,8 +208,7 @@ async fn completions_streaming_single_prompt_returns_sse() {
         body_str.contains("[DONE]"),
         "SSE stream must terminate with [DONE]; got {body_str:?}"
     );
-    eprintln!("SSE body length: {}", body_str.len());
-    eprintln!("SSE body sample: {}", &body_str[..body_str.len().min(500)]);
+    drop(_fixture);
 }
 
 #[tokio::test]

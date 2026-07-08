@@ -593,7 +593,7 @@ fn run_layer_diff(
     let _ = index.load_lm_head_kquant(path);
     let tokenizer = larql_vindex::load_vindex_tokenizer(path)?;
     let mut w_metal = larql_vindex::load_model_weights_kquant(path, &mut cb)?;
-    let mut w_cpu = larql_vindex::load_model_weights_kquant(path, &mut cb)?;
+    let w_cpu = larql_vindex::load_model_weights_kquant(path, &mut cb)?;
 
     let wrapped = larql_inference::wrap_chat_prompt(path, Some(config.model.as_str()), prompt);
     let token_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrapped.prompt)?;
@@ -642,7 +642,7 @@ fn run_layer_diff(
     std::env::set_var("LARQL_CPU_DUMP_LAYERS", cpu_path);
     std::env::set_var("LARQL_CPU_STAGE_DUMP", cpu_path);
     println!("Running CPU…");
-    predict_kquant_hidden(&mut w_cpu, &token_ids, &index, None);
+    predict_kquant_hidden(&w_cpu, &token_ids, &index, None);
     std::env::remove_var("LARQL_CPU_DUMP_LAYERS");
     std::env::remove_var("LARQL_CPU_STAGE_DUMP");
 

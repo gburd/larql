@@ -142,6 +142,42 @@ impl RelationClassifier {
             .collect()
     }
 
+    /// Known relation labels ranked by how many features carry each (probe
+    /// labels per-feature, cluster labels by cluster size), most-common first,
+    /// keeping the top `top_n`. The frequency-ordered analogue of
+    /// [`Self::relation_labels`] (which is alphabetical).
+    ///
+    /// FR3b's explicit classifier needs the *meaningful* relations in its
+    /// candidate set — "language", "capital", "currency". An alphabetical
+    /// top-N silently drops them (e.g. keeps a rare early-alphabet label while
+    /// cutting "language"), which made "mother tongue" fail to resolve while a
+    /// niche relation survived. Ranking by frequency keeps the relations that
+    /// actually populate the index and lets the `none` escape work (rare labels
+    /// fall out, so an out-of-domain word finds no plausible match).
+    pub fn relation_labels_ranked(&self, top_n: usize) -> Vec<String> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        if let Some(clusters) = self.clusters.as_ref() {
+            for (i, l) in clusters.labels.iter().enumerate() {
+                *counts.entry(l.clone()).or_insert(0) +=
+                    clusters.counts.get(i).copied().unwrap_or(0);
+            }
+        }
+        for l in self.probe_labels.values() {
+            *counts.entry(l.clone()).or_insert(0) += 1;
+        }
+        let mut ranked: Vec<(String, usize)> = counts
+            .into_iter()
+            .filter(|(l, _)| {
+                let t = l.trim();
+                !t.is_empty() && !t.eq_ignore_ascii_case("unknown")
+            })
+            .collect();
+        // Most-common first; alphabetical tie-break for determinism.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(top_n);
+        ranked.into_iter().map(|(l, _)| l).collect()
+    }
+
     /// Check whether a feature's label is probe-confirmed (vs cluster-assigned).
     pub fn is_probe_label(&self, layer: usize, feature: usize) -> bool {
         self.probe_labels.contains_key(&(layer, feature))
@@ -390,6 +426,41 @@ mod tests {
             probe_count: 0,
         };
         assert!(rc.relation_labels().is_empty());
+    }
+
+    // ── relation_labels_ranked (FR3b explicit candidate set) ──
+
+    #[test]
+    fn relation_labels_ranked_orders_by_feature_count_and_caps() {
+        // Clusters give capital=100/language=80/continent=60; add a probe
+        // label "currency" on three features (count 3, the rarest). Ranking is
+        // most-common first, and top_n caps the tail (currency drops at n=3).
+        let mut rc = make_test_classifier();
+        rc.probe_labels.insert((1, 1), "currency".into());
+        rc.probe_labels.insert((2, 2), "currency".into());
+        rc.probe_labels.insert((3, 3), "currency".into());
+        rc.probe_count = rc.probe_labels.len();
+
+        assert_eq!(
+            rc.relation_labels_ranked(10),
+            vec!["capital", "language", "continent", "currency"],
+        );
+        // The cap keeps the *meaningful* (frequent) head, drops the rare tail —
+        // the property alphabetical truncation lacked.
+        assert_eq!(
+            rc.relation_labels_ranked(3),
+            vec!["capital", "language", "continent"],
+        );
+    }
+
+    #[test]
+    fn relation_labels_ranked_filters_empty_and_unknown() {
+        let mut rc = make_test_classifier();
+        if let Some(c) = rc.clusters.as_mut() {
+            c.labels = vec!["capital".into(), "".into(), "unknown".into()];
+            c.counts = vec![100, 50, 50];
+        }
+        assert_eq!(rc.relation_labels_ranked(10), vec!["capital"]);
     }
 
     #[test]

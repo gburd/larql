@@ -170,10 +170,16 @@ pub fn render_user_prompt(
     family: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let raw_prompt = std::env::var(ENV_RAW_PROMPT).is_ok();
-    let enable_thinking = std::env::var(ENV_THINKING).is_ok();
-    let user_system = std::env::var(ENV_SYSTEM).ok();
-    let suppress_default = std::env::var(ENV_NO_DEFAULT_SYSTEM).is_ok();
+    // Read through the override-aware helpers (NOT raw `std::env::var`) so
+    // tests can toggle these per-thread without `std::env::set_var`, which
+    // races concurrent `getenv` on the decode path and SIGSEGVs libc.
+    // `env_flag` matches the old `var(_).is_ok()` (set, even empty) and
+    // `env_value` matches `var(_).ok()`.
+    use larql_compute::options::{env_flag, env_value};
+    let raw_prompt = env_flag(ENV_RAW_PROMPT);
+    let enable_thinking = env_flag(ENV_THINKING);
+    let user_system = env_value(ENV_SYSTEM);
+    let suppress_default = env_flag(ENV_NO_DEFAULT_SYSTEM);
 
     if raw_prompt {
         return Ok(user_prompt.to_string());
@@ -400,47 +406,55 @@ mod integration_tests {
         assert!(read_chat_template(tmp.path()).is_none());
     }
 
-    // ── render_user_prompt — serialised via mutex because the function
-    //    reads process-global env vars that other tests would race on. ────
-    use std::sync::{Mutex, OnceLock};
+    // ── render_user_prompt — `render_user_prompt` reads its prompt-affecting
+    //    env vars through the override-aware `larql_compute::options` helpers,
+    //    so tests toggle them per-thread (NOT `std::env::set_var`, which races
+    //    concurrent `getenv` on the decode path → SIGSEGV). No global lock is
+    //    needed: each test's overrides are thread-local and cleared on drop. ──
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// RAII guard that pins the prompt-affecting env vars on the current
+    /// thread (all unset by default, then any caller-supplied values) and
+    /// clears every override on drop. Panic-safe; needs no lock.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            larql_compute::options::clear_fast_path_overrides();
+        }
     }
-
-    /// Helper: clear all prompt-affecting env vars while holding the
-    /// global lock. Returns the lock guard so the caller's mutations
-    /// stay isolated for the rest of the test.
-    fn lock_and_clear_env() -> std::sync::MutexGuard<'static, ()> {
-        // Recover from a poisoned lock (a panicking earlier test) — we
-        // just want serialisation, not panic propagation.
-        let guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    /// Clear all prompt-affecting env vars on this thread (overrides them to
+    /// "unset"), then set any caller-supplied values. Returns the guard so the
+    /// overrides stay live for the rest of the test and are cleared on drop.
+    fn lock_and_clear_env_with(vars: &[(&'static str, &str)]) -> EnvGuard {
         for k in [
             ENV_RAW_PROMPT,
             ENV_THINKING,
             ENV_SYSTEM,
             ENV_NO_DEFAULT_SYSTEM,
         ] {
-            unsafe { std::env::remove_var(k) };
+            larql_compute::options::set_env_override(k, None);
         }
-        guard
+        for &(name, value) in vars {
+            larql_compute::options::set_env_override(name, Some(value));
+        }
+        EnvGuard
+    }
+
+    /// Convenience for the common "clear everything, set nothing" case.
+    fn lock_and_clear_env() -> EnvGuard {
+        lock_and_clear_env_with(&[])
     }
 
     #[test]
     fn render_user_prompt_passes_through_when_raw_env_set() {
-        let _g = lock_and_clear_env();
-        unsafe { std::env::set_var(ENV_RAW_PROMPT, "1") };
+        let _g = lock_and_clear_env_with(&[(ENV_RAW_PROMPT, "1")]);
         let tmp = tempfile::tempdir().unwrap();
         let result = render_user_prompt(tmp.path(), "tinymodel", "hello").unwrap();
-        unsafe { std::env::remove_var(ENV_RAW_PROMPT) };
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn render_user_prompt_uses_vindex_template_when_no_system() {
-        let _g = lock_and_clear_env();
-        unsafe { std::env::set_var(ENV_NO_DEFAULT_SYSTEM, "1") };
+        let _g = lock_and_clear_env_with(&[(ENV_NO_DEFAULT_SYSTEM, "1")]);
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("chat_template.jinja"),
@@ -448,17 +462,14 @@ mod integration_tests {
         )
         .unwrap();
         let result = render_user_prompt(tmp.path(), "tinymodel", "hi");
-        unsafe { std::env::remove_var(ENV_NO_DEFAULT_SYSTEM) };
         assert_eq!(result.unwrap(), "WRAP:hi");
     }
 
     #[test]
     fn render_user_prompt_errors_when_no_template_and_system_requested() {
-        let _g = lock_and_clear_env();
-        unsafe { std::env::set_var(ENV_SYSTEM, "you are helpful") };
+        let _g = lock_and_clear_env_with(&[(ENV_SYSTEM, "you are helpful")]);
         let tmp = tempfile::tempdir().unwrap();
         let err = render_user_prompt(tmp.path(), "unknown-family", "hi");
-        unsafe { std::env::remove_var(ENV_SYSTEM) };
         let msg = err.unwrap_err();
         assert!(
             msg.contains("no chat template"),
@@ -468,8 +479,7 @@ mod integration_tests {
 
     #[test]
     fn render_user_prompt_renders_with_explicit_system_message() {
-        let _g = lock_and_clear_env();
-        unsafe { std::env::set_var(ENV_SYSTEM, "you are helpful") };
+        let _g = lock_and_clear_env_with(&[(ENV_SYSTEM, "you are helpful")]);
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("chat_template.jinja"),
@@ -477,7 +487,6 @@ mod integration_tests {
         )
         .unwrap();
         let result = render_user_prompt(tmp.path(), "tinymodel", "hi");
-        unsafe { std::env::remove_var(ENV_SYSTEM) };
         let s = result.unwrap();
         assert!(s.contains("<system>you are helpful"));
         assert!(s.contains("<user>hi"));
@@ -485,8 +494,7 @@ mod integration_tests {
 
     #[test]
     fn render_user_prompt_uses_family_default_when_thinking_set() {
-        let _g = lock_and_clear_env();
-        unsafe { std::env::set_var(ENV_THINKING, "1") };
+        let _g = lock_and_clear_env_with(&[(ENV_THINKING, "1")]);
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("chat_template.jinja"),
@@ -494,7 +502,6 @@ mod integration_tests {
         )
         .unwrap();
         let result = render_user_prompt(tmp.path(), "gemma4", "hi");
-        unsafe { std::env::remove_var(ENV_THINKING) };
         let s = result.unwrap();
         assert!(s.contains("<system>"));
         assert!(s.contains("<user>hi"));

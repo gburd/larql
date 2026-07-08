@@ -1,0 +1,1 @@
+{"experiment":"fr_early_exit_decode_projection","vindex":"output/gemma3-4b-q4k-v2.vindex","install_layer":24,"num_layers":34,"fired":12,"full_ms":466.4905,"early_ms":344.9526,"per_token_speedup":1.3523}

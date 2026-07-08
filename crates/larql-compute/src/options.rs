@@ -5,6 +5,23 @@
 //! explicit options struct; this module is the compatibility bridge while those
 //! APIs are split out.
 //!
+//! ## Environment-variable surface (the categories)
+//!
+//! - **Decode fast path — default ON, opt out with `=0`.** The shipped CPU
+//!   decode default; you do *not* set anything to go fast. Resolvers:
+//!   [`q4k_direct_attn_enabled`], [`q4k_attn_int8_enabled`],
+//!   [`q4k_lm_head_enabled`], [`q4k_direct_ffn_enabled`], [`q4k_asm_enabled`],
+//!   [`spin_pool_enabled`] (env `LARQL_Q4K_*`, `LARQL_SPIN_POOL`). Set any to
+//!   `0`/`false`/`off`/`no` to force the f32/rayon path (A/B, kernel debug).
+//! - **Diagnostics / dumps — presence = on** (`env_flag`): the `LARQL_*_DUMP_*`,
+//!   `*_TIMING`, `LARQL_PROFILE_SPLIT`, `LARQL_DECODE_STAGES`,
+//!   `LARQL_VINDEX_DESCRIBE`, `LARQL_MOE_DEBUG` toggles. Off unless set.
+//! - **Retained comparison knobs** (ADR-017 shader/kernel retention): the
+//!   fused-shader flags (`LARQL_QKV_FUSED`, `LARQL_FUSED_*`) and the `asm_v2`
+//!   bench arm — deliberately kept for A/B, *not* dead code.
+//! - **Config / paths / experiment / test** live with their feature, not here
+//!   (`HF_*`, `LARQL_HOME`, `LARQL_MODEL`, `LARQL_MEMIT_*`, `LARQL_TEST_*`, …).
+//!
 //! ## Helper taxonomy — pick the matching one for the flag's intended default
 //!
 //! Mixing these on the same env var is the bug class flagged in the
@@ -49,14 +66,10 @@ pub const ENV_DISABLE_Q4K_DIRECT: &str = "LARQL_DISABLE_Q4K_DIRECT";
 pub const ENV_Q4K_DIRECT: &str = "LARQL_Q4K_DIRECT";
 /// Max entries in the dequantised MoE expert cache.
 pub const ENV_MOE_CACHE_ENTRIES: &str = "LARQL_MOE_CACHE_ENTRIES";
-/// Namespaced MoE bypass toggle.
+/// MoE bypass toggle (diagnostic).
 pub const ENV_SKIP_MOE: &str = "LARQL_SKIP_MOE";
-/// Legacy MoE bypass toggle. Prefer [`ENV_SKIP_MOE`] in new scripts.
-pub const ENV_SKIP_MOE_LEGACY: &str = "SKIP_MOE";
-/// Namespaced MoE route/debug output toggle.
+/// MoE route/debug output toggle.
 pub const ENV_MOE_DEBUG: &str = "LARQL_MOE_DEBUG";
-/// Legacy MoE route/debug output toggle. Prefer [`ENV_MOE_DEBUG`].
-pub const ENV_MOE_DEBUG_LEGACY: &str = "MOE_DEBUG";
 /// Enable Metal MoE dispatch timing.
 pub const ENV_METAL_MOE_TIMING: &str = "LARQL_MOE_TIMING";
 /// Select the 8-simdgroup Q4_K matvec kernel; set to a false value to opt out.
@@ -119,10 +132,197 @@ pub const ENV_STAGE_DUMP_LAYER: &str = "LARQL_STAGE_DUMP_LAYER";
 pub const ENV_GPU_TIMING: &str = "LARQL_GPU_TIMING";
 /// Request paired commit/wait decode stage profiling.
 pub const ENV_PROFILE_SPLIT: &str = "LARQL_PROFILE_SPLIT";
-/// Legacy alias for [`ENV_PROFILE_SPLIT`].
-pub const ENV_DECODE_STAGE_TIMING: &str = "LARQL_DECODE_STAGE_TIMING";
 /// Debug-only outer norm bypass in Metal MoE combine.
 pub const ENV_SKIP_OUTER_NORM: &str = "SKIP_OUTER_NORM";
+
+// ── CPU decode fast path — default ON, opt out with `=0` ─────────────────────
+//
+// These graduated from opt-in experiments (2026-06) to the shipped default:
+// together they take CPU MoE decode from ~7 tok/s (f32 fallback) to ~35 on the
+// 26B-A4B, parity-safe, with per-layer/format fallbacks (a layer/model that
+// can't take the fast route silently uses the f32 one). Disable any single
+// stage with `LARQL_<NAME>=0` (also accepts `false`/`off`/`no`) — e.g. for an
+// A/B against the f32 path or to debug a kernel.
+//
+/// Q4_K-direct attention projections (read Q4_K weights straight from the index
+/// instead of dequantising to f32 first).
+pub const ENV_Q4K_DIRECT_ATTN: &str = "LARQL_Q4K_DIRECT_ATTN";
+/// Int8 (Q8_K) activation route for the Q4_K-direct attention projections.
+pub const ENV_Q4K_ATTN_INT8: &str = "LARQL_Q4K_ATTN_INT8";
+/// Q4_K lm_head (vocab projection straight from the Q4_K view; ~4× the
+/// bandwidth of the f32 head). Falls back to f32 when no Q4_K head view exists.
+pub const ENV_Q4K_LM_HEAD: &str = "LARQL_Q4K_LM_HEAD";
+/// Q4_K-direct dense-FFN slab on the decode path (prefill stays f32 gemm).
+pub const ENV_Q4K_DIRECT_FFN: &str = "LARQL_Q4K_DIRECT_FFN";
+/// Hand-asm aarch64 Q4_K/Q6_K × Q8_K kernels (bit-exact with the intrinsic path).
+pub const ENV_Q4K_ASM: &str = "LARQL_Q4K_ASM";
+/// Spin-barrier thread pool for the decode hot path (vs rayon's sleeping pool).
+pub const ENV_SPIN_POOL: &str = "LARQL_SPIN_POOL";
+
+thread_local! {
+    /// Per-thread override for env-var reads ([`env_override`]). Tests inject
+    /// values here to toggle a flag WITHOUT `std::env::set_var`, which is
+    /// thread-unsafe against the concurrent `getenv` every other parallel test
+    /// does on the decode path — that race SIGSEGVs libc. Each entry is the raw
+    /// value the env helper should see: `Some("v")` = "set to v", `None` = "act
+    /// as if unset". Production never touches this; the map is empty so every
+    /// helper falls through to the process env unchanged.
+    static ENV_OVERRIDES: std::cell::RefCell<
+        std::collections::HashMap<&'static str, Option<String>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The current thread's test override for `name`, if any. The outer `Option`
+/// tells overridden-vs-not; the inner is the (possibly-unset) raw value.
+fn env_override(name: &str) -> Option<Option<String>> {
+    ENV_OVERRIDES.with(|o| o.borrow().get(name).cloned())
+}
+
+/// Effective raw value for `name`: the thread-local override if present, else
+/// the process env. The single choke point every env helper reads through.
+fn env_effective(name: &str) -> Option<String> {
+    match env_override(name) {
+        Some(v) => v,
+        None => std::env::var(name).ok(),
+    }
+}
+
+// ── Pure value parsers (no env) — directly unit-tested; the env helpers below
+//    just feed them the effective raw value. Keeps the "0"/"true"/… vocabulary
+//    in one place and testable without touching process env.
+fn is_opt_out_value(v: Option<&str>) -> bool {
+    matches!(v, Some("0") | Some("false") | Some("off") | Some("no"))
+}
+fn is_opt_in_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("on") | Some("yes"))
+}
+
+/// The current thread's override for a fast-path stage flag as a bool, if set.
+/// `None` in production → the accessor uses the cached [`decode_options`] value.
+fn fast_path_override(name: &'static str) -> Option<bool> {
+    env_override(name).map(|v| !is_opt_out_value(v.as_deref()))
+}
+
+/// Override an env flag on the current thread to a raw string value (`Some`) or
+/// unset (`None`) — test-only escape hatch ([`ENV_OVERRIDES`]). Lets tests
+/// toggle any flag without process-global env mutation (which segfaults under
+/// parallel `getenv`). Clear with [`clear_fast_path_overrides`] on teardown.
+#[doc(hidden)]
+pub fn set_env_override(name: &'static str, value: Option<&str>) {
+    ENV_OVERRIDES.with(|o| {
+        o.borrow_mut().insert(name, value.map(str::to_string));
+    });
+}
+
+/// Override a decode fast-path stage flag on the current thread (test-only).
+/// Bool convenience over [`set_env_override`] (`true` → `"1"`, `false` → `"0"`).
+#[doc(hidden)]
+pub fn set_fast_path_override(name: &'static str, on: bool) {
+    set_env_override(name, Some(if on { "1" } else { "0" }));
+}
+
+/// Clear all thread-local env overrides (test-only).
+#[doc(hidden)]
+pub fn clear_fast_path_overrides() {
+    ENV_OVERRIDES.with(|o| o.borrow_mut().clear());
+}
+
+/// RAII guard that sets fast-path stage overrides on the current thread and
+/// clears them on drop (test-only). Replaces the `std::env::set_var` pattern,
+/// which races concurrent `getenv` on the decode path and SIGSEGVs libc.
+#[cfg(test)]
+pub(crate) struct FastPathGuard;
+
+#[cfg(test)]
+impl FastPathGuard {
+    pub(crate) fn set(flags: &[(&'static str, bool)]) -> Self {
+        for &(name, on) in flags {
+            set_fast_path_override(name, on);
+        }
+        FastPathGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for FastPathGuard {
+    fn drop(&mut self) {
+        clear_fast_path_overrides();
+    }
+}
+
+/// The decode fast-path stage flags — the single source of truth for "which
+/// decode stages are on". Read ONCE from the process env at first use and
+/// cached (see [`decode_options`]); each stage is default-ON, opt out with
+/// `LARQL_<X>=0`. This folds what were four per-token `getenv`s and two ad-hoc
+/// per-stage `OnceLock`s (`asm`, `spin_pool`) into one typed registry. Tests
+/// toggle stages per-thread via [`set_fast_path_override`] (no `set_var`, which
+/// races the per-token `getenv` and SIGSEGVs libc), and the override wins over
+/// this cache.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeOptions {
+    /// Q4_K-direct attention projections (read Q4_K bytes from the index).
+    pub q4k_direct_attn: bool,
+    /// Int8 (Q8_K) activation route for the Q4_K-direct attention projections.
+    pub q4k_attn_int8: bool,
+    /// Q4_K lm_head (vocab projection straight from the Q4_K view).
+    pub q4k_lm_head: bool,
+    /// Q4_K-direct dense-FFN decode slab (prefill stays f32 gemm).
+    pub q4k_direct_ffn: bool,
+    /// Hand-asm aarch64 Q4_K/Q6_K kernels (bit-exact with the intrinsic path).
+    pub q4k_asm: bool,
+    /// Spin-barrier thread pool for the decode hot path (vs rayon's pool).
+    pub spin_pool: bool,
+}
+
+impl DecodeOptions {
+    fn from_env() -> Self {
+        // RAW process env (bypass the per-thread override): this is the
+        // process-wide cached production value, and a test's thread-local
+        // override must not be baked into it (the accessors apply the override
+        // per-call instead, via `fast_path_override`).
+        let on = |name: &str| !is_opt_out_value(std::env::var(name).ok().as_deref());
+        Self {
+            q4k_direct_attn: on(ENV_Q4K_DIRECT_ATTN),
+            q4k_attn_int8: on(ENV_Q4K_ATTN_INT8),
+            q4k_lm_head: on(ENV_Q4K_LM_HEAD),
+            q4k_direct_ffn: on(ENV_Q4K_DIRECT_FFN),
+            q4k_asm: on(ENV_Q4K_ASM),
+            spin_pool: on(ENV_SPIN_POOL),
+        }
+    }
+}
+
+/// Process-wide decode fast-path flags, built from env on first use and cached.
+/// The single registry the per-stage `*_enabled()` accessors read.
+pub fn decode_options() -> &'static DecodeOptions {
+    static OPTS: std::sync::OnceLock<DecodeOptions> = std::sync::OnceLock::new();
+    OPTS.get_or_init(DecodeOptions::from_env)
+}
+
+/// Q4_K-direct attention projections enabled (default on).
+pub fn q4k_direct_attn_enabled() -> bool {
+    fast_path_override(ENV_Q4K_DIRECT_ATTN).unwrap_or(decode_options().q4k_direct_attn)
+}
+/// Int8 attention projection route enabled (default on).
+pub fn q4k_attn_int8_enabled() -> bool {
+    fast_path_override(ENV_Q4K_ATTN_INT8).unwrap_or(decode_options().q4k_attn_int8)
+}
+/// Q4_K lm_head enabled (default on; falls back to f32 without a head view).
+pub fn q4k_lm_head_enabled() -> bool {
+    fast_path_override(ENV_Q4K_LM_HEAD).unwrap_or(decode_options().q4k_lm_head)
+}
+/// Q4_K-direct dense-FFN decode slab enabled (default on).
+pub fn q4k_direct_ffn_enabled() -> bool {
+    fast_path_override(ENV_Q4K_DIRECT_FFN).unwrap_or(decode_options().q4k_direct_ffn)
+}
+/// Hand-asm Q4_K/Q6_K kernels enabled (default on; aarch64 only).
+pub fn q4k_asm_enabled() -> bool {
+    fast_path_override(ENV_Q4K_ASM).unwrap_or(decode_options().q4k_asm)
+}
+/// Spin-barrier decode pool enabled (default on).
+pub fn spin_pool_enabled() -> bool {
+    fast_path_override(ENV_SPIN_POOL).unwrap_or(decode_options().spin_pool)
+}
 
 // Helpers below are `pub` (not `pub(crate)`) because sibling backend
 // crates (`larql-compute-metal`, future `larql-compute-vulkan`, …)
@@ -131,8 +331,15 @@ pub const ENV_SKIP_OUTER_NORM: &str = "SKIP_OUTER_NORM";
 // `env::var_os`/`parse::<usize>` boilerplate and risk drift in how
 // "set" / "true" / "1" are interpreted across backends.
 
+// All of these read through `env_effective` so the thread-local test override
+// applies uniformly (no `std::env::set_var` in tests → no `setenv`/`getenv`
+// SIGSEGV race). In production the override map is empty, so each is exactly
+// the prior `std::env::var*` read.
 pub fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some()
+    match env_override(name) {
+        Some(v) => v.is_some(),
+        None => std::env::var_os(name).is_some(),
+    }
 }
 
 pub fn env_flag_any(names: &[&str]) -> bool {
@@ -140,11 +347,11 @@ pub fn env_flag_any(names: &[&str]) -> bool {
 }
 
 pub fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.parse().ok()
+    env_effective(name)?.parse().ok()
 }
 
 pub fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+    env_effective(name)
 }
 
 pub fn env_nonempty_value(name: &str) -> Option<String> {
@@ -152,67 +359,70 @@ pub fn env_nonempty_value(name: &str) -> Option<String> {
 }
 
 pub fn env_opt_in(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-    )
+    is_opt_in_value(env_effective(name).as_deref())
 }
 
 pub fn env_opt_out(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("0") | Ok("false") | Ok("off") | Ok("no")
-    )
+    is_opt_out_value(env_effective(name).as_deref())
 }
 
 pub fn env_not_zero_or_default(name: &str, default: bool) -> bool {
-    std::env::var(name)
+    env_effective(name)
         .map(|value| value != "0")
         .unwrap_or(default)
 }
 
 pub(crate) fn moe_debug_enabled() -> bool {
-    env_flag_any(&[ENV_MOE_DEBUG, ENV_MOE_DEBUG_LEGACY])
+    env_flag(ENV_MOE_DEBUG)
 }
 
 pub(crate) fn skip_moe_enabled() -> bool {
-    env_flag_any(&[ENV_SKIP_MOE, ENV_SKIP_MOE_LEGACY])
+    env_flag(ENV_SKIP_MOE)
 }
 
 pub fn split_profile_requested() -> bool {
-    env_flag_any(&[ENV_PROFILE_SPLIT, ENV_DECODE_STAGE_TIMING])
+    env_flag(ENV_PROFILE_SPLIT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_env_vars<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env test mutex poisoned");
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect();
+    /// Run `f` with the given env flags overridden on the current thread via the
+    /// thread-local override (NOT `std::env::set_var`, which races concurrent
+    /// `getenv` → SIGSEGV). Cleared on drop, so no cross-test leakage and no
+    /// serialization needed.
+    fn with_env_vars<T>(vars: &[(&'static str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                clear_fast_path_overrides();
+            }
+        }
+        let _clear = Clear;
         for (name, value) in vars {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
+            set_env_override(name, *value);
         }
-        let result = f();
-        for (name, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        result
+        f()
     }
 
-    fn with_env<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    fn with_env<T>(name: &'static str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         with_env_vars(&[(name, value)], f)
+    }
+
+    #[test]
+    fn opt_value_parsers_recognise_the_vocabulary() {
+        for v in ["0", "false", "off", "no"] {
+            assert!(is_opt_out_value(Some(v)));
+            assert!(!is_opt_in_value(Some(v)));
+        }
+        for v in ["1", "true", "on", "yes"] {
+            assert!(is_opt_in_value(Some(v)));
+            assert!(!is_opt_out_value(Some(v)));
+        }
+        assert!(!is_opt_out_value(None));
+        assert!(!is_opt_in_value(None));
+        assert!(!is_opt_out_value(Some("maybe")));
     }
 
     #[test]
@@ -271,38 +481,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_alias_helpers_still_work() {
-        with_env_vars(
-            &[(ENV_SKIP_MOE, None), (ENV_SKIP_MOE_LEGACY, Some("1"))],
-            || {
-                assert!(skip_moe_enabled());
-            },
-        );
-        with_env_vars(
-            &[(ENV_MOE_DEBUG, Some("1")), (ENV_MOE_DEBUG_LEGACY, None)],
-            || {
-                assert!(moe_debug_enabled());
-            },
-        );
-        with_env_vars(
-            &[
-                (ENV_PROFILE_SPLIT, None),
-                (ENV_DECODE_STAGE_TIMING, Some("1")),
-            ],
-            || {
-                assert!(split_profile_requested());
-            },
-        );
+    fn namespaced_toggle_helpers_read_their_flag() {
+        with_env(ENV_SKIP_MOE, Some("1"), || assert!(skip_moe_enabled()));
+        with_env(ENV_MOE_DEBUG, Some("1"), || assert!(moe_debug_enabled()));
+        with_env(ENV_PROFILE_SPLIT, Some("1"), || {
+            assert!(split_profile_requested())
+        });
     }
 
     #[test]
     fn env_flag_any_and_debug_helpers_cover_absent_and_present_cases() {
         with_env_vars(
-            &[
-                (ENV_SKIP_OUTER_NORM, None),
-                (ENV_MOE_DEBUG, None),
-                (ENV_MOE_DEBUG_LEGACY, None),
-            ],
+            &[(ENV_SKIP_OUTER_NORM, None), (ENV_MOE_DEBUG, None)],
             || {
                 assert!(!env_flag(ENV_SKIP_OUTER_NORM));
                 assert!(!env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG]));
@@ -311,14 +501,10 @@ mod tests {
         );
 
         with_env_vars(
-            &[
-                (ENV_SKIP_OUTER_NORM, Some("1")),
-                (ENV_MOE_DEBUG, Some("1")),
-                (ENV_MOE_DEBUG_LEGACY, None),
-            ],
+            &[(ENV_SKIP_OUTER_NORM, Some("1")), (ENV_MOE_DEBUG, Some("1"))],
             || {
                 assert!(env_flag(ENV_SKIP_OUTER_NORM));
-                assert!(env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG_LEGACY]));
+                assert!(env_flag_any(&[ENV_SKIP_OUTER_NORM, ENV_MOE_DEBUG]));
                 assert!(moe_debug_enabled());
             },
         );

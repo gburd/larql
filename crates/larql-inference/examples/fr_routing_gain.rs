@@ -16,7 +16,7 @@
 //! Usage: `cargo run --release --example fr_routing_gain -- [VINDEX_DIR] [LAYER]`
 
 use larql_inference::forward::{KNN_COSINE_THRESHOLD, KNN_VERIFY_TOPK};
-use larql_inference::vindex::{insert_q4k_layer_tensors, WalkFfn};
+use larql_inference::vindex::{insert_q4k_layer_tensors_resident, WalkFfn};
 use larql_inference::{
     apply_knn_override, apply_knn_override_two_tier, apply_knn_override_verified,
     capture_residuals, load_tokenizer, predict_with_ffn,
@@ -101,7 +101,7 @@ fn main() {
     let tok = load_tokenizer(&dir).expect("tokenizer");
     eprintln!("Dequantising {} layers ...", weights.num_layers);
     for l in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, l).expect("dequant");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, l).expect("dequant");
     }
 
     // Install novel facts at the resolved layer.

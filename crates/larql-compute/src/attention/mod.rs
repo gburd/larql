@@ -61,7 +61,9 @@ pub use block::{
 };
 pub use decode::{
     gqa_attention_decode_step, run_attention_block_decode_step,
+    run_attention_block_decode_step_auto, run_attention_block_decode_step_auto_inplace,
     run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
+    run_attention_block_decode_step_q4k_direct_inplace,
 };
 pub use gpu::{
     q4_attention_proj, run_attention_block_gpu, run_attention_with_kv,

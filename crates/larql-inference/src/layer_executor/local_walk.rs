@@ -26,7 +26,6 @@ use crate::attention::{
 };
 use crate::ffn::FfnBackend;
 use crate::forward::run_ffn;
-use crate::model::ModelWeights;
 use larql_compute::ComputeBackend;
 
 use super::{ExecutorDispatchKind, LayerExecutor};
@@ -61,7 +60,7 @@ impl<'a> LayerExecutor for LocalWalkExecutor<'a> {
 
     fn run_prefill_layer(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         layer: usize,
         hidden_in: &Array2<f32>,
         ffn: &dyn FfnBackend,
@@ -70,18 +69,18 @@ impl<'a> LayerExecutor for LocalWalkExecutor<'a> {
         // projection matmuls; `run_attention_with_kv_backend` returns
         // `(h_post_attn, k_rope, v_final)`.
         let (h_post_attn, k, v) =
-            run_attention_with_kv_backend(weights, hidden_in, layer, Some(self.backend))?;
+            run_attention_with_kv_backend(weights, hidden_in, layer, Some(self.backend), None)?;
         // FFN through the caller-supplied dispatcher. This is the
         // critical decoupling: local FFN uses `WeightFfn` / `BackendFfn`,
         // remote FFN uses `RemoteWalkBackend`, MoE shards use
         // `RemoteMoeBackend`. The executor doesn't pick.
-        let (h_out, _activation) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_out, _activation) = run_ffn(&weights, &h_post_attn, layer, ffn, false);
         Some((h_out, (k, v)))
     }
 
     fn run_decode_layer(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         layer: usize,
         hidden_in: &Array2<f32>,
         prior_kv: &SharedKV,
@@ -100,7 +99,7 @@ impl<'a> LayerExecutor for LocalWalkExecutor<'a> {
             abs_position,
             Some(self.backend),
         )?;
-        let (h_out, _activation) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_out, _activation) = run_ffn(&weights, &h_post_attn, layer, ffn, false);
         Some((h_out, new_kv))
     }
 }
@@ -109,6 +108,7 @@ impl<'a> LayerExecutor for LocalWalkExecutor<'a> {
 mod tests {
     use super::*;
     use crate::ffn::WeightFfn;
+    use crate::model::ModelWeights;
     use crate::test_utils::make_test_weights;
     use larql_compute::CpuBackend;
 
@@ -142,7 +142,12 @@ mod tests {
         let exec = LocalWalkExecutor::new(&backend);
         let hidden_in = Array2::from_elem((3, weights.hidden_size), 0.1f32);
         let (h_out, (k, v)) = exec
-            .run_prefill_layer(&weights, 0, &hidden_in, &ffn)
+            .run_prefill_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &hidden_in,
+                &ffn,
+            )
             .expect("prefill_layer");
         assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
         assert!(h_out.iter().all(|v| v.is_finite()));
@@ -165,7 +170,7 @@ mod tests {
         let mut h = crate::forward::embed_tokens_pub(&weights, &[0u32, 1, 2]);
         for layer in 0..weights.num_layers {
             let (h_next, _kv) = exec
-                .run_prefill_layer(&weights, layer, &h, &ffn)
+                .run_prefill_layer(larql_models::WeightsView::dense(&weights), layer, &h, &ffn)
                 .expect("layer prefill");
             assert_eq!(h_next.shape(), &[3, weights.hidden_size]);
             assert!(h_next.iter().all(|v| v.is_finite()));
@@ -184,13 +189,25 @@ mod tests {
         // Seed K/V from a 2-token prefill, then decode one step.
         let prefill_hidden = Array2::from_elem((2, weights.hidden_size), 0.1f32);
         let (_, prior_kv) = exec
-            .run_prefill_layer(&weights, 0, &prefill_hidden, &ffn)
+            .run_prefill_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &prefill_hidden,
+                &ffn,
+            )
             .unwrap();
         assert_eq!(prior_kv.0.shape()[0], 2);
 
         let new_token_hidden = Array2::from_elem((1, weights.hidden_size), 0.05f32);
         let (h_out, new_kv) = exec
-            .run_decode_layer(&weights, 0, &new_token_hidden, &prior_kv, 2, &ffn)
+            .run_decode_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &new_token_hidden,
+                &prior_kv,
+                2,
+                &ffn,
+            )
             .expect("decode_layer");
         assert_eq!(h_out.shape(), &[1, weights.hidden_size]);
         assert!(h_out.iter().all(|v| v.is_finite()));
@@ -209,7 +226,14 @@ mod tests {
         let empty_kv: SharedKV = (Array2::zeros((0, kv_dim)), Array2::zeros((0, kv_dim)));
         let h_in = Array2::from_elem((1, weights.hidden_size), 0.1f32);
         let (h_out, new_kv) = exec
-            .run_decode_layer(&weights, 0, &h_in, &empty_kv, 0, &ffn)
+            .run_decode_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &h_in,
+                &empty_kv,
+                0,
+                &ffn,
+            )
             .expect("decode_layer with empty prior");
         assert_eq!(h_out.shape(), &[1, weights.hidden_size]);
         assert_eq!(new_kv.0.shape()[0], 1);
@@ -229,12 +253,22 @@ mod tests {
 
         let ffn_real = WeightFfn { weights: &weights };
         let (h_real, _) = exec
-            .run_prefill_layer(&weights, 0, &h_in, &ffn_real)
+            .run_prefill_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &h_in,
+                &ffn_real,
+            )
             .unwrap();
 
         let ffn_null = NullFfn;
         let (h_null, _) = exec
-            .run_prefill_layer(&weights, 0, &h_in, &ffn_null)
+            .run_prefill_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &h_in,
+                &ffn_null,
+            )
             .unwrap();
 
         // The two FFN backends produce different outputs; the executor

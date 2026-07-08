@@ -981,15 +981,15 @@ mod compliance_tests {
         };
 
         // Build a separate &mut binding for the `prefill_quant` call.
-        let mut weights_for_q4k = larql_inference::test_utils::make_test_weights();
-        let out = engine.prefill_quant(&mut weights_for_q4k, &ffn, &index, &[1, 2, 3], &*backend);
+        let weights_for_q4k = larql_inference::test_utils::make_test_weights();
+        let out = engine.prefill_quant(&weights_for_q4k, &ffn, &index, &[1, 2, 3], &*backend);
         assert!(out.is_ok());
         assert_eq!(
             engine.prefill_calls, 1,
             "default prefill_quant must call prefill"
         );
 
-        let out = engine.decode_step_quant(&mut weights_for_q4k, &ffn, &index, 4, &*backend);
+        let out = engine.decode_step_quant(&weights_for_q4k, &ffn, &index, 4, &*backend);
         assert!(out.is_ok());
         assert_eq!(
             engine.decode_calls, 1,

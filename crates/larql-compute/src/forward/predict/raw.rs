@@ -7,7 +7,6 @@ use super::super::layer::run_layer_with_ffn;
 use super::super::ple::precompute_per_layer_inputs;
 use super::super::{apply_norm, dot_proj};
 use crate::attention::SharedKV;
-use crate::ffn::WeightFfn;
 use larql_models::ModelWeights;
 use ndarray::Array2;
 
@@ -63,7 +62,7 @@ pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> V
 /// (since `run_layer_with_ffn` already collapses the block's output +
 /// skip, perturbing the post-block `h[-1]` is algebraically the same).
 pub fn forward_raw_logits(
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     token_ids: &[u32],
     perturb: Option<(usize, ndarray::ArrayView1<f32>)>,
 ) -> RawForward {
@@ -89,7 +88,7 @@ pub fn forward_raw_logits(
 /// `initial_residual`, when `Some`, must be a slice of exactly
 /// `weights.hidden_size` floats. `token_ids` may not be empty.
 pub fn forward_raw_logits_with_prefix(
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     token_ids: &[u32],
     initial_residual: Option<&[f32]>,
     perturb: Option<(usize, ndarray::ArrayView1<f32>)>,
@@ -114,7 +113,7 @@ pub fn forward_raw_logits_with_prefix(
 /// Layout: `h[0] = boundary`, `h[1..]` = query embeddings.
 /// The perturbation is applied at `target_layer` to the last row.
 pub fn forward_from_layer(
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     token_ids: &[u32],
     boundary_residual: &[f32],
     from_layer: usize,
@@ -140,7 +139,7 @@ pub fn forward_from_layer(
 /// Layout when `prefix` is `None`: rows 0..q = query embeddings,
 /// total_len = q.
 fn forward_layer_range(
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     token_ids: &[u32],
     prefix: Option<&[f32]>,
     layer_range: Range<usize>,
@@ -149,7 +148,7 @@ fn forward_layer_range(
     let hidden = weights.hidden_size;
     let q_len = token_ids.len();
 
-    let q_embed = embed_tokens_pub(weights, token_ids);
+    let q_embed = embed_tokens_pub(&weights, token_ids);
     let (mut h, total_len) = if let Some(prefix) = prefix {
         assert_eq!(
             prefix.len(),
@@ -184,8 +183,8 @@ fn forward_layer_range(
     } else {
         token_ids.to_vec()
     };
-    let ple_inputs = precompute_per_layer_inputs(weights, &h, &ple_token_ids);
-    let ffn = WeightFfn { weights };
+    let ple_inputs = precompute_per_layer_inputs(&weights, &h, &ple_token_ids);
+    let ffn = crate::ffn::ViewFfn { view: weights };
 
     let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
 
@@ -227,11 +226,11 @@ fn forward_layer_range(
 
     let h_pre_norm = h.clone();
     let norm_offset = weights.arch.norm_weight_offset();
-    let h_final = apply_norm(weights, &h, weights.arch.final_norm_key(), norm_offset);
+    let h_final = apply_norm(&weights, &h, weights.arch.final_norm_key(), norm_offset);
 
     let last_2d = h_final.slice(ndarray::s![total_len - 1..total_len, ..]);
     let logits_raw = dot_proj(&last_2d, &weights.lm_head);
-    let logits = apply_logits_transform(weights, logits_raw.row(0).as_slice().unwrap());
+    let logits = apply_logits_transform(&weights, logits_raw.row(0).as_slice().unwrap());
 
     RawForward {
         h_pre_norm,
@@ -250,7 +249,11 @@ mod forward_from_layer_tests {
     #[test]
     fn forward_raw_logits_returns_vocab_logits() {
         let weights = make_test_weights();
-        let raw = forward_raw_logits(&weights, &[0u32, 1, 2], None);
+        let raw = forward_raw_logits(
+            larql_models::WeightsView::dense(&weights),
+            &[0u32, 1, 2],
+            None,
+        );
         assert_eq!(
             raw.logits.len(),
             weights.vocab_size,
@@ -266,7 +269,7 @@ mod forward_from_layer_tests {
     #[test]
     fn forward_raw_logits_single_token() {
         let weights = make_test_weights();
-        let raw = forward_raw_logits(&weights, &[5u32], None);
+        let raw = forward_raw_logits(larql_models::WeightsView::dense(&weights), &[5u32], None);
         assert_eq!(raw.logits.len(), weights.vocab_size);
         assert!(
             raw.logits.iter().all(|v| v.is_finite()),
@@ -284,7 +287,13 @@ mod forward_from_layer_tests {
         let token_ids = &[1u32, 2];
         let boundary = vec![0.0f32; weights.hidden_size];
 
-        let from_layer = forward_from_layer(&weights, token_ids, &boundary, 0, None);
+        let from_layer = forward_from_layer(
+            larql_models::WeightsView::dense(&weights),
+            token_ids,
+            &boundary,
+            0,
+            None,
+        );
         // from_layer=0 with zero boundary: should have (1 boundary + 2 query) positions
         assert_eq!(from_layer.h_pre_norm.shape(), &[3, weights.hidden_size]);
         assert_eq!(from_layer.logits.len(), weights.vocab_size);
@@ -299,8 +308,20 @@ mod forward_from_layer_tests {
         let token_ids = &[3u32];
         let boundary = vec![0.1f32; weights.hidden_size];
 
-        let from_0 = forward_from_layer(&weights, token_ids, &boundary, 0, None);
-        let from_1 = forward_from_layer(&weights, token_ids, &boundary, 1, None);
+        let from_0 = forward_from_layer(
+            larql_models::WeightsView::dense(&weights),
+            token_ids,
+            &boundary,
+            0,
+            None,
+        );
+        let from_1 = forward_from_layer(
+            larql_models::WeightsView::dense(&weights),
+            token_ids,
+            &boundary,
+            1,
+            None,
+        );
 
         // Outputs should differ (layer 0's transform changes the residual)
         let differ = from_0
@@ -319,7 +340,7 @@ mod forward_from_layer_tests {
         let weights = make_test_weights();
         // 3 query tokens, from_layer=1: h has 4 rows (1 boundary + 3 query)
         let raw = forward_from_layer(
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &[0u32, 1, 2],
             &vec![0.0; weights.hidden_size],
             1,
@@ -333,7 +354,12 @@ mod forward_from_layer_tests {
     fn forward_raw_logits_with_prefix_shape() {
         let weights = make_test_weights();
         let prefix = vec![0.5f32; weights.hidden_size];
-        let raw = forward_raw_logits_with_prefix(&weights, &[0u32, 1], Some(&prefix), None);
+        let raw = forward_raw_logits_with_prefix(
+            larql_models::WeightsView::dense(&weights),
+            &[0u32, 1],
+            Some(&prefix),
+            None,
+        );
         // prefix + 2 tokens = 3 positions
         assert_eq!(raw.h_pre_norm.shape(), &[3, weights.hidden_size]);
         assert_eq!(raw.logits.len(), weights.vocab_size);

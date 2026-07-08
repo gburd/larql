@@ -187,6 +187,7 @@ fn build_synthetic_vindex(dir: &std::path::Path) {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     index.save_vindex(dir, &mut config).unwrap();
 

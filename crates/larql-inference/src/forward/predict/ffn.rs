@@ -30,7 +30,7 @@ pub fn predict_with_ffn(
             .and_then(|src| kv_cache.get(&src));
 
         match run_layer_with_ffn(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             layer,
             ffn,
@@ -84,7 +84,7 @@ pub fn predict_with_ffn_early_exit(
             .and_then(|src| kv_cache.get(&src));
 
         match run_layer_with_ffn(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             layer,
             ffn,
@@ -132,7 +132,7 @@ pub fn predict_with_ffn_attention(
 
     for layer in 0..num_layers {
         match run_layer_with_capture(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             layer,
             ffn,
@@ -174,7 +174,15 @@ pub fn predict_with_router(
 
     for layer in 0..num_layers {
         let ffn = router.get(layer);
-        h = match run_layer_with_ffn(weights, &h, layer, ffn, false, ple_inputs.get(layer), None) {
+        h = match run_layer_with_ffn(
+            larql_models::WeightsView::dense(weights),
+            &h,
+            layer,
+            ffn,
+            false,
+            ple_inputs.get(layer),
+            None,
+        ) {
             Some((h_new, _, _)) => h_new,
             None => continue,
         };
@@ -199,7 +207,7 @@ pub fn predict_with_strategy(
         match mode {
             LayerMode::Compute(ffn) => {
                 h = match run_layer_with_ffn(
-                    weights,
+                    larql_models::WeightsView::dense(weights),
                     &h,
                     layer,
                     *ffn,
@@ -215,7 +223,9 @@ pub fn predict_with_strategy(
                 h *= *gain;
             }
             LayerMode::AttentionOnly => {
-                if let Some(h_post_attn) = run_attention(weights, &h, layer) {
+                if let Some(h_post_attn) =
+                    run_attention(larql_models::WeightsView::dense(weights), &h, layer)
+                {
                     h = h_post_attn;
                 }
             }

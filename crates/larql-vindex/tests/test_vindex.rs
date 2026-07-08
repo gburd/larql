@@ -2612,6 +2612,7 @@ fn streaming_extract_from_safetensors() {
         "test/streaming",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         larql_vindex::QuantFormat::None,
@@ -2816,6 +2817,7 @@ fn streaming_extract_q4k_from_safetensors() {
         "test/streaming-q4k",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         QuantFormat::Q4K,
@@ -3830,6 +3832,7 @@ fn streaming_extract_q4k_carries_ple_tensors() {
         "test/streaming-q4k-ple",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         QuantFormat::Q4K,
@@ -4008,6 +4011,7 @@ fn streaming_extract_noquant_carries_ple_tensors() {
         "test/streaming-noquant-ple",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         // Inference (not Browse): non-Q4 only writes model weights when
         // the level includes attn.
         larql_vindex::ExtractLevel::Inference,
@@ -4180,6 +4184,7 @@ fn load_model_weights_rejects_ple_arch_with_missing_sidecars() {
         "test/ple-missing-sidecar",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Inference,
         larql_vindex::StorageDtype::F32,
         QuantFormat::None,
@@ -4392,6 +4397,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
         "test/variable-ffn",
         &output_dir,
         5,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         QuantFormat::Q4K,

@@ -1,6 +1,16 @@
 # BoundaryKvEngine — Specification
 
 **Status:** 📝 Draft v0.1 (2026-05-17).
+
+> ⚠️ **Implementation status (2026-06-14): the emit half is shipped; the
+> RESUME half is NOT.** Boundary-frame *emission* at chunk boundaries
+> (§6.1/§6.2, Phase 1–2) is live and tested. Everything describing
+> *restore* — §2.2 (cross-session restore contract), §2.3, §6.3
+> (`resume`), §8.3, §8.5, and Phase 3 — specifies *intended* behaviour
+> that is **not yet built**. Treat those sections as design, not
+> as-implemented. (`BoundaryKvEngine::resume` does not exist in the
+> code; the frame chain is currently a write-only transport artifact.)
+
 **Audience:** LARQL contributors.
 **Scope:** Contract for a KV-cache engine in `larql-kv` that emits and
 consumes `larql-boundary` frames at chunk boundaries, enabling compact
@@ -299,6 +309,10 @@ chunk boundary (i.e., `state.next_position % chunk_tokens == 0` after
 the step), emit a frame.
 
 ### 6.3 `resume(boundary_chain, optional_hot_tokens) -> State`
+
+> ⚠️ **NOT IMPLEMENTED** (2026-06-14). This describes intended behaviour;
+> `BoundaryKvEngine::resume` does not exist in the code yet. See the
+> banner at the top of this spec.
 
 Reconstructs a decode state from a previously emitted boundary chain.
 

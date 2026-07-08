@@ -53,7 +53,6 @@ pub mod cpu;
 
 use crate::ffn::FfnBackend;
 use crate::kv_dispatch::{KvDispatch, KvHandle, ResidualHandle};
-use larql_models::ModelWeights;
 use ndarray::Array2;
 use std::error::Error;
 use std::fmt;
@@ -300,7 +299,7 @@ pub trait AsyncComputeBackend: crate::ComputeBackend + KvDispatch + Send {
     /// [`KvDispatch::attention_step`].
     fn attention_step_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -319,7 +318,7 @@ pub trait AsyncComputeBackend: crate::ComputeBackend + KvDispatch + Send {
     #[allow(clippy::too_many_arguments)]
     fn attention_step_windowed_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -337,7 +336,7 @@ pub trait AsyncComputeBackend: crate::ComputeBackend + KvDispatch + Send {
     /// `AttentionHandle` is pending until commit.
     fn attention_prefill_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
@@ -350,7 +349,7 @@ pub trait AsyncComputeBackend: crate::ComputeBackend + KvDispatch + Send {
     /// Async equivalent of [`KvDispatch::recompute_kv_from_residuals`].
     fn recompute_kv_from_residuals_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         residuals: &Array2<f32>,
         layer: usize,
     ) -> KvHandle {
@@ -375,7 +374,7 @@ pub trait AsyncComputeBackend: crate::ComputeBackend + KvDispatch + Send {
     /// Async equivalent of [`KvDispatch::forward_from_layer`].
     fn forward_from_layer_async(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         ffn: &dyn FfnBackend,
         start_layer: usize,
         residuals: &ResidualHandle,
@@ -458,7 +457,14 @@ mod tests {
             dim: weights.hidden_size,
         });
         let query = Array2::zeros((1, weights.hidden_size));
-        let _ = backend.attention_step_async(&weights, &query, &mut kv, 0, 0, None);
+        let _ = backend.attention_step_async(
+            larql_models::WeightsView::dense(&weights),
+            &query,
+            &mut kv,
+            0,
+            0,
+            None,
+        );
     }
 
     #[test]
@@ -467,7 +473,13 @@ mod tests {
         let backend = StubAsyncBackend;
         let weights = larql_models::test_fixtures::make_test_weights();
         let tokens = Array2::zeros((2, weights.hidden_size));
-        let _ = backend.attention_prefill_async(&weights, &tokens, 0, None, None);
+        let _ = backend.attention_prefill_async(
+            larql_models::WeightsView::dense(&weights),
+            &tokens,
+            0,
+            None,
+            None,
+        );
     }
 
     #[test]
@@ -487,7 +499,13 @@ mod tests {
             shape: (1, weights.hidden_size),
         });
         let ffn = crate::ffn::NullFfn;
-        let _ = backend.forward_from_layer_async(&weights, &ffn, 0, &residuals, &[0u32]);
+        let _ = backend.forward_from_layer_async(
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            0,
+            &residuals,
+            &[0u32],
+        );
     }
 
     #[test]
@@ -502,7 +520,15 @@ mod tests {
         });
         let query = Array2::zeros((1, weights.hidden_size));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = backend.attention_step_windowed_async(&weights, &query, &mut kv, 0, 0, 4, None);
+            let _ = backend.attention_step_windowed_async(
+                larql_models::WeightsView::dense(&weights),
+                &query,
+                &mut kv,
+                0,
+                0,
+                4,
+                None,
+            );
         }));
         let err = result.expect_err("should panic via attention_step_async");
         let msg = err

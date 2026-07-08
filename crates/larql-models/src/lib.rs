@@ -47,7 +47,7 @@ pub use vectors::{
     COMPONENT_ATTN_QK, COMPONENT_EMBEDDINGS, COMPONENT_FFN_DOWN, COMPONENT_FFN_GATE,
     COMPONENT_FFN_UP,
 };
-pub use weights::{ModelWeights, WeightArray};
+pub use weights::{DequantScratch, ModelWeights, WeightArray, WeightsView};
 
 pub use loading::{
     is_ffn_tensor, load_gguf, load_gguf_validated, load_model_dir, load_model_dir_filtered,

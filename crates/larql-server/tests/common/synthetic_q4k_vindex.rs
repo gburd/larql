@@ -174,6 +174,7 @@ pub fn build() -> SyntheticQ4kVindex {
         "test/synthetic-q4k",
         &vindex_dir,
         4, // down_top_k
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Inference,
         larql_vindex::StorageDtype::F32,
         larql_vindex::QuantFormat::Q4K,

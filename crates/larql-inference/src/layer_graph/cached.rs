@@ -172,8 +172,14 @@ impl AttentionCache {
         let mut ffn_inputs = Vec::with_capacity(layer_range.len());
         for layer in layer_range {
             // Attention (exact)
-            let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
+            let (h_post_attn, _, _) = crate::attention::run_attention_block_gpu(
+                larql_models::WeightsView::dense(weights),
+                &h,
+                layer,
+                false,
+                None,
+            )
+            .unwrap();
 
             // Capture FFN-normed input (last token)
             let pre_ffn_key = if arch.has_post_norms() {

@@ -32,7 +32,7 @@
 use larql_inference::forward::{
     apply_knn_override_verified, KNN_COSINE_THRESHOLD, KNN_VERIFY_TOPK,
 };
-use larql_inference::vindex::insert_q4k_layer_tensors;
+use larql_inference::vindex::insert_q4k_layer_tensors_resident;
 use larql_inference::{capture_residuals, load_tokenizer};
 use larql_vindex::KnnStore;
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ fn main() {
     let num_layers = weights.num_layers;
     eprintln!("Dequantising {num_layers} layers to f32 ...");
     for layer in 0..num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant");
     }
 
     // Sweep the whole stack — capture_residuals returns every requested layer

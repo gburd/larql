@@ -17,3 +17,5 @@ All specs live with the crate they describe.
 | `larql confidence` (slot bits) | larql-cli | [crates/larql-cli/docs/slot-bits-spec.md](../crates/larql-cli/docs/slot-bits-spec.md) |
 | Trace format | larql-inference | [crates/larql-inference/docs/trace-format.md](../crates/larql-inference/docs/trace-format.md) |
 | Vindex-as-FFN lookup | larql-inference | [crates/larql-inference/docs/specs/vindex-as-ffn.md](../crates/larql-inference/docs/specs/vindex-as-ffn.md) |
+| Arithmetic Virtual Expert (AVE) | larql-inference | [crates/larql-inference/docs/specs/virtual-experts/arithmetic-virtual-expert.md](../crates/larql-inference/docs/specs/virtual-experts/arithmetic-virtual-expert.md) |
+| Math Expression Expert (MEE, AVE v0.2) | larql-inference | [crates/larql-inference/docs/specs/virtual-experts/math-expression-expert.md](../crates/larql-inference/docs/specs/virtual-experts/math-expression-expert.md) |

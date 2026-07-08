@@ -12,7 +12,7 @@
 //! Usage: `cargo run --release --example walk_ffn_drift -- [VINDEX]`
 
 use larql_inference::ffn::FfnBackend;
-use larql_inference::vindex::{insert_q4k_layer_tensors, WalkFfn};
+use larql_inference::vindex::{insert_q4k_layer_tensors_resident, WalkFfn};
 use larql_inference::{load_tokenizer, predict_with_ffn};
 use larql_models::ModelWeights;
 use ndarray::{Array1, Array2};
@@ -125,7 +125,7 @@ fn main() {
     let _ = index.load_lm_head_kquant(&dir);
     let tok = load_tokenizer(&dir).expect("tok");
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant attn");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant attn");
     }
     let _ = WalkFfn::new_unlimited(&weights, &index); // (warms down-norm cache path)
 

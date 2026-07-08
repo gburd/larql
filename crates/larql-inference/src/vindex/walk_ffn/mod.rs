@@ -199,12 +199,18 @@ thread_local! {
     static WALK_TRACE_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `LARQL_WALK_TRACE=1` — emit the per-feature walk trace to stderr.
+const ENV_WALK_TRACE: &str = "LARQL_WALK_TRACE";
+
 fn walk_trace_env_enabled() -> bool {
     WALK_TRACE_ENABLED.with(|c| {
         if let Some(v) = c.get() {
             return v;
         }
-        let enabled = std::env::var("LARQL_WALK_TRACE").ok().as_deref() == Some("1");
+        // Route through the override-aware `options` helper so tests can toggle
+        // this via the thread-local override (NOT `std::env::set_var`, which
+        // races concurrent `getenv` on the decode path → SIGSEGV).
+        let enabled = larql_compute::options::env_value(ENV_WALK_TRACE).as_deref() == Some("1");
         c.set(Some(enabled));
         enabled
     })
@@ -861,19 +867,17 @@ mod dispatch_tests {
 
     /// `walk_trace_env_enabled` caches the env-var lookup in a thread-local.
     /// Spawn a fresh thread so the cell starts empty, set `LARQL_WALK_TRACE=1`
-    /// in that thread, then drive `forward` — `trace_path` reads the cache
-    /// (first call populates it as `Some(true)`) and emits to stderr
-    /// (line 145-147).
+    /// in that thread via the thread-local override (NOT `std::env::set_var`,
+    /// which races concurrent `getenv` on the decode path → SIGSEGV), then
+    /// drive `forward` — `trace_path` reads the cache (first call populates it
+    /// as `Some(true)`) and emits to stderr (line 145-147). The override is
+    /// set INSIDE the spawned thread because both the override map and the
+    /// `WALK_TRACE_ENABLED` cache are thread-local; it is cleared before the
+    /// thread returns.
     #[test]
     fn walk_ffn_trace_path_honours_env_var_in_fresh_thread() {
         let handle = std::thread::spawn(|| {
-            // SAFETY: thread-isolated env var. The whole point of running
-            // in a dedicated thread is that no other test sees this var
-            // mid-flight — and we wipe it before returning. Set + remove
-            // are bracketed within a single thread's lifetime.
-            unsafe {
-                std::env::set_var("LARQL_WALK_TRACE", "1");
-            }
+            larql_compute::options::set_env_override(super::ENV_WALK_TRACE, Some("1"));
             let weights = make_test_weights();
             let idx = MockGateIndex {
                 n_features: weights.intermediate_size,
@@ -888,9 +892,7 @@ mod dispatch_tests {
             .unwrap();
             // Drives trace_path, which checks walk_trace_env_enabled.
             ffn.forward(0, &x);
-            unsafe {
-                std::env::remove_var("LARQL_WALK_TRACE");
-            }
+            larql_compute::options::clear_fast_path_overrides();
         });
         handle.join().expect("env-var thread panicked");
     }

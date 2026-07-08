@@ -155,7 +155,8 @@ pub fn quantize_x_to_q8k(x: &[f32]) -> Q8KActivation {
 /// into 8 6-bit scales + 8 6-bit mins.  Matches llama.cpp's
 /// `get_scale_min_k4` (and `q4_common::dequantize_q4_k` / `q4k_matvec.rs`).
 #[inline(always)]
-fn unpack_scales_mins(p: &[u8]) -> ([u8; 8], [u8; 8]) {
+#[doc(hidden)] // pub for the C12 decomposition microbench (benches/q4k_q8k_matvec.rs)
+pub fn unpack_scales_mins(p: &[u8]) -> ([u8; 8], [u8; 8]) {
     let mut scales = [0u8; 8];
     let mut mins = [0u8; 8];
     for j in 0..4 {
@@ -614,7 +615,8 @@ pub fn q4k_q8k_matvec_neon_2row(
 /// baseline on `aarch64-apple-darwin` — same assumption as `sdot_acc`.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
-unsafe fn q4k_sb_sum1_asm(quants: *const u8, act: *const i8, scales: *const i32) -> i32 {
+#[doc(hidden)] // pub for the C12 decomposition microbench (benches/q4k_q8k_matvec.rs)
+pub unsafe fn q4k_sb_sum1_asm(quants: *const u8, act: *const i8, scales: *const i32) -> i32 {
     let sum1: i32;
     // One group of the unrolled body, parameterised by the two scale lanes
     // (`$sv` = scale vector, `$l0`/`$l1` = lane indices for sub-blocks 2g/2g+1).
@@ -754,23 +756,392 @@ pub fn q4k_q8k_matvec_asm(
     }
 }
 
-/// C12 opt-in: route Q4_K × Q8_K matvecs through the hand-asm kernel
-/// (`q4k_q8k_matvec_asm`) instead of the intrinsic path when `LARQL_Q4K_ASM`
-/// is `1`/`true`. Read once and cached — the env lookup must not land in the
-/// per-token hot loop. Default off; both paths are bit-exact.
-/// Pure parse of the `LARQL_Q4K_ASM` opt-in value (`1`/`true` → on).
-/// Split out so the truth table is unit-testable without touching the
-/// process environment or the `OnceLock` cache below.
+/// TBL index tables for the v2 super-block kernel's vectorised scale/min
+/// unpack. The 16-byte header vector holds `d`(0-1) `dmin`(2-3) and the 12
+/// packed scale bytes at lanes 4..16, so the `unpack_scales_mins` byte
+/// positions shift by +4: A=p[0..4]→lanes 4..8, B=p[4..8]→lanes 8..12,
+/// C=p[8..12]→lanes 12..16. 0xFF lanes produce zeros (TBL out-of-range).
+/// Order: SCLO, SCHI_HI2, HI_LO4 (shared by scales and mins), MNLO,
+/// MNHI_HI2 → loaded into v24..v28.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-fn q4k_asm_flag_enabled(val: Option<&str>) -> bool {
-    matches!(val, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+#[rustfmt::skip]
+static Q4K_UNPACK_IDX: [u8; 80] = [
+    // SCLO: scales[0..4] = lo6 of A
+    4, 5, 6, 7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    // SCHI_HI2: scales[4..8] |= (A >> 6) << 4
+    0xff, 0xff, 0xff, 0xff, 4, 5, 6, 7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    // HI_LO4: scales[4..8] = lo4 of C (and mins[4..8] = hi4 of C, same lanes)
+    0xff, 0xff, 0xff, 0xff, 12, 13, 14, 15, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    // MNLO: mins[0..4] = lo6 of B
+    8, 9, 10, 11, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    // MNHI_HI2: mins[4..8] |= (B >> 6) << 4
+    0xff, 0xff, 0xff, 0xff, 8, 9, 10, 11, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// v2 super-block kernel (C12): the WHOLE per-super-block computation in one
+/// `asm!` block — vectorised 6-bit scale/min unpack (TBL, replaces the
+/// scalar `unpack_scales_mins` + i32 array round-trip), the 4-group SDOT
+/// `sum1` body (identical to [`q4k_sb_sum1_asm`]), `sum2` as
+/// `smull`/`smlal2` over the Q8_K sub-block sums, hardware `fcvt` for
+/// `d`/`dmin` (replaces two software `f16_to_f32` calls), and the exact-order
+/// f32 epilogue. Returns the super-block's contribution
+/// `d_w·d_y·sum1 − dmin_w·d_y·sum2`.
+///
+/// Built from the 2026-06-11 decomposition measurement: the v1 asm block is
+/// 16.3 cyc/SB but the Rust glue around it costs 19.2 cyc/SB with only ~3.6
+/// hidden by OoO overlap — the glue, not the asm schedule, is the fat.
+///
+/// Bit-exactness: `fcvt` h→s is exact (every f16 is representable), `scvtf`
+/// rounds i32→f32 identically to Rust's `as f32`, and the epilogue
+/// multiplication tree matches the scalar reference's expression order.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+unsafe fn q4k_sb_contrib_asm(
+    header: *const u8,
+    quants: *const u8,
+    act: *const i8,
+    q8_sums: *const i16,
+    d_y: f32,
+) -> f32 {
+    let contrib: f32;
+    macro_rules! grp {
+        ($sv:literal, $l0:literal, $l1:literal) => {
+            concat!(
+                "ld1 {{v0.16b, v1.16b}}, [{q}], #32\n",
+                "ld1 {{v20.16b, v21.16b, v22.16b, v23.16b}}, [{a}], #64\n",
+                "and  v2.16b, v0.16b, v16.16b\n",
+                "and  v3.16b, v1.16b, v16.16b\n",
+                "ushr v4.16b, v0.16b, #4\n",
+                "ushr v5.16b, v1.16b, #4\n",
+                "movi v6.4s, #0\n",
+                "movi v7.4s, #0\n",
+                "sdot v6.4s, v2.16b, v20.16b\n",
+                "sdot v6.4s, v3.16b, v21.16b\n",
+                "sdot v7.4s, v4.16b, v22.16b\n",
+                "sdot v7.4s, v5.16b, v23.16b\n",
+                "mul  v6.4s, v6.4s, ",
+                $sv,
+                ".s[",
+                $l0,
+                "]\n",
+                "mul  v7.4s, v7.4s, ",
+                $sv,
+                ".s[",
+                $l1,
+                "]\n",
+                "add  v17.4s, v17.4s, v6.4s\n",
+                "add  v17.4s, v17.4s, v7.4s\n",
+            )
+        };
+    }
+    unsafe {
+        core::arch::asm!(
+            "movi v16.16b, #0x0f",
+            "movi v30.16b, #0x3f",
+            "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{idx}]",
+            "ld1 {{v28.16b}}, [{idx2}]",
+            "ld1 {{v0.16b}}, [{hdr}]",      // d | dmin | 12 packed scale bytes
+            // ── vectorised unpack_scales_mins ──
+            "and  v1.16b, v0.16b, v30.16b", // lo6 of every byte
+            "ushr v2.16b, v0.16b, #6",
+            "shl  v2.16b, v2.16b, #4",      // (byte >> 6) << 4
+            "and  v3.16b, v0.16b, v16.16b", // lo4
+            "ushr v4.16b, v0.16b, #4",      // hi4
+            "tbl  v5.16b, {{v1.16b}}, v24.16b", // scales[0..4]
+            "tbl  v6.16b, {{v3.16b}}, v26.16b", // scales[4..8] lo4 (from C)
+            "tbl  v7.16b, {{v2.16b}}, v25.16b", // scales[4..8] hi2 (from A)
+            "orr  v5.16b, v5.16b, v6.16b",
+            "orr  v5.16b, v5.16b, v7.16b",      // sc8 in lanes 0..8
+            "tbl  v6.16b, {{v1.16b}}, v27.16b", // mins[0..4]
+            "tbl  v7.16b, {{v4.16b}}, v26.16b", // mins[4..8] lo4 (from C)
+            "tbl  v1.16b, {{v2.16b}}, v28.16b", // mins[4..8] hi2 (from B)
+            "orr  v6.16b, v6.16b, v7.16b",
+            "orr  v31.16b, v6.16b, v1.16b",     // mn8 stashed in v31
+            "ushll v5.8h, v5.8b, #0",
+            "ushll  v18.4s, v5.4h, #0",
+            "ushll2 v19.4s, v5.8h, #0",         // scales as i32x4 ×2
+            // ── sum1: 4 groups, identical to the v1 asm ──
+            "movi v17.4s, #0",
+            grp!("v18", "0", "1"),
+            grp!("v18", "2", "3"),
+            grp!("v19", "0", "1"),
+            grp!("v19", "2", "3"),
+            "addv s17, v17.4s",                 // sum1 (i32 in s17)
+            // ── sum2 = Σ mins[s] · q8_sums[s] (i16 sums, mins ≤ 63) ──
+            "ushll v1.8h, v31.8b, #0",
+            "ld1 {{v2.8h}}, [{sums}]",
+            "smull  v3.4s, v2.4h, v1.4h",
+            "smlal2 v3.4s, v2.8h, v1.8h",
+            "addv s3, v3.4s",                   // sum2 (i32 in s3)
+            // ── epilogue: d_w·d_y·sum1f − dmin_w·d_y·sum2f, exact order ──
+            "ldr  s0, [{hdr}]",                 // d (h[0]) | dmin (h[1])
+            "mov  h4, v0.h[0]",
+            "fcvt s4, h4",                      // d_w (exact)
+            "mov  h5, v0.h[1]",
+            "fcvt s5, h5",                      // dmin_w (exact)
+            "scvtf s6, s17",                    // sum1 as f32 (same rounding as Rust)
+            "scvtf s7, s3",                     // sum2 as f32
+            "fmul s4, s4, {dy:s}",
+            "fmul s4, s4, s6",
+            "fmul s5, s5, {dy:s}",
+            "fmul s5, s5, s7",
+            "fsub {contrib:s}, s4, s5",
+            hdr = in(reg) header,
+            q = inout(reg) quants => _,
+            a = inout(reg) act => _,
+            sums = in(reg) q8_sums,
+            idx = in(reg) Q4K_UNPACK_IDX.as_ptr(),
+            idx2 = in(reg) Q4K_UNPACK_IDX.as_ptr().wrapping_add(64),
+            dy = in(vreg) d_y,
+            contrib = out(vreg) contrib,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v30") _, out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    contrib
 }
 
+/// v2 hand-asm Q4_K × Q8_K matvec: per super-block one [`q4k_sb_contrib_asm`]
+/// call — no per-block Rust glue at all (the v1 form's `unpack_scales_mins` +
+/// scale-array + `sum2` + 2× software `f16_to_f32` measured 19.2 cyc/SB,
+/// as much as the asm block itself). Bit-exact with the scalar reference
+/// (`q8k_matvec_asm_v2_matches_scalar_bit_exact`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn q4k_q8k_matvec_asm_v2(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(out.len(), rows);
+    debug_assert_eq!(q8k_x.qs.len(), cols);
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    if rows == 0 || cols == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    if w.len() < rows * row_bytes {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+        for sb in 0..n_blocks {
+            let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            // SAFETY: 144-byte super-block (16 header + 128 quants); the act
+            // slice spans 256 i8; q8_sums has 8 i16 per super-block; the
+            // static index tables are 80 bytes.
+            acc += unsafe {
+                q4k_sb_contrib_asm(
+                    block.as_ptr(),
+                    block[16..].as_ptr(),
+                    q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK].as_ptr(),
+                    q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..].as_ptr(),
+                    q8k_x.d[sb],
+                )
+            };
+        }
+        *out_slot = acc;
+    }
+}
+
+/// v3 (C12): one `asm!` block per ROW — the super-block loop lives inside
+/// the asm, so the TBL tables / masks load once per row instead of once per
+/// super-block (v2 paid ~4-5 cyc/SB reloading loop-invariant constants).
+/// The walking pointer exploits the Q4_K layout: each 144-byte block is
+/// [16B header][128B quants] contiguous, so the header `ld1 ..., #16`
+/// followed by the four group loads (4×32B) lands the pointer exactly on
+/// the next block's header — no pointer arithmetic at all.
+///
+/// Accumulation order matches the v1/v2/scalar forms exactly (sequential
+/// `fadd` of per-block contributions), so it stays bit-exact.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+unsafe fn q4k_row_dot_asm(
+    row: *const u8,
+    act: *const i8,
+    q8_sums: *const i16,
+    d: *const f32,
+    n_blocks: usize,
+) -> f32 {
+    let acc: f32;
+    macro_rules! grp {
+        ($sv:literal, $l0:literal, $l1:literal) => {
+            concat!(
+                "ld1 {{v0.16b, v1.16b}}, [{p}], #32\n",
+                "ld1 {{v20.16b, v21.16b, v22.16b, v23.16b}}, [{a}], #64\n",
+                "and  v2.16b, v0.16b, v16.16b\n",
+                "and  v3.16b, v1.16b, v16.16b\n",
+                "ushr v4.16b, v0.16b, #4\n",
+                "ushr v5.16b, v1.16b, #4\n",
+                "movi v6.4s, #0\n",
+                "movi v7.4s, #0\n",
+                "sdot v6.4s, v2.16b, v20.16b\n",
+                "sdot v6.4s, v3.16b, v21.16b\n",
+                "sdot v7.4s, v4.16b, v22.16b\n",
+                "sdot v7.4s, v5.16b, v23.16b\n",
+                "mul  v6.4s, v6.4s, ",
+                $sv,
+                ".s[",
+                $l0,
+                "]\n",
+                "mul  v7.4s, v7.4s, ",
+                $sv,
+                ".s[",
+                $l1,
+                "]\n",
+                "add  v17.4s, v17.4s, v6.4s\n",
+                "add  v17.4s, v17.4s, v7.4s\n",
+            )
+        };
+    }
+    unsafe {
+        core::arch::asm!(
+            // ── loop-invariant constants (per row, not per super-block) ──
+            "movi v16.16b, #0x0f",
+            "movi v30.16b, #0x3f",
+            "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{idx}]",
+            "ld1 {{v28.16b}}, [{idx2}]",
+            "fmov s29, wzr",                    // row accumulator
+            "2:",
+            "ld1 {{v0.16b}}, [{p}], #16",       // header; pointer → quants
+            // ── vectorised unpack_scales_mins ──
+            "and  v1.16b, v0.16b, v30.16b",
+            "ushr v2.16b, v0.16b, #6",
+            "shl  v2.16b, v2.16b, #4",
+            "and  v3.16b, v0.16b, v16.16b",
+            "ushr v4.16b, v0.16b, #4",
+            "tbl  v5.16b, {{v1.16b}}, v24.16b",
+            "tbl  v6.16b, {{v3.16b}}, v26.16b",
+            "tbl  v7.16b, {{v2.16b}}, v25.16b",
+            "orr  v5.16b, v5.16b, v6.16b",
+            "orr  v5.16b, v5.16b, v7.16b",
+            "tbl  v6.16b, {{v1.16b}}, v27.16b",
+            "tbl  v7.16b, {{v4.16b}}, v26.16b",
+            "tbl  v1.16b, {{v2.16b}}, v28.16b",
+            "orr  v6.16b, v6.16b, v7.16b",
+            "orr  v31.16b, v6.16b, v1.16b",     // mn8
+            "mov  v15.16b, v0.16b",             // keep header (d|dmin) for epilogue
+            "ushll v5.8h, v5.8b, #0",
+            "ushll  v18.4s, v5.4h, #0",
+            "ushll2 v19.4s, v5.8h, #0",
+            // ── sum1 ──
+            "movi v17.4s, #0",
+            grp!("v18", "0", "1"),
+            grp!("v18", "2", "3"),
+            grp!("v19", "0", "1"),
+            grp!("v19", "2", "3"),
+            "addv s17, v17.4s",
+            // ── sum2 ──
+            "ushll v1.8h, v31.8b, #0",
+            "ld1 {{v2.8h}}, [{sums}], #16",
+            "smull  v3.4s, v2.4h, v1.4h",
+            "smlal2 v3.4s, v2.8h, v1.8h",
+            "addv s3, v3.4s",
+            // ── epilogue ──
+            "ldr  s8, [{d}], #4",               // d_y for this super-block
+            "mov  h4, v15.h[0]",
+            "fcvt s4, h4",
+            "mov  h5, v15.h[1]",
+            "fcvt s5, h5",
+            "scvtf s6, s17",
+            "scvtf s7, s3",
+            "fmul s4, s4, s8",
+            "fmul s4, s4, s6",
+            "fmul s5, s5, s8",
+            "fmul s5, s5, s7",
+            "fsub s4, s4, s5",
+            "fadd s29, s29, s4",
+            "subs {n}, {n}, #1",
+            "b.ne 2b",
+            "fmov {acc:s}, s29",
+            p = inout(reg) row => _,
+            a = inout(reg) act => _,
+            sums = inout(reg) q8_sums => _,
+            d = inout(reg) d => _,
+            n = inout(reg) n_blocks => _,
+            idx = in(reg) Q4K_UNPACK_IDX.as_ptr(),
+            idx2 = in(reg) Q4K_UNPACK_IDX.as_ptr().wrapping_add(64),
+            acc = out(vreg) acc,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    acc
+}
+
+/// v3 hand-asm Q4_K × Q8_K matvec: one asm block per row (constants hoisted,
+/// zero per-super-block Rust glue). Bit-exact with the scalar reference
+/// (`q8k_matvec_asm_v3_matches_scalar_bit_exact`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn q4k_q8k_matvec_asm_v3(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(out.len(), rows);
+    debug_assert_eq!(q8k_x.qs.len(), cols);
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    if rows == 0 || cols == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    if w.len() < rows * row_bytes {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
+        // SAFETY: the row spans n_blocks × 144 bytes (checked above); the
+        // activation arrays carry n_blocks super-blocks of qs/sums/d.
+        *out_slot = unsafe {
+            q4k_row_dot_asm(
+                w[r * row_bytes..].as_ptr(),
+                q8k_x.qs.as_ptr(),
+                q8k_x.sums.as_ptr(),
+                q8k_x.d.as_ptr(),
+                n_blocks,
+            )
+        };
+    }
+}
+
+/// C12: route Q4_K × Q8_K matvecs through the hand-asm kernel
+/// (`q4k_q8k_matvec_asm`) instead of the intrinsic path. **Default on**
+/// (`LARQL_Q4K_ASM=0` opts out); both paths are bit-exact. The truth table +
+/// caching live in [`crate::options::q4k_asm_enabled`].
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 fn use_asm_kernel() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| q4k_asm_flag_enabled(std::env::var("LARQL_Q4K_ASM").ok().as_deref()))
+    crate::options::q4k_asm_enabled()
 }
 
 /// Public entry point: dispatches to NEON on aarch64, scalar elsewhere.
@@ -796,11 +1167,12 @@ pub fn q4k_q8k_matvec_into(
         // is compute/issue-bound, see `docs/q4k-decode-kernel.md`.)
         //
         // C12: opt-in hand-asm kernel (`LARQL_Q4K_ASM=1`). Bit-exact with
-        // the intrinsic path; ~+2.5% isolated. Default off until the
-        // two-super-block-interleaved version closes more of the gap and
-        // the gate_up fused path gets the same treatment.
+        // the intrinsic path. v2 (2026-06-11) folds ALL the per-super-block
+        // Rust glue into the asm block (vectorised scale/min unpack, sum2,
+        // hardware fcvt + epilogue) — the decomposition bench measured the
+        // glue at 19.2 cyc/SB vs the asm block's 16.3.
         if use_asm_kernel() {
-            q4k_q8k_matvec_asm(out, q8k_x, w, rows, cols);
+            q4k_q8k_matvec_asm_v3(out, q8k_x, w, rows, cols);
         } else {
             q4k_q8k_matvec_neon(out, q8k_x, w, rows, cols);
         }
@@ -814,6 +1186,64 @@ pub fn q4k_q8k_matvec_into(
     }
     #[allow(unreachable_code)]
     q4k_q8k_matvec_scalar(out, q8k_x, w, rows, cols);
+}
+
+/// Row-chunked **parallel** Q4_K / Q6_K × Q8_K matvec — the single source for
+/// every quantized projection on the decode path (attention Q/K/V/O, the dense
+/// FFN gate/up/down slab, and the lm_head vocab projection). Fills `out[0..rows]`
+/// with each weight row's dot against `q8k_x`.
+///
+/// `format` is `"Q4_K"` or `"Q6_K"` (selects the per-row kernel and the byte
+/// stride). The per-row kernel ([`q4k_q8k_matvec_into`] / [`q6k_q8k_matvec_into`])
+/// is single-threaded; this wraps it across output-row chunks and routes the
+/// chunks through the spin pool when enabled, else rayon — so the whole decode
+/// path shares one parallelism strategy.
+///
+/// This centralizes what were four byte-identical `par_chunks_mut` copies
+/// (larql-compute `cached.rs`, larql-inference `cached.rs`, and the two lm_head
+/// blocks in larql-inference `dense.rs`) — the "consolidation hazard" twins.
+/// `out.len()` must be `>= rows`; rows beyond `rows` are left untouched.
+pub fn q4k_q8k_matvec_parallel(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    format: &str,
+) {
+    // Only Q4_K / Q6_K have a kernel below; gate on those, but take the
+    // packed super-block geometry from the format helper rather than
+    // re-spelling `(cols/256)*144`/`*210`. The truncating `cols / block_elems`
+    // is preserved (k-quant cols are always a 256-multiple in practice).
+    let fmt = match crate::QuantFormat::from_registry_tag(format) {
+        Some(f @ (crate::QuantFormat::Q4_K | crate::QuantFormat::Q6_K)) => f,
+        _ => return,
+    };
+    let (block_elems, block_bytes) = fmt
+        .packed_block_layout()
+        .expect("Q4_K/Q6_K always have a packed block layout");
+    let bytes_per_row = (cols / block_elems) * block_bytes;
+    if rows == 0 || cols == 0 || bytes.len() < rows * bytes_per_row {
+        return;
+    }
+    const CHUNK_ROWS: usize = 32;
+    crate::cpu::spin_pool::par_chunks_mut(&mut out[..rows], CHUNK_ROWS, |chunk_idx, chunk| {
+        let row_start = chunk_idx * CHUNK_ROWS;
+        let chunk_len = chunk.len().min(rows.saturating_sub(row_start));
+        if chunk_len == 0 {
+            return;
+        }
+        let w_chunk = &bytes[row_start * bytes_per_row..(row_start + chunk_len) * bytes_per_row];
+        match fmt {
+            crate::QuantFormat::Q4_K => {
+                q4k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols)
+            }
+            crate::QuantFormat::Q6_K => {
+                q6k_q8k_matvec_into(&mut chunk[..chunk_len], q8k_x, w_chunk, chunk_len, cols)
+            }
+            _ => {}
+        }
+    });
 }
 
 /// AVX2 Q4_K × Q8_K matvec for x86_64.
@@ -934,7 +1364,14 @@ pub fn q4k_q8k_gate_up_into(
 ) {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        q4k_q8k_gate_up_neon(gate_out, up_out, q8k_x, gate_w, up_w, rows, cols);
+        // C12: same opt-in as `q4k_q8k_matvec_into` — `LARQL_Q4K_ASM=1`
+        // routes the fused kernel through the hand-asm form. Bit-exact
+        // (`q8k_gate_up_asm_matches_scalar_bit_exact`); default off.
+        if use_asm_kernel() {
+            q4k_q8k_gate_up_asm(gate_out, up_out, q8k_x, gate_w, up_w, rows, cols);
+        } else {
+            q4k_q8k_gate_up_neon(gate_out, up_out, q8k_x, gate_w, up_w, rows, cols);
+        }
         return;
     }
     #[allow(unreachable_code)]
@@ -1064,6 +1501,234 @@ pub fn q4k_q8k_gate_up_neon(
                 s1_u += sc_u[sb_lo] as i32 * u_dot_lo + sc_u[sb_hi] as i32 * u_dot_hi;
                 s2_u += mn_u[sb_lo] as i32 * q8_sums[sb_lo] as i32
                     + mn_u[sb_hi] as i32 * q8_sums[sb_hi] as i32;
+            }
+            acc_g += d_g * d_y * s1_g as f32 - dmin_g * d_y * s2_g as f32;
+            acc_u += d_u * d_y * s1_u as f32 - dmin_u * d_y * s2_u as f32;
+        }
+        gate_out[r] = acc_g;
+        up_out[r] = acc_u;
+    }
+}
+
+/// Fused gate+up twin of [`q4k_sb_sum1_asm`] (C12): one super-block's integer
+/// `sum1` for BOTH the gate and up matrices in a single `asm!` block, sharing
+/// the four activation vector loads per group between them — the point of the
+/// fusion (the separate-matvec form streams the same 64 activation bytes per
+/// group twice, and the doubled SDOT stream gives the OoO core independent
+/// work to fill the ~20 stalled cycles the single-matrix form measures).
+/// Scale handling matches the single-matrix form: 8 scales per matrix arrive
+/// as two i32x4 vectors, applied with `mul (by element)` — no scalar `ldrb`.
+///
+/// Register map: v16 nibble mask; v17/v26 gate/up accumulators; v18-v19
+/// gate scales, v24-v25 up scales; per group v0-v1/v8-v9 raw nibbles,
+/// v2-v5/v10-v13 unpacked, v6-v7/v14-v15 dot temps, v20-v23 shared
+/// activation. i32 lane sums are order-independent (wrapping add is
+/// associative), so the tree-sum is bit-exact with the scalar reference.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+unsafe fn q4k_gate_up_sb_sum1_asm(
+    g_quants: *const u8,
+    u_quants: *const u8,
+    act: *const i8,
+    g_scales: *const i32,
+    u_scales: *const i32,
+) -> (i32, i32) {
+    let sum1_g: i32;
+    let sum1_u: i32;
+    // One group of the unrolled body: `$gsv`/`$usv` = gate/up scale vectors,
+    // `$l0`/`$l1` = lane indices for sub-blocks 2g / 2g+1.
+    macro_rules! grp2 {
+        ($gsv:literal, $usv:literal, $l0:literal, $l1:literal) => {
+            concat!(
+                "ld1 {{v0.16b, v1.16b}}, [{g}], #32\n",
+                "ld1 {{v8.16b, v9.16b}}, [{u}], #32\n",
+                "ld1 {{v20.16b, v21.16b, v22.16b, v23.16b}}, [{a}], #64\n",
+                "and  v2.16b, v0.16b, v16.16b\n", // gate lo (sub-block 2g)
+                "and  v3.16b, v1.16b, v16.16b\n",
+                "ushr v4.16b, v0.16b, #4\n", // gate hi (sub-block 2g+1)
+                "ushr v5.16b, v1.16b, #4\n",
+                "and  v10.16b, v8.16b, v16.16b\n", // up lo
+                "and  v11.16b, v9.16b, v16.16b\n",
+                "ushr v12.16b, v8.16b, #4\n", // up hi
+                "ushr v13.16b, v9.16b, #4\n",
+                "movi v6.4s, #0\n",
+                "movi v7.4s, #0\n",
+                "movi v14.4s, #0\n",
+                "movi v15.4s, #0\n",
+                // Gate / up SDOTs interleaved — independent chains on the
+                // same shared activation registers.
+                "sdot v6.4s,  v2.16b,  v20.16b\n",
+                "sdot v14.4s, v10.16b, v20.16b\n",
+                "sdot v6.4s,  v3.16b,  v21.16b\n",
+                "sdot v14.4s, v11.16b, v21.16b\n",
+                "sdot v7.4s,  v4.16b,  v22.16b\n",
+                "sdot v15.4s, v12.16b, v22.16b\n",
+                "sdot v7.4s,  v5.16b,  v23.16b\n",
+                "sdot v15.4s, v13.16b, v23.16b\n",
+                "mul  v6.4s,  v6.4s,  ",
+                $gsv,
+                ".s[",
+                $l0,
+                "]\n",
+                "mul  v7.4s,  v7.4s,  ",
+                $gsv,
+                ".s[",
+                $l1,
+                "]\n",
+                "mul  v14.4s, v14.4s, ",
+                $usv,
+                ".s[",
+                $l0,
+                "]\n",
+                "mul  v15.4s, v15.4s, ",
+                $usv,
+                ".s[",
+                $l1,
+                "]\n",
+                "add  v17.4s, v17.4s, v6.4s\n",
+                "add  v17.4s, v17.4s, v7.4s\n",
+                "add  v26.4s, v26.4s, v14.4s\n",
+                "add  v26.4s, v26.4s, v15.4s\n",
+            )
+        };
+    }
+    unsafe {
+        core::arch::asm!(
+            "movi v16.16b, #0x0f",                // nibble mask
+            "movi v17.4s, #0",                    // gate sum1 accumulator
+            "movi v26.4s, #0",                    // up sum1 accumulator
+            "ld1 {{v18.4s, v19.4s}}, [{gs}]",     // gate scales[0..4], [4..8]
+            "ld1 {{v24.4s, v25.4s}}, [{us}]",     // up scales[0..4], [4..8]
+            grp2!("v18", "v24", "0", "1"),        // group 0 → sub-blocks 0,1
+            grp2!("v18", "v24", "2", "3"),        // group 1 → sub-blocks 2,3
+            grp2!("v19", "v25", "0", "1"),        // group 2 → sub-blocks 4,5
+            grp2!("v19", "v25", "2", "3"),        // group 3 → sub-blocks 6,7
+            "addv s17, v17.4s",
+            "addv s26, v26.4s",
+            "fmov {sg:w}, s17",
+            "fmov {su:w}, s26",
+            g = inout(reg) g_quants => _,
+            u = inout(reg) u_quants => _,
+            a = inout(reg) act => _,
+            gs = in(reg) g_scales,
+            us = in(reg) u_scales,
+            sg = out(reg) sum1_g,
+            su = out(reg) sum1_u,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _,
+            options(nostack, readonly),
+        );
+    }
+    (sum1_g, sum1_u)
+}
+
+/// Hand-asm fused gate+up matvec (C12). Identical interface and output to
+/// [`q4k_q8k_gate_up_neon`] — integer `sum1` pairs come from
+/// [`q4k_gate_up_sb_sum1_asm`], the `sum2` terms and the f32 epilogue are
+/// the same Rust code as the neon/scalar forms, so it is bit-exact with two
+/// independent scalar matvecs (`q8k_gate_up_asm_matches_scalar_bit_exact`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[allow(clippy::too_many_arguments)]
+pub fn q4k_q8k_gate_up_asm(
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    gate_w: &[u8],
+    up_w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(gate_out.len(), rows);
+    debug_assert_eq!(up_out.len(), rows);
+    debug_assert_eq!(q8k_x.qs.len(), cols);
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    if rows == 0 || cols == 0 {
+        for v in gate_out.iter_mut() {
+            *v = 0.0;
+        }
+        for v in up_out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    if gate_w.len() < rows * row_bytes || up_w.len() < rows * row_bytes {
+        for v in gate_out.iter_mut() {
+            *v = 0.0;
+        }
+        for v in up_out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    for r in 0..rows {
+        let row_base = r * row_bytes;
+        let mut acc_g = 0.0f32;
+        let mut acc_u = 0.0f32;
+        for sb in 0..n_blocks {
+            let g_block = &gate_w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+            let u_block = &up_w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+            let d_g = f16_to_f32(u16::from_le_bytes([g_block[0], g_block[1]]));
+            let dmin_g = f16_to_f32(u16::from_le_bytes([g_block[2], g_block[3]]));
+            let d_u = f16_to_f32(u16::from_le_bytes([u_block[0], u_block[1]]));
+            let dmin_u = f16_to_f32(u16::from_le_bytes([u_block[2], u_block[3]]));
+            let (sc_g, mn_g) = unpack_scales_mins(&g_block[4..16]);
+            let (sc_u, mn_u) = unpack_scales_mins(&u_block[4..16]);
+
+            let sc_g_i32 = [
+                sc_g[0] as i32,
+                sc_g[1] as i32,
+                sc_g[2] as i32,
+                sc_g[3] as i32,
+                sc_g[4] as i32,
+                sc_g[5] as i32,
+                sc_g[6] as i32,
+                sc_g[7] as i32,
+            ];
+            let sc_u_i32 = [
+                sc_u[0] as i32,
+                sc_u[1] as i32,
+                sc_u[2] as i32,
+                sc_u[3] as i32,
+                sc_u[4] as i32,
+                sc_u[5] as i32,
+                sc_u[6] as i32,
+                sc_u[7] as i32,
+            ];
+
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_qs_ptr = q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK].as_ptr();
+            let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
+            let d_y = q8k_x.d[sb];
+
+            // SAFETY: each Q4_K super-block is 144 bytes (16 header + 128
+            // quants), `q8_qs_ptr` spans a full 256-i8 super-block, and both
+            // scale arrays are 8 i32.
+            let (s1_g, s1_u) = unsafe {
+                q4k_gate_up_sb_sum1_asm(
+                    g_block[16..].as_ptr(),
+                    u_block[16..].as_ptr(),
+                    q8_qs_ptr,
+                    sc_g_i32.as_ptr(),
+                    sc_u_i32.as_ptr(),
+                )
+            };
+
+            // sum2 stays scalar (precomputed Q8_K sums; no SDOT) — identical
+            // to the neon/scalar paths so the f32 epilogue is bit-for-bit the
+            // same.
+            let mut s2_g: i32 = 0;
+            let mut s2_u: i32 = 0;
+            for s in 0..SUBBLOCKS_PER_BLOCK {
+                s2_g += mn_g[s] as i32 * q8_sums[s] as i32;
+                s2_u += mn_u[s] as i32 * q8_sums[s] as i32;
             }
             acc_g += d_g * d_y * s1_g as f32 - dmin_g * d_y * s2_g as f32;
             acc_u += d_u * d_y * s1_u as f32 - dmin_u * d_y * s2_u as f32;
@@ -1268,6 +1933,168 @@ pub fn q6k_q8k_matvec_neon(
     }
 }
 
+/// TBL index table for the Q6_K hi2 replicate: group `j` (of 4 within one
+/// 16-byte `qh` vector) selects bytes `4j..4j+3`, each repeated 4×, so a
+/// single `tbl` builds the per-element hi2 source that the neon form
+/// assembles with four scalar multiplies per group.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[rustfmt::skip]
+static Q6K_TBL_IDX: [u8; 64] = [
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+    4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+    8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11,
+    12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15,
+];
+
+/// Right-shift pattern for the replicated hi2 bytes (negative = shift right
+/// under `sshl`): element 4j+k needs `qh_byte >> 2k`.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+static Q6K_SHIFT_RIGHT: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+
+/// One Q6_K super-block's integer `sum1 = Σ_g scale[g] · dot16_g` in a single
+/// `asm!` block (C12). Differences from [`q6k_q8k_matvec_neon`]'s inner loop:
+/// the hi2 replicate is one `tbl` (vs 4 scalar multiplies + vector rebuild),
+/// and the per-group scale lands as a vector-lane `mul` on the 4-lane SDOT
+/// partials with a single `addv` at the end (vs 16 horizontal `addv` + scalar
+/// multiply-adds). i32 lane sums are order-independent (wrapping add), so the
+/// result is bit-exact with the neon/scalar forms.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+unsafe fn q6k_sb_sum1_asm(ql: *const u8, qh: *const u8, act: *const i8, scales: *const i32) -> i32 {
+    let sum1: i32;
+    // One 16-element group: `$qh` = the loaded qh vector for this group's
+    // quad (v8-v11), `$idx` = the TBL replicate index vector for the group's
+    // position within that quad (v24-v27), `$sv`/`$lane` = widened scale
+    // vector (v12-v15) and lane.
+    macro_rules! q6grp {
+        ($qh:literal, $idx:literal, $sv:literal, $lane:literal) => {
+            concat!(
+                "ld1 {{v0.8b}}, [{ql}], #8\n",
+                "ld1 {{v5.16b}}, [{a}], #16\n",
+                "and  v1.16b, v0.16b, v29.16b\n", // lo4 of even elements
+                "ushr v2.16b, v0.16b, #4\n",      // lo4 of odd elements
+                "zip1 v3.16b, v1.16b, v2.16b\n",  // restore element order
+                "tbl  v4.16b, {{",
+                $qh,
+                ".16b}}, ",
+                $idx,
+                ".16b\n",
+                "sshl v4.16b, v4.16b, v28.16b\n",
+                "and  v4.16b, v4.16b, v30.16b\n",
+                "shl  v4.16b, v4.16b, #4\n",
+                "orr  v3.16b, v3.16b, v4.16b\n", // raw6 = lo4 | hi2<<4
+                "sub  v3.16b, v3.16b, v31.16b\n", // signed: raw6 - 32
+                "movi v6.4s, #0\n",
+                "sdot v6.4s, v3.16b, v5.16b\n",
+                "mul  v6.4s, v6.4s, ",
+                $sv,
+                ".s[",
+                $lane,
+                "]\n",
+                "add  v16.4s, v16.4s, v6.4s\n",
+            )
+        };
+    }
+    unsafe {
+        core::arch::asm!(
+            "movi v16.4s, #0",                           // sum1 accumulator
+            "movi v29.16b, #0x0f",                       // lo4 mask
+            "movi v30.16b, #0x03",                       // hi2 mask
+            "movi v31.16b, #32",                         // raw6 bias
+            "ld1 {{v8.16b, v9.16b, v10.16b, v11.16b}}, [{qh}]",      // 64B qh
+            "ld1 {{v12.4s, v13.4s, v14.4s, v15.4s}}, [{scales}]",    // 16 i32 scales
+            "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{idx}]",   // TBL tables
+            "ld1 {{v28.16b}}, [{shift}]",                            // shift pattern
+            q6grp!("v8", "v24", "v12", "0"),
+            q6grp!("v8", "v25", "v12", "1"),
+            q6grp!("v8", "v26", "v12", "2"),
+            q6grp!("v8", "v27", "v12", "3"),
+            q6grp!("v9", "v24", "v13", "0"),
+            q6grp!("v9", "v25", "v13", "1"),
+            q6grp!("v9", "v26", "v13", "2"),
+            q6grp!("v9", "v27", "v13", "3"),
+            q6grp!("v10", "v24", "v14", "0"),
+            q6grp!("v10", "v25", "v14", "1"),
+            q6grp!("v10", "v26", "v14", "2"),
+            q6grp!("v10", "v27", "v14", "3"),
+            q6grp!("v11", "v24", "v15", "0"),
+            q6grp!("v11", "v25", "v15", "1"),
+            q6grp!("v11", "v26", "v15", "2"),
+            q6grp!("v11", "v27", "v15", "3"),
+            "addv s16, v16.4s",
+            "fmov {sum1:w}, s16",
+            ql = inout(reg) ql => _,
+            a = inout(reg) act => _,
+            qh = in(reg) qh,
+            scales = in(reg) scales,
+            idx = in(reg) Q6K_TBL_IDX.as_ptr(),
+            shift = in(reg) Q6K_SHIFT_RIGHT.as_ptr(),
+            sum1 = out(reg) sum1,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+    sum1
+}
+
+/// Hand-asm Q6_K × Q8_K matvec (C12). Identical interface and output to
+/// [`q6k_q8k_matvec_neon`] — `sum1` comes from [`q6k_sb_sum1_asm`], the f32
+/// epilogue (`acc += d_w·d_y·sum1`, no mins term) is the same Rust code, so
+/// it is bit-exact with the scalar reference
+/// (`q6k_matvec_asm_matches_scalar_bit_exact`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn q6k_q8k_matvec_asm(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * Q6K_BLOCK_BYTES;
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    if rows == 0 || cols == 0 || w.len() < rows * row_bytes {
+        return;
+    }
+
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+        for sb in 0..n_blocks {
+            let block = &w[row_base + sb * Q6K_BLOCK_BYTES..];
+            let d_w = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let d_y = q8k_x.d[sb];
+
+            // 16 per-group i8 scales widened to i32 for the vector-lane muls.
+            let mut sc = [0i32; 16];
+            for (g, s) in sc.iter_mut().enumerate() {
+                *s = block[192 + g] as i8 as i32;
+            }
+
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_ptr = q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK].as_ptr();
+
+            // SAFETY: a Q6_K super-block is 210 bytes (128 ql + 64 qh + 16
+            // scales + 2 d); `q8_ptr` spans a full 256-i8 super-block; `sc`
+            // is 16 i32; the static TBL/shift tables are 64/16 bytes.
+            let sum1 = unsafe {
+                q6k_sb_sum1_asm(block.as_ptr(), block.as_ptr().add(128), q8_ptr, sc.as_ptr())
+            };
+            acc += d_w * d_y * sum1 as f32;
+        }
+        *out_r = acc;
+    }
+}
+
 /// Public entry point: dispatches to NEON on aarch64, scalar elsewhere.
 /// `w` is a Q6_K weight matrix of `rows` rows × `cols` columns.
 /// `q8k_x` is the pre-quantised activation vector (`cols` elements).
@@ -1280,7 +2107,13 @@ pub fn q6k_q8k_matvec_into(
 ) {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        q6k_q8k_matvec_neon(out, q8k_x, w, rows, cols);
+        // C12: same opt-in as the Q4_K kernels — `LARQL_Q4K_ASM=1` routes
+        // through the hand-asm form. Bit-exact; default off.
+        if use_asm_kernel() {
+            q6k_q8k_matvec_asm(out, q8k_x, w, rows, cols);
+        } else {
+            q6k_q8k_matvec_neon(out, q8k_x, w, rows, cols);
+        }
         return;
     }
     #[allow(unreachable_code)]
@@ -1512,20 +2345,231 @@ mod tests {
         );
     }
 
-    /// `LARQL_Q4K_ASM` opt-in truth table (the pure parse behind the
-    /// `OnceLock`-cached `use_asm_kernel`).
+    /// The fused gate+up hand-asm kernel must be bit-exact with two
+    /// independent scalar matvecs — same shapes discipline as the
+    /// single-matrix asm test, with DIFFERENT gate vs up weights so a
+    /// pointer/register swap between the two matrices can't cancel out.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     #[test]
-    fn q4k_asm_flag_truth_table() {
-        assert!(q4k_asm_flag_enabled(Some("1")));
-        assert!(q4k_asm_flag_enabled(Some("true")));
-        assert!(q4k_asm_flag_enabled(Some("TRUE")));
-        assert!(q4k_asm_flag_enabled(Some("True")));
-        assert!(!q4k_asm_flag_enabled(Some("0")));
-        assert!(!q4k_asm_flag_enabled(Some("false")));
-        assert!(!q4k_asm_flag_enabled(Some("yes")));
-        assert!(!q4k_asm_flag_enabled(Some("")));
-        assert!(!q4k_asm_flag_enabled(None));
+    fn q8k_gate_up_asm_matches_scalar_bit_exact() {
+        for &(rows, cols) in &[(7usize, 1024usize), (8, 2560), (3, 2560), (16, 512)] {
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+                })
+                .collect();
+            let g_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+                })
+                .collect();
+            let u_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.019).sin() * 0.5 + (f * 0.031).cos() * 0.3) * 0.7
+                })
+                .collect();
+            let g_q4 = quantize_q4_k(&g_f32);
+            let u_q4 = quantize_q4_k(&u_f32);
+            let q8 = quantize_x_to_q8k(&x);
+
+            let mut g_scalar = vec![0.0f32; rows];
+            let mut u_scalar = vec![0.0f32; rows];
+            q4k_q8k_matvec_scalar(&mut g_scalar, &q8, &g_q4, rows, cols);
+            q4k_q8k_matvec_scalar(&mut u_scalar, &q8, &u_q4, rows, cols);
+
+            let mut g_asm = vec![0.0f32; rows];
+            let mut u_asm = vec![0.0f32; rows];
+            q4k_q8k_gate_up_asm(&mut g_asm, &mut u_asm, &q8, &g_q4, &u_q4, rows, cols);
+
+            for r in 0..rows {
+                assert_eq!(
+                    g_scalar[r].to_bits(),
+                    g_asm[r].to_bits(),
+                    "gate rows={rows} cols={cols} row {r}: scalar={} asm={}",
+                    g_scalar[r],
+                    g_asm[r],
+                );
+                assert_eq!(
+                    u_scalar[r].to_bits(),
+                    u_asm[r].to_bits(),
+                    "up rows={rows} cols={cols} row {r}: scalar={} asm={}",
+                    u_scalar[r],
+                    u_asm[r],
+                );
+            }
+        }
+    }
+
+    /// Fused gate+up asm early-return guards: zero dims and short weight
+    /// buffers must zero BOTH outputs (same contract as the neon form).
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q8k_gate_up_asm_zero_dims_and_short_weights_zero_output() {
+        let empty = Q8KActivation {
+            qs: vec![],
+            d: vec![],
+            sums: vec![],
+        };
+        let mut g = vec![1.0f32; 4];
+        let mut u = vec![1.0f32; 4];
+        q4k_q8k_gate_up_asm(&mut g, &mut u, &empty, &[], &[], 4, 0);
+        assert!(g.iter().chain(u.iter()).all(|&v| v == 0.0));
+
+        let cols = 256;
+        let rows = 2;
+        let q = quantize_x_to_q8k(&vec![0.5f32; cols]);
+        let w_short = vec![0u8; BLOCK_BYTES]; // one row's worth, rows == 2
+        let w_full = vec![0u8; 2 * BLOCK_BYTES];
+        let mut g = vec![1.0f32; rows];
+        let mut u = vec![1.0f32; rows];
+        q4k_q8k_gate_up_asm(&mut g, &mut u, &q, &w_short, &w_full, rows, cols);
+        assert!(g.iter().chain(u.iter()).all(|&v| v == 0.0));
+    }
+
+    /// The v2 (all-glue-in-asm) kernel must be bit-exact with the scalar
+    /// reference: the vectorised scale/min unpack must reproduce
+    /// `unpack_scales_mins` exactly, `fcvt`/`scvtf` match the software
+    /// conversions bit-for-bit, and the epilogue preserves expression order.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q8k_matvec_asm_v2_matches_scalar_bit_exact() {
+        for &(rows, cols) in &[(7usize, 1024usize), (8, 2560), (3, 2560), (16, 512)] {
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+                })
+                .collect();
+            let w_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+                })
+                .collect();
+            let w_q4 = quantize_q4_k(&w_f32);
+            let q8 = quantize_x_to_q8k(&x);
+
+            let mut out_scalar = vec![0.0f32; rows];
+            let mut out_v2 = vec![0.0f32; rows];
+            q4k_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q4, rows, cols);
+            q4k_q8k_matvec_asm_v2(&mut out_v2, &q8, &w_q4, rows, cols);
+
+            for r in 0..rows {
+                assert_eq!(
+                    out_scalar[r].to_bits(),
+                    out_v2[r].to_bits(),
+                    "rows={rows} cols={cols} row {r}: scalar={} v2={} diff={}",
+                    out_scalar[r],
+                    out_v2[r],
+                    (out_scalar[r] - out_v2[r]).abs()
+                );
+            }
+        }
+    }
+
+    /// The v3 (whole-row-in-asm) kernel must be bit-exact with the scalar
+    /// reference — the in-asm loop changes only WHERE the iteration happens,
+    /// not any arithmetic or its order.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q8k_matvec_asm_v3_matches_scalar_bit_exact() {
+        for &(rows, cols) in &[(7usize, 1024usize), (8, 2560), (3, 2560), (16, 512)] {
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+                })
+                .collect();
+            let w_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+                })
+                .collect();
+            let w_q4 = quantize_q4_k(&w_f32);
+            let q8 = quantize_x_to_q8k(&x);
+
+            let mut out_scalar = vec![0.0f32; rows];
+            let mut out_v3 = vec![0.0f32; rows];
+            q4k_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q4, rows, cols);
+            q4k_q8k_matvec_asm_v3(&mut out_v3, &q8, &w_q4, rows, cols);
+
+            for r in 0..rows {
+                assert_eq!(
+                    out_scalar[r].to_bits(),
+                    out_v3[r].to_bits(),
+                    "rows={rows} cols={cols} row {r}: scalar={} v3={} diff={}",
+                    out_scalar[r],
+                    out_v3[r],
+                    (out_scalar[r] - out_v3[r]).abs()
+                );
+            }
+        }
+    }
+
+    /// The Q6_K hand-asm kernel must be bit-exact with the scalar reference
+    /// (and therefore the neon form) — the TBL-replicate + vector-lane scale
+    /// restructure changes only the i32 summation order, which is exact.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q6k_matvec_asm_matches_scalar_bit_exact() {
+        for &(rows, cols) in &[(7usize, 1024usize), (8, 2560), (3, 2560), (16, 512)] {
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+                })
+                .collect();
+            let w_f32: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    let f = i as f32;
+                    ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+                })
+                .collect();
+            let w_q6 = quantize_q6_k(&w_f32);
+            let q8 = quantize_x_to_q8k(&x);
+
+            let mut out_scalar = vec![0.0f32; rows];
+            let mut out_asm = vec![0.0f32; rows];
+            q6k_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q6, rows, cols);
+            q6k_q8k_matvec_asm(&mut out_asm, &q8, &w_q6, rows, cols);
+
+            for r in 0..rows {
+                assert_eq!(
+                    out_scalar[r].to_bits(),
+                    out_asm[r].to_bits(),
+                    "rows={rows} cols={cols} row {r}: scalar={} asm={} diff={}",
+                    out_scalar[r],
+                    out_asm[r],
+                    (out_scalar[r] - out_asm[r]).abs()
+                );
+            }
+        }
+    }
+
+    /// Q6_K asm early-return guards: zero dims / short weights zero output.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn q6k_matvec_asm_zero_dims_and_short_weights_zero_output() {
+        let empty = Q8KActivation {
+            qs: vec![],
+            d: vec![],
+            sums: vec![],
+        };
+        let mut out = vec![1.0f32; 4];
+        q6k_q8k_matvec_asm(&mut out, &empty, &[], 4, 0);
+        assert!(out.iter().all(|&v| v == 0.0));
+
+        let cols = 256;
+        let rows = 2;
+        let q = quantize_x_to_q8k(&vec![0.5f32; cols]);
+        let w = vec![0u8; Q6K_BLOCK_BYTES]; // one row's worth, rows == 2
+        let mut out = vec![1.0f32; rows];
+        q6k_q8k_matvec_asm(&mut out, &q, &w, rows, cols);
+        assert!(out.iter().all(|&v| v == 0.0));
     }
 
     /// `quantize_x_to_q8k_into` must produce the same `qs`, `d`, `sums` as

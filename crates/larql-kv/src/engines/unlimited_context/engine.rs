@@ -23,6 +23,7 @@ use serde::Serialize;
 use super::checkpoint_store::CheckpointStore;
 use super::extend::{
     empty_prior, rs_extend_from_checkpoint_backend, rs_extend_from_checkpoint_quant,
+    rs_extend_inplace,
 };
 use super::token_archive::TokenArchive;
 use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
@@ -94,6 +95,9 @@ pub struct UnlimitedContextEngine {
     /// prefill routes through `coarse_prefill_with_state`. `None` =
     /// legacy CPU walk path.
     pub(super) kv_handle: Option<larql_inference::KvHandle>,
+    /// Engine-owned f32 dequant scratch for the per-layer walk fallback
+    /// (see `MarkovResidualEngine::dequant_scratch`). Keeps `weights` immutable.
+    pub(super) dequant_scratch: larql_inference::DequantScratch,
 }
 
 impl UnlimitedContextEngine {
@@ -116,6 +120,7 @@ impl UnlimitedContextEngine {
             profiling: false,
             profile: crate::profiler::EngineProfiler::default(),
             kv_handle: None,
+            dequant_scratch: larql_inference::DequantScratch::new(),
         }
     }
 
@@ -131,12 +136,25 @@ impl UnlimitedContextEngine {
         tokens: &[u32],
         moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
     ) -> Option<()> {
+        self.process_with_index(weights, tokens, moe_ffn, None)
+    }
+
+    /// `process` with an optional vindex threaded to the per-token attention
+    /// steps (Q4K-direct route under `LARQL_Q4K_DIRECT_ATTN` — the
+    /// non-standard-engine structural-gap fix).
+    pub fn process_with_index(
+        &mut self,
+        weights: &ModelWeights,
+        tokens: &[u32],
+        moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Option<()> {
         let mut remaining = tokens;
         while !remaining.is_empty() {
             let free = self.window_size - self.current_window_tokens.len();
             let take = remaining.len().min(free);
             let (chunk, rest) = remaining.split_at(take);
-            self.extend_current(weights, chunk, moe_ffn)?;
+            self.extend_current(weights, chunk, moe_ffn, index)?;
             remaining = rest;
             if self.current_window_tokens.len() >= self.window_size {
                 self.close_window();
@@ -154,9 +172,17 @@ impl UnlimitedContextEngine {
 
     /// Reconstruct a window's full K,V by replaying its archived tokens from
     /// the prior window's boundary checkpoint.
+    ///
+    /// For hybrid-MoE models, pass the FFN hook + vindex so the replay
+    /// dispatches experts exactly like the live-window path
+    /// ([`extend_current`](Self::extend_current)); pass `None`/`None` for dense
+    /// models. (Previously this always passed `None` → dense FFN, which would
+    /// have produced wrong K/V for an evicted MoE window — the C1 follow-up.)
     pub fn replay_window(
         &self,
         weights: &ModelWeights,
+        moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+        index: Option<&larql_vindex::VectorIndex>,
         window_id: usize,
     ) -> Option<(Vec<SharedKV>, usize)> {
         let (tokens, abs_offset) = self.archive.retrieve(window_id)?;
@@ -168,16 +194,14 @@ impl UnlimitedContextEngine {
             empty_prior(weights)
         };
 
-        // Archived-window replay does not yet re-dispatch remote MoE experts
-        // (it fires only on window eviction / long context). `None` → dense
-        // FFN; see the larql-kv "MoE-aware KV engines (C1)" roadmap follow-up.
         let out = rs_extend_from_checkpoint_backend(
-            weights,
+            larql_inference::WeightsView::dense(weights),
             tokens,
             prior,
             abs_offset,
             self.backend.as_ref(),
-            None,
+            moe_ffn,
+            index,
         )?;
         let abs_end = abs_offset + tokens.len() - 1;
         Some((out.kv_cache, abs_end))
@@ -269,9 +293,9 @@ impl UnlimitedContextEngine {
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
         let prof = self.profiling.then_some(&mut self.profile);
-        let out = rs_extend_from_checkpoint_quant(
-            weights, index, chunk, prior, abs_start, backend, prof,
-        )?;
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
+        let out =
+            rs_extend_from_checkpoint_quant(view, index, chunk, prior, abs_start, backend, prof)?;
 
         self.last_hidden = Some(out.last_hidden);
         // CPU walk path returns narrow `[n, kv_dim]` arrays — counter
@@ -306,39 +330,75 @@ impl UnlimitedContextEngine {
         weights: &ModelWeights,
         chunk: &[u32],
         moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<()> {
         if chunk.is_empty() {
             return Some(());
         }
 
-        let prior = if self.current_window_tokens.is_empty() {
+        // `prior_len` is the prior's LOGICAL row count — the window-KV counter
+        // mid-window, the checkpoint's row count at a window start, or 0.
+        let (mut prior, prior_len) = if self.current_window_tokens.is_empty() {
             if self.current_window_id > 0 && self.checkpoints.contains(self.current_window_id - 1) {
                 let (ckpt, _) = self.checkpoints.load(self.current_window_id - 1)?;
-                ckpt
+                let len = ckpt.first().map_or(0, |(k, _)| k.shape()[0]);
+                (ckpt, len)
             } else {
-                empty_prior(weights)
+                (empty_prior(weights), 0)
             }
         } else {
-            self.current_window_kv
-                .take()
-                .unwrap_or_else(|| empty_prior(weights))
+            (
+                self.current_window_kv
+                    .take()
+                    .unwrap_or_else(|| empty_prior(weights)),
+                self.current_window_kv_len,
+            )
         };
 
         let abs_start = self.abs_offset + self.current_window_tokens.len();
-        let out = rs_extend_from_checkpoint_backend(
-            weights,
-            chunk,
-            prior,
-            abs_start,
-            self.backend.as_ref(),
-            moe_ffn,
-        )?;
 
-        self.last_hidden = Some(out.last_hidden);
-        // CPU walk path: see comment on extend_current_quant — narrow
-        // arrays, counter == shape[0].
-        self.current_window_kv_len = out.kv_cache.first().map_or(0, |(k, _)| k.shape()[0]);
-        self.current_window_kv = Some(out.kv_cache);
+        // In-place fast path: append the chunk's K/V rows into the window's
+        // doubling-capacity buffers instead of rebuilding an owned `[len+1]`
+        // concat every layer every step (O(window) → O(1) per step). Gated to
+        // the Q4K-direct route (with the shared `LARQL_MARKOV_INPLACE_KV`
+        // toggle); flags-off keeps the unchanged owned-concat path bit-for-bit,
+        // which is what `resident_identity_tests` pins. The window's existing
+        // `current_window_kv_len` counter already treats the buffers as
+        // over-allocated (the dispatch path does too), so close_window /
+        // current_kv_bytes need no change.
+        let use_inplace = index.is_some()
+            && crate::engines::markov_residual::compute::markov_inplace_kv_enabled()
+            && larql_compute::options::q4k_direct_attn_enabled();
+
+        if use_inplace {
+            let last = rs_extend_inplace(
+                larql_inference::WeightsView::dense(weights),
+                chunk,
+                &mut prior,
+                prior_len,
+                abs_start,
+                self.backend.as_ref(),
+                moe_ffn,
+                index,
+            )?;
+            self.last_hidden = Some(last);
+            self.current_window_kv_len = prior_len + chunk.len();
+            self.current_window_kv = Some(prior);
+        } else {
+            let out = rs_extend_from_checkpoint_backend(
+                larql_inference::WeightsView::dense(weights),
+                chunk,
+                prior,
+                abs_start,
+                self.backend.as_ref(),
+                moe_ffn,
+                index,
+            )?;
+            self.last_hidden = Some(out.last_hidden);
+            // CPU walk path: narrow arrays, counter == shape[0].
+            self.current_window_kv_len = out.kv_cache.first().map_or(0, |(k, _)| k.shape()[0]);
+            self.current_window_kv = Some(out.kv_cache);
+        }
         self.current_window_tokens.extend_from_slice(chunk);
         Some(())
     }
@@ -481,6 +541,26 @@ impl KvEngine for UnlimitedContextEngine {
             })
     }
 
+    /// Resident-path decode: threads `index` to the per-token attention
+    /// steps' Q4K-direct route (the non-standard-engine structural-gap fix).
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        self.process_with_index(weights, &[token_id], Some(ffn), Some(index))
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "process returned None during decode_step".into(),
+            })?;
+        self.last_hidden
+            .clone()
+            .ok_or_else(|| EngineError::BackendFailure {
+                details: "last_hidden missing after decode_step".into(),
+            })
+    }
+
     fn memory_bytes(&self) -> usize {
         self.checkpoints.total_bytes() + self.archive.total_bytes() + self.current_kv_bytes()
     }
@@ -511,7 +591,7 @@ impl KvEngine for UnlimitedContextEngine {
     /// from captured per-layer state (W1-GPU) or computed via walk.
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_ids: &[u32],
@@ -524,7 +604,7 @@ impl KvEngine for UnlimitedContextEngine {
             return Ok(hidden);
         }
         self.kv_handle = None;
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
         self.process_quant(weights, index, token_ids, backend)
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process_quant returned None during prefill_quant".into(),
@@ -538,7 +618,7 @@ impl KvEngine for UnlimitedContextEngine {
 
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &VectorIndex,
         token_id: u32,
@@ -551,7 +631,7 @@ impl KvEngine for UnlimitedContextEngine {
                     details: "decode_step_via_dispatch returned None".into(),
                 });
         }
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
         self.process_quant(weights, index, &[token_id], backend)
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process_quant returned None during decode_step_quant".into(),
@@ -576,7 +656,7 @@ impl KvEngine for UnlimitedContextEngine {
     // owns per-layer compute; window state is engine state.
     fn prefill_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
@@ -592,7 +672,7 @@ impl KvEngine for UnlimitedContextEngine {
         if matches!(executor.dispatch_kind(), ExecutorDispatchKind::Fused) {
             return self.prefill_quant(weights, ffn, index, token_ids, executor.backend());
         }
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
         self.process_via_executor(weights, executor, ffn, token_ids)
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process_via_executor returned None during prefill_quant_via_executor"
@@ -607,7 +687,7 @@ impl KvEngine for UnlimitedContextEngine {
 
     fn decode_step_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &VectorIndex,
@@ -617,7 +697,7 @@ impl KvEngine for UnlimitedContextEngine {
         if matches!(executor.dispatch_kind(), ExecutorDispatchKind::Fused) {
             return self.decode_step_quant(weights, ffn, index, token_id, executor.backend());
         }
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
         self.process_via_executor(weights, executor, ffn, &[token_id])
             .ok_or_else(|| EngineError::BackendFailure {
                 details: "process_via_executor returned None during decode_step_quant_via_executor"
@@ -695,8 +775,14 @@ impl UnlimitedContextEngine {
             let mut h = embed_tokens_pub(weights, &[token_id]);
 
             for (layer, kv_slot) in kv_cache.iter_mut().enumerate() {
-                let (h_out, new_kv) =
-                    executor.run_decode_layer(weights, layer, &h, kv_slot, abs_position, ffn)?;
+                let (h_out, new_kv) = executor.run_decode_layer(
+                    larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch),
+                    layer,
+                    &h,
+                    kv_slot,
+                    abs_position,
+                    ffn,
+                )?;
                 h = h_out;
                 *kv_slot = new_kv;
             }
@@ -907,13 +993,13 @@ mod tests {
     fn prefill_quant_cpu_runs_via_dequant_path() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill_quant Q4K cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -922,32 +1008,83 @@ mod tests {
     fn decode_step_quant_cpu_extends_state() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill_quant");
         let h = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode_step_quant Q4K cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// Flags-ON parity gate for the in-place window K/V fast path: an A/B of the
+    /// in-place steady state vs the owned-concat reference, both driving the
+    /// resident decode path (`extend_current`) with Q4K-direct attention live.
+    /// The two must produce bit-identical hidden states every step — the
+    /// in-place append only changes the window-buffer representation (doubling +
+    /// views vs fresh owned concat). 13 tokens < window(512), so it stays in one
+    /// window (no close). Serialised on `Q4K_FLAG_ENV_LOCK`; path selected via
+    /// the shared `LARQL_MARKOV_INPLACE_KV` thread-local override.
+    #[test]
+    fn decode_inplace_matches_owned_concat_flags_on() {
+        use crate::engines::markov_residual::compute::set_markov_env_override;
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+        let _q4k = crate::engines::Q4kFlagGuard::set(&[
+            (larql_compute::options::ENV_Q4K_DIRECT_ATTN, true),
+            (larql_compute::options::ENV_Q4K_ATTN_INT8, false),
+        ]);
+
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+
+        let run = |inplace: bool| -> Vec<Vec<u32>> {
+            set_markov_env_override(
+                "LARQL_MARKOV_INPLACE_KV",
+                Some(if inplace { "1" } else { "0" }),
+            );
+            let mut engine = UnlimitedContextEngine::new(512);
+            engine
+                .prefill(&weights, &ffn, &[0u32, 1, 2])
+                .expect("prefill");
+            let mut hiddens = Vec::new();
+            for tok in 3u32..=12 {
+                let h = engine
+                    .decode_step_resident(&weights, &ffn, &index, tok)
+                    .expect("decode_step_resident");
+                assert!(h.iter().all(|v| v.is_finite()));
+                hiddens.push(h.iter().map(|v| v.to_bits()).collect());
+            }
+            hiddens
+        };
+
+        let a = run(true);
+        let b = run(false);
+        assert_eq!(
+            a, b,
+            "unlimited in-place vs owned-concat hidden states diverged (q4k on)"
+        );
     }
 
     #[test]
     fn decode_step_quant_without_prefill_returns_none() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512);
         // No prefill → decode falls through fast-path checks and returns None
         // (or some empty hidden) without panicking.
-        let _ = engine.decode_step_quant(&mut weights, &ffn, &index, 0, &*backend);
+        let _ = engine.decode_step_quant(&weights, &ffn, &index, 0, &*backend);
     }
 
     // ── Public utility methods (stats, replay_window, summary) ────────────
@@ -994,8 +1131,8 @@ mod tests {
         let engine = UnlimitedContextEngine::new(512);
         // No windows archived → any window_id returns None at the
         // `self.archive.retrieve(window_id)?` line.
-        assert!(engine.replay_window(&weights, 0).is_none());
-        assert!(engine.replay_window(&weights, 99).is_none());
+        assert!(engine.replay_window(&weights, None, None, 0).is_none());
+        assert!(engine.replay_window(&weights, None, None, 99).is_none());
     }
 
     #[test]
@@ -1017,7 +1154,7 @@ mod tests {
         );
         // Replay the first archived window — exercises the
         // `rs_extend_from_checkpoint_backend` path (lines 132-138).
-        let replay = engine.replay_window(&weights, 0);
+        let replay = engine.replay_window(&weights, None, None, 0);
         assert!(replay.is_some(), "replay_window(0) should succeed");
         let (kv, abs_end) = replay.unwrap();
         assert!(!kv.is_empty(), "replayed K/V cache should be non-empty");
@@ -1034,14 +1171,14 @@ mod tests {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
         use larql_inference::test_utils::make_test_weights;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512);
         let h = engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2])
             .expect("executor prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > 0);
@@ -1052,17 +1189,17 @@ mod tests {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
         use larql_inference::test_utils::make_test_weights;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512);
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1])
             .expect("prefill");
         let h = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 2)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -1074,16 +1211,16 @@ mod tests {
     fn process_quant_with_profiling_populates_summary() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::test_utils::make_test_weights;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = UnlimitedContextEngine::new(512).with_profiling(true);
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill");
         engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode");
         let summary = engine
             .stage_summary()
@@ -1125,7 +1262,7 @@ mod tests {
     fn executor_path_honors_ffn_parameter() {
         use larql_inference::layer_executor::LocalWalkExecutor;
         use larql_inference::test_utils::make_test_weights;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
@@ -1136,7 +1273,7 @@ mod tests {
         };
         let mut engine = UnlimitedContextEngine::new(512);
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2])
             .expect("prefill via executor");
 
         let call_count = ffn.calls.load(std::sync::atomic::Ordering::SeqCst);
@@ -1157,7 +1294,7 @@ mod tests {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
         use larql_inference::test_utils::make_test_weights;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
@@ -1167,7 +1304,7 @@ mod tests {
         // branch in `extend_current_via_executor`.
         let mut engine = UnlimitedContextEngine::new(2);
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1, 2, 3])
             .expect("prefill 4 tokens through executor");
         let stats = engine.stats(&weights);
         assert!(

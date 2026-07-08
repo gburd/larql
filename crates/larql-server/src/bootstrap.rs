@@ -354,8 +354,6 @@ pub fn load_single_vindex(
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -445,6 +443,11 @@ pub struct Cli {
     /// Pass this flag if you want the historical lazy behaviour
     /// (e.g. for `--ffn-only` boxes that *might* be promoted to
     /// inference later, or in tests).
+    ///
+    /// Note: `--lazy-weights` also skips the startup memory
+    /// pre-flight check (there is nothing to size before the
+    /// deferred load), so a too-small-RAM condition surfaces on the
+    /// first request rather than at startup.
     #[arg(long)]
     pub lazy_weights: bool,
 
@@ -926,12 +929,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     if !cli.no_memcheck && !cli.lazy_weights {
         let total_estimate: u64 = models
             .iter()
-            // BitNet (--keep-quant) vindexes don't allocate dense
-            // BitLinear tensors at load time — the resident size
-            // estimator targets the dense path and would massively
-            // over-count for them.  Skip until estimate_resident_bytes
-            // grows a bitnet-aware branch.
-            .filter(|m| !m.infer_disabled && !m.is_bitnet())
+            .filter(|m| !m.infer_disabled)
             .map(|m| m.config.estimate_resident_bytes())
             .sum();
         if total_estimate > 0 {
@@ -954,9 +952,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     info!("Memcheck: skipped ({reason})");
                 }
                 crate::memcheck::MemCheckOutcome::Tight { .. } => {
-                    return Err(
-                        crate::memcheck::explain_tight_outcome(&outcome).into(),
-                    );
+                    return Err(crate::memcheck::explain_tight_outcome(&outcome).into());
                 }
             }
         }
@@ -974,27 +970,6 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     } else {
         for m in &models {
             if m.infer_disabled {
-                continue;
-            }
-            // BitNet vindex (--keep-quant) skips the dense load and
-            // pre-loads the native ternary path instead.  Saves ~5 GB
-            // of dense allocation per model on a 2 B BitNet.
-            if m.is_bitnet() {
-                let load_start = std::time::Instant::now();
-                info!("Pre-loading BitNet model for '{}' …", m.id);
-                if let Err(e) = m.force_load_bitnet_model() {
-                    return Err(format!(
-                        "failed to load bitnet model for '{}': {} \
-                         (pass --lazy-weights to defer until first request)",
-                        m.id, e
-                    )
-                    .into());
-                }
-                info!(
-                    "  Pre-loaded BitNet model for '{}' in {:.1}s",
-                    m.id,
-                    load_start.elapsed().as_secs_f64(),
-                );
                 continue;
             }
             let load_start = std::time::Instant::now();

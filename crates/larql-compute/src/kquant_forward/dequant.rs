@@ -15,7 +15,7 @@ use ndarray::Array2;
 /// the k-quant super-block size. Unknown formats panic; callers have
 /// already dispatched on format via the `attn_kquant_layer_data` /
 /// `interleaved_kquant_layer_data` tag.
-pub(super) fn dequantize_matrix(
+pub(crate) fn dequantize_matrix(
     bytes: &[u8],
     format: &str,
     rows: usize,

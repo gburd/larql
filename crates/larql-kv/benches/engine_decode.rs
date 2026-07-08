@@ -78,12 +78,24 @@ fn bench_decode_step(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_step");
     for (name, kind) in all_engines() {
         group.bench_function(name, |b| {
-            // Pre-warm: prefill once, then time a single decode_step.
-            let mut engine = kind.clone().build(cpu_engine_backend());
-            let _ = engine.prefill(&weights, &ffn, &prompt);
-            b.iter(|| {
-                let _ = engine.decode_step(&weights, &ffn, 1);
-            });
+            // Measure ONE decode step at a fixed (prompt-length) context. A
+            // fresh prefilled engine per timed call keeps the K/V cache from
+            // growing across iterations — the unbounded `standard` engine
+            // otherwise appends ~N positions over criterion's N iterations,
+            // making the per-call cost non-stationary (and the result a
+            // function of iteration count, not single-step latency). Setup is
+            // untimed; only `decode_step` is measured.
+            b.iter_batched_ref(
+                || {
+                    let mut engine = kind.clone().build(cpu_engine_backend());
+                    let _ = engine.prefill(&weights, &ffn, &prompt);
+                    engine
+                },
+                |engine| {
+                    let _ = engine.decode_step(&weights, &ffn, 1);
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -182,36 +194,73 @@ fn bench_helpers_sync_vs_async(c: &mut Criterion) {
 
     group.bench_function("prefill_sync", |b| {
         b.iter(|| {
-            let _ = kv_prefill_via_dispatch(&cpu, &weights, &ffn, &prompt, None, None).unwrap();
+            let _ = kv_prefill_via_dispatch(
+                &cpu,
+                larql_inference::WeightsView::dense(&weights),
+                &ffn,
+                &prompt,
+                None,
+                None,
+            )
+            .unwrap();
         });
     });
 
     group.bench_function("prefill_async", |b| {
         b.iter(|| {
-            let _ =
-                kv_prefill_via_dispatch_async(&cpu, &weights, &ffn, &prompt, None, None).unwrap();
+            let _ = kv_prefill_via_dispatch_async(
+                &cpu,
+                larql_inference::WeightsView::dense(&weights),
+                &ffn,
+                &prompt,
+                None,
+                None,
+            )
+            .unwrap();
         });
     });
 
     group.bench_function("decode_step_sync", |b| {
-        let (_, mut handles) =
-            kv_prefill_via_dispatch(&cpu, &weights, &ffn, &prompt, None, None).unwrap();
+        let (_, mut handles) = kv_prefill_via_dispatch(
+            &cpu,
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
         let mut pos = prompt.len();
         b.iter(|| {
-            let _ =
-                kv_decode_step_via_dispatch(&cpu, &weights, &ffn, &mut handles, 1, pos, None, None);
+            let _ = kv_decode_step_via_dispatch(
+                &cpu,
+                larql_inference::WeightsView::dense(&weights),
+                &ffn,
+                &mut handles,
+                1,
+                pos,
+                None,
+                None,
+            );
             pos += 1;
         });
     });
 
     group.bench_function("decode_step_async", |b| {
-        let (_, mut handles) =
-            kv_prefill_via_dispatch_async(&cpu, &weights, &ffn, &prompt, None, None).unwrap();
+        let (_, mut handles) = kv_prefill_via_dispatch_async(
+            &cpu,
+            larql_inference::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
         let mut pos = prompt.len();
         b.iter(|| {
             let _ = kv_decode_step_via_dispatch_async(
                 &cpu,
-                &weights,
+                larql_inference::WeightsView::dense(&weights),
                 &ffn,
                 &mut handles,
                 1,

@@ -212,6 +212,7 @@ fn write_large_vindex_dir(dir: &std::path::Path) {
         model_config: Some(model_config),
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     vindex.save_vindex(dir, &mut config).unwrap();

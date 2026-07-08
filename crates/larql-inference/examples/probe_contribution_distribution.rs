@@ -299,9 +299,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut h = forward::embed_tokens_pub(weights, &token_ids);
             let ple_inputs = forward::ple::precompute_per_layer_inputs(weights, &h, &token_ids);
             for layer in 0..weights.num_layers {
-                let (h_post_attn, _) =
-                    forward::layer::run_attention_with_kv_cache(weights, &h, layer)
-                        .ok_or_else(|| format!("attention failed at layer {layer}"))?;
+                let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(
+                    larql_inference::WeightsView::dense(weights),
+                    &h,
+                    layer,
+                )
+                .ok_or_else(|| format!("attention failed at layer {layer}"))?;
                 let (h_post_ffn, _) =
                     forward::run_ffn(weights, &h_post_attn, layer, &dense_ffn, false);
                 let mut h_out = forward::ple::apply_per_layer_embedding(
@@ -348,8 +351,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut layer_stats = Vec::with_capacity(weights.num_layers);
 
         for layer in 0..weights.num_layers {
-            let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(weights, &h, layer)
-                .ok_or_else(|| format!("attention failed at layer {layer}"))?;
+            let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(
+                larql_inference::WeightsView::dense(weights),
+                &h,
+                layer,
+            )
+            .ok_or_else(|| format!("attention failed at layer {layer}"))?;
 
             let h_ffn = pre_ffn_norm(weights, &h_post_attn, layer);
             let last = h_ffn.shape()[0] - 1;

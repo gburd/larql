@@ -15,7 +15,6 @@ use larql_inference::attention::SharedKV;
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::embed_tokens_pub;
 use larql_inference::layer_executor::LayerExecutor;
-use larql_inference::model::ModelWeights;
 use ndarray::{s, Array2};
 
 use crate::engines::boundary_per_layer::cold_tier::{
@@ -29,7 +28,7 @@ use crate::engines::markov_residual::recompute_kv;
 /// `executor.dispatch_kind() != Fused` (engine glue falls back to
 /// `walk::run_prefill` in that case).
 pub(super) fn run_prefill(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     executor: &dyn LayerExecutor,
     ffn: &dyn FfnBackend,
     policy: &BoundaryLayerPolicy,
@@ -39,7 +38,7 @@ pub(super) fn run_prefill(
     let backend = executor.backend();
     let num_layers = weights.num_layers;
     let seq_len = token_ids.len();
-    let mut h = embed_tokens_pub(weights, token_ids);
+    let mut h = embed_tokens_pub(&weights, token_ids);
     let mut stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
 
     for layer in 0..num_layers {
@@ -52,6 +51,7 @@ pub(super) fn run_prefill(
         stored,
         cold_encoded: None,
         cold_kv: None,
+        hot_kv: None,
         cold_abs_start: 0,
         next_position: seq_len,
         max_window: window_size,
@@ -86,7 +86,7 @@ pub(super) fn run_prefill(
 /// Executor-driven decode step. Caller MUST have already checked that
 /// `executor.dispatch_kind() != Fused`.
 pub(super) fn run_decode(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     executor: &dyn LayerExecutor,
     ffn: &dyn FfnBackend,
     policy: &BoundaryLayerPolicy,
@@ -96,7 +96,7 @@ pub(super) fn run_decode(
     let backend = executor.backend();
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
-    let mut h_new = embed_tokens_pub(weights, &[token_id]);
+    let mut h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
 
     for layer in 0..num_layers {
@@ -202,8 +202,15 @@ mod tests {
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
         let token_ids: Vec<u32> = vec![0, 1, 2];
-        let (hidden, rs) = run_prefill(&weights, &executor, &ffn, &policy, None, &token_ids)
-            .expect("prefill should succeed with synthetic weights");
+        let (hidden, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            None,
+            &token_ids,
+        )
+        .expect("prefill should succeed with synthetic weights");
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs.next_position, 3);
         assert!(rs.cold_encoded.is_none(), "no overflow → no cold_encoded");
@@ -225,8 +232,15 @@ mod tests {
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
         let token_ids: Vec<u32> = vec![0, 1, 2];
-        let (_hidden, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(2), &token_ids)
-            .expect("prefill should succeed");
+        let (_hidden, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            Some(2),
+            &token_ids,
+        )
+        .expect("prefill should succeed");
         assert!(
             rs.cold_encoded.is_some(),
             "overflow path must populate cold_encoded"
@@ -250,14 +264,29 @@ mod tests {
         let executor = LocalWalkExecutor::new(&backend);
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (_, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(4), &[0]).unwrap();
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            Some(4),
+            &[0],
+        )
+        .unwrap();
         assert!(
             rs.cold_encoded.is_none(),
             "no overflow expected after prefill"
         );
 
-        let (hidden, rs_after) =
-            run_decode(&weights, &executor, &ffn, &policy, rs, 1).expect("decode should succeed");
+        let (hidden, rs_after) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            rs,
+            1,
+        )
+        .expect("decode should succeed");
         assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
         assert_eq!(rs_after.next_position, 2);
         for slab in &rs_after.stored {
@@ -277,7 +306,15 @@ mod tests {
         let executor = LocalWalkExecutor::new(&backend);
         let ffn = NullFfn;
         let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
-        let (_, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(2), &[0, 1, 2]).unwrap();
+        let (_, rs) = run_prefill(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            Some(2),
+            &[0, 1, 2],
+        )
+        .unwrap();
         assert!(
             rs.cold_encoded.is_some(),
             "prefill should have populated cold_encoded"
@@ -289,7 +326,15 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(initial_cold_rows, 1, "1 row in cold after prefill");
 
-        let (_, rs_after) = run_decode(&weights, &executor, &ffn, &policy, rs, 3).unwrap();
+        let (_, rs_after) = run_decode(
+            larql_inference::WeightsView::dense(&weights),
+            &executor,
+            &ffn,
+            &policy,
+            rs,
+            3,
+        )
+        .unwrap();
         let after_cold_rows = rs_after
             .cold_encoded
             .as_ref()

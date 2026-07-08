@@ -98,7 +98,7 @@ fn sparse_ffn_forward_impl(
 
     // Fall back to dense when most features are selected
     if k * 5 >= intermediate * 4 && overrides.is_empty() {
-        return dense_ffn_forward(weights, layer, x);
+        return dense_ffn_forward(larql_models::WeightsView::dense(weights), layer, x);
     }
 
     let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
@@ -589,7 +589,11 @@ mod tests {
         // Request all features to trigger that path.
         let all: Vec<usize> = (0..weights.intermediate_size).collect();
         let (sparse_out, _) = sparse_ffn_forward(&weights, 0, &x, &all);
-        let (dense_out, _) = crate::ffn::weight::dense_ffn_forward(&weights, 0, &x);
+        let (dense_out, _) = crate::ffn::weight::dense_ffn_forward(
+            larql_models::WeightsView::dense(&weights),
+            0,
+            &x,
+        );
         for (s, d) in sparse_out.iter().zip(dense_out.iter()) {
             assert!((s - d).abs() < 1e-4, "sparse/dense mismatch: {s} vs {d}");
         }

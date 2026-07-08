@@ -36,7 +36,7 @@ use crate::engines::w10_enabled as w10_env_on;
 /// backend / vindex lacks the required support (caller falls back to
 /// `walk::run_prefill`).
 pub(super) fn try_prefill_via_dispatch(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     backend: &dyn EngineBackend,
     policy: &BoundaryLayerPolicy,
     window_size: Option<usize>,
@@ -81,6 +81,7 @@ pub(super) fn try_prefill_via_dispatch(
         stored,
         cold_encoded: None,
         cold_kv: None,
+        hot_kv: None,
         cold_abs_start: 0,
         next_position: prompt_len,
         max_window: window_size,
@@ -102,8 +103,15 @@ pub(super) fn try_prefill_via_dispatch(
             for (layer, overflow) in overflow_per_layer.iter().enumerate() {
                 let codec = policy.codec_for(layer);
                 let decoded_overflow = roundtrip(overflow, codec);
-                let (k, v) = recompute_kv(weights, &decoded_overflow, layer, 0, backend, None)
-                    .expect("cold K/V pre-computation failed");
+                let (k, v) = recompute_kv(
+                    larql_inference::WeightsView::dense(weights),
+                    &decoded_overflow,
+                    layer,
+                    0,
+                    backend,
+                    None,
+                )
+                .expect("cold K/V pre-computation failed");
                 cold_kv.push((k, v));
                 let mut enc = PerLayerEncodedColdLayer::empty(codec, weights.hidden_size);
                 enc.append(overflow);
@@ -122,7 +130,7 @@ pub(super) fn try_prefill_via_dispatch(
 /// updated store. `None` signals a state-dump failure — caller should
 /// clear its `kv_handle` and fall back to the dense walk.
 pub(super) fn decode_step_via_dispatch(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     backend: &dyn EngineBackend,
     policy: &BoundaryLayerPolicy,
     handle: &mut KvHandle,
@@ -210,7 +218,7 @@ pub(super) fn decode_step_via_dispatch(
             }
         }
         extend_cold_kv_with_overflow(
-            weights,
+            larql_inference::WeightsView::dense(weights),
             backend,
             policy,
             &mut rs,
@@ -262,9 +270,9 @@ mod tests {
             weights.hidden_size,
         );
         let backend = cpu_engine_backend();
-        let mut w = weights;
+        let w = weights;
         assert!(try_prefill_via_dispatch(
-            &mut w,
+            &w,
             backend.as_ref(),
             &bf16_policy(),
             Some(4),
@@ -277,11 +285,11 @@ mod tests {
     #[test]
     fn try_prefill_via_dispatch_windowed_populates_store_under_w10_honly() {
         clear_w10_override();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
         let (h, rs, _handle) = try_prefill_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             Some(4),
@@ -301,11 +309,11 @@ mod tests {
     #[test]
     fn try_prefill_via_dispatch_windowless_drops_stored_under_w10_none_mask() {
         clear_w10_override();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
         let (_h, rs, _handle) = try_prefill_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             None,
@@ -324,11 +332,11 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_appends_h_in_under_honly() {
         clear_w10_override();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
         let (_h, rs, mut handle) = try_prefill_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             Some(4),
@@ -338,7 +346,7 @@ mod tests {
         .expect("prefill");
         let rows_before = rs.stored[0].shape()[0];
         let (h, rs) = decode_step_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             &mut handle,
@@ -356,11 +364,11 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_windowless_takes_none_mask_path() {
         clear_w10_override();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
         let (_h, rs, mut handle) = try_prefill_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             None,
@@ -369,7 +377,7 @@ mod tests {
         )
         .expect("prefill (windowless)");
         let (_h, rs) = decode_step_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             &mut handle,
@@ -388,13 +396,13 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_overflow_extends_cold_tier() {
         clear_w10_override();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
         // window=2: after prefilling 2 tokens, one decode crosses the
         // window and the dispatch eviction path runs.
         let (_h, rs, mut handle) = try_prefill_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             Some(2),
@@ -404,7 +412,7 @@ mod tests {
         .expect("prefill");
         assert!(rs.cold_encoded.is_none(), "no overflow at prefill");
         let (_h, rs) = decode_step_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             &mut handle,
@@ -420,7 +428,7 @@ mod tests {
         // Subsequent decode should extend an existing cold_encoded
         // (Some(layers) branch of the match).
         let (_h, rs) = decode_step_via_dispatch(
-            &mut weights,
+            &weights,
             backend.as_ref(),
             &bf16_policy(),
             &mut handle,

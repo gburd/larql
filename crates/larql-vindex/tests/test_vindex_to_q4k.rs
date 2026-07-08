@@ -280,6 +280,7 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
         "test/q4k-e2e-source",
         &src_dir,
         4,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Inference,
         larql_vindex::StorageDtype::F32,
         larql_vindex::QuantFormat::None,
@@ -433,6 +434,7 @@ fn q4k_feature_major_down_round_trip() {
         "test/fm-down",
         &src_dir,
         4,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Inference,
         larql_vindex::StorageDtype::F32,
         QuantFormat::None,
@@ -536,6 +538,7 @@ fn legacy_q4k_filenames_load_via_dual_read() {
         "test/legacy-round-trip",
         &src_dir,
         4,
+        0, // summary_features_per_expert (off)
         larql_vindex::ExtractLevel::Inference,
         larql_vindex::StorageDtype::F32,
         QuantFormat::None,

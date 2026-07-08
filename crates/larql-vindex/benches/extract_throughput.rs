@@ -152,6 +152,7 @@ fn bench_extract_throughput(c: &mut Criterion) {
                     "bench/extract",
                     &out_dir,
                     5,
+                    0, // summary_features_per_expert (off)
                     ExtractLevel::All,
                     StorageDtype::F32,
                     q,
@@ -179,6 +180,7 @@ fn bench_extract_throughput(c: &mut Criterion) {
             "bench/extract",
             &ref_dir,
             5,
+            0, // summary_features_per_expert (off)
             ExtractLevel::All,
             StorageDtype::F32,
             QuantFormat::Q4K,
@@ -225,6 +227,7 @@ fn bench_extract_throughput(c: &mut Criterion) {
                 "bench/extract",
                 &resume_dir,
                 5,
+                0, // summary_features_per_expert (off)
                 ExtractLevel::All,
                 StorageDtype::F32,
                 QuantFormat::Q4K,

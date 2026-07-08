@@ -347,12 +347,13 @@ pub trait KvEngine: Send {
     /// through `backend.prefill_kquant` for full GPU speed. Falls back to the
     /// f32 path when `backend.supports_quant(::larql_compute::QuantFormat::Q4_K) == false` or `index` has no Q4K data.
     ///
-    /// `weights` is `&mut` so the engine can lazily insert dequantised f32
-    /// attention tensors into `weights.tensors` on the first call (one-time
-    /// cost; subsequent decode steps reuse the cached tensors).
+    /// `weights` is `&ModelWeights` (immutable): the engine dequantises f32
+    /// attention tensors into its own `dequant_scratch` on the first call and
+    /// resolves them via `WeightsView::with_scratch` (one-time cost; subsequent
+    /// decode steps reuse the engine-owned scratch).
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
         token_ids: &[u32],
@@ -368,7 +369,7 @@ pub trait KvEngine: Send {
     /// when available, f32 fallback otherwise.
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
         token_id: u32,
@@ -378,13 +379,12 @@ pub trait KvEngine: Send {
         self.decode_step(weights, ffn, token_id) // default: f32 fallback
     }
 
-    /// Resident-weights quant prefill. Unlike [`prefill_quant`] (which takes
-    /// `&mut weights` to lazily dequantise attn into `weights.tensors`), this
-    /// assumes the **caller has already made the client weights f32-resident**
-    /// — so it takes `&weights` and merely threads `index` to the backend. That
-    /// lets a Q4K-direct attention kernel (`LARQL_Q4K_DIRECT_ATTN`) read packed
-    /// bytes from the index while the FFN backend borrows the same `&weights`
-    /// immutably — no `&mut`/`&` borrow conflict (task #16). Default: f32
+    /// Resident-weights quant prefill. Unlike [`prefill_quant`] (which
+    /// dequantises attn into the engine's `dequant_scratch`), this assumes the
+    /// **caller has already made the client weights f32-resident** — so it
+    /// merely threads `index` to the backend. That lets a Q4K-direct attention
+    /// kernel (`LARQL_Q4K_DIRECT_ATTN`) read packed bytes from the index while
+    /// the FFN backend borrows the same `&weights` (task #16). Default: f32
     /// fallback (index ignored).
     fn prefill_resident(
         &mut self,
@@ -451,7 +451,7 @@ pub trait KvEngine: Send {
     /// parameter properly.
     fn prefill_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn crate::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
@@ -464,7 +464,7 @@ pub trait KvEngine: Send {
     /// [`prefill_quant_via_executor`] for the migration contract.
     fn decode_step_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn crate::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
@@ -525,38 +525,39 @@ pub trait RetrievalEngine: Send {
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError>;
 
-    /// Prefill against a Q4K-quantised vindex. Default impl dequantises
-    /// the attention tensors into `weights.tensors` and delegates to
-    /// [`prefill`](Self::prefill); engines that also need the FFN
-    /// tensors dequantised (e.g. Apollo, which runs its forward through
-    /// `forward_raw_logits` rather than an `FfnBackend` router) override
-    /// to insert those too.
-    ///
-    /// `weights` is `&mut` because the dequant step lazily populates
-    /// `weights.tensors`. Production callers reuse the populated
-    /// tensors across subsequent decode steps; the cost is one-time per
-    /// engine session.
+    /// Prefill against a Q4K-quantised vindex. **No default** — the trait
+    /// default returns an `InvariantViolation` because the `ffn`-less `prefill`
+    /// it would delegate to can't be handed an engine-owned dequant scratch
+    /// without mutating `weights`. Engines that serve Q4K (e.g. Apollo, which
+    /// runs its forward through `forward_raw_logits` and dequantises attn+FFN
+    /// into its own `dequant_scratch`) override this.
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &larql_vindex::VectorIndex,
         token_ids: &[u32],
     ) -> Result<Array2<f32>, EngineError> {
-        crate::vindex::ensure_attn_tensors_dequantised(weights, index);
-        self.prefill(weights, token_ids)
+        let _ = (weights, index, token_ids);
+        Err(EngineError::InvariantViolation {
+            what: "RetrievalEngine::prefill_quant must be overridden for Q4K vindexes — the \
+                   default cannot thread an engine-owned dequant scratch through the \
+                   `ffn`-less `prefill` (it would have to mutate `weights`)."
+                .into(),
+        })
     }
 
-    /// One decode step against a Q4K-quantised vindex. Default impl
-    /// dequantises the attention tensors and delegates to
-    /// [`decode_step`](Self::decode_step).
+    /// One decode step against a Q4K-quantised vindex. No default — engines
+    /// that serve Q4K must override (see [`prefill_quant`](Self::prefill_quant)).
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &larql_vindex::VectorIndex,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        crate::vindex::ensure_attn_tensors_dequantised(weights, index);
-        self.decode_step(weights, token_id)
+        let _ = (weights, index, token_id);
+        Err(EngineError::InvariantViolation {
+            what: "RetrievalEngine::decode_step_quant must be overridden for Q4K vindexes.".into(),
+        })
     }
 
     /// Bytes of persistent engine state (excludes model weights).
@@ -716,7 +717,7 @@ impl AnyEngine {
     /// it (they dequantise + run on f32 internally).
     pub fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
         token_ids: &[u32],
@@ -732,7 +733,7 @@ impl AnyEngine {
     /// [`prefill_quant`].
     pub fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
         token_id: u32,
@@ -781,7 +782,7 @@ impl AnyEngine {
     /// executor loops).
     pub fn prefill_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn crate::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
@@ -797,7 +798,7 @@ impl AnyEngine {
     /// fall-back semantics as [`prefill_quant_via_executor`].
     pub fn decode_step_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn crate::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_vindex::VectorIndex,
@@ -1006,13 +1007,13 @@ mod tests {
         assert_eq!(engine.decode_calls, 1);
 
         // prefill_quant_via_executor → prefill_quant → prefill (default fallback)
-        let mut weights_q = crate::test_utils::make_test_weights();
-        let out = engine.prefill_quant_via_executor(&mut weights_q, &exec, &ffn, &index, &[0, 1]);
+        let weights_q = crate::test_utils::make_test_weights();
+        let out = engine.prefill_quant_via_executor(&weights_q, &exec, &ffn, &index, &[0, 1]);
         assert!(out.is_ok());
         assert_eq!(engine.prefill_calls, 2);
 
         // decode_step_quant_via_executor → decode_step_quant → decode_step
-        let out = engine.decode_step_quant_via_executor(&mut weights_q, &exec, &ffn, &index, 3);
+        let out = engine.decode_step_quant_via_executor(&weights_q, &exec, &ffn, &index, 3);
         assert!(out.is_ok());
         assert_eq!(engine.decode_calls, 2);
     }
@@ -1028,15 +1029,15 @@ mod tests {
             decode_calls: 0,
         };
 
-        let mut weights_q4k = crate::test_utils::make_test_weights();
-        let out = engine.prefill_quant(&mut weights_q4k, &ffn, &index, &[1, 2, 3], &*backend);
+        let weights_q4k = crate::test_utils::make_test_weights();
+        let out = engine.prefill_quant(&weights_q4k, &ffn, &index, &[1, 2, 3], &*backend);
         assert!(out.is_ok());
         assert_eq!(
             engine.prefill_calls, 1,
             "default prefill_quant must dispatch to prefill"
         );
 
-        let out = engine.decode_step_quant(&mut weights_q4k, &ffn, &index, 4, &*backend);
+        let out = engine.decode_step_quant(&weights_q4k, &ffn, &index, 4, &*backend);
         assert!(out.is_ok());
         assert_eq!(
             engine.decode_calls, 1,

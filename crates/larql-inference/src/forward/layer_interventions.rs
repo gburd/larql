@@ -48,7 +48,11 @@ pub fn run_layer_with_zeroed_pre_o_heads(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_zero_pre_o_heads(
-        weights, h, layer, heads, shared_kv,
+        larql_models::WeightsView::dense(weights),
+        h,
+        layer,
+        heads,
+        shared_kv,
     )?;
     if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
@@ -79,7 +83,7 @@ pub fn run_layer_with_replaced_pre_o_head(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_pre_o_head(
-        weights,
+        larql_models::WeightsView::dense(weights),
         h,
         layer,
         head,
@@ -113,8 +117,12 @@ pub fn run_layer_with_mapped_pre_o_head<F>(
 where
     F: FnMut(&Array2<f32>) -> Option<Array2<f32>>,
 {
-    let (_, pre_o) =
-        crate::attention::run_attention_block_shared_with_pre_o(weights, h, layer, shared_kv)?;
+    let (_, pre_o) = crate::attention::run_attention_block_shared_with_pre_o(
+        larql_models::WeightsView::dense(weights),
+        h,
+        layer,
+        shared_kv,
+    )?;
     let head_dim = weights.arch.head_dim_for_layer(layer);
     let start = head.checked_mul(head_dim)?;
     let end = start.checked_add(head_dim)?;
@@ -159,8 +167,12 @@ pub fn run_layer_with_mapped_head_residual_delta<F>(
 where
     F: FnMut(&Array2<f32>) -> Option<Array2<f32>>,
 {
-    let (_, pre_o) =
-        crate::attention::run_attention_block_shared_with_pre_o(weights, h, layer, shared_kv)?;
+    let (_, pre_o) = crate::attention::run_attention_block_shared_with_pre_o(
+        larql_models::WeightsView::dense(weights),
+        h,
+        layer,
+        shared_kv,
+    )?;
     let head_dim = weights.arch.head_dim_for_layer(layer);
     let start = head.checked_mul(head_dim)?;
     let end = start.checked_add(head_dim)?;
@@ -200,8 +212,12 @@ pub fn run_layer_with_original_head_residual_delta(
     ple_input: Option<&Array2<f32>>,
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
-    let (_, pre_o) =
-        crate::attention::run_attention_block_shared_with_pre_o(weights, h, layer, shared_kv)?;
+    let (_, pre_o) = crate::attention::run_attention_block_shared_with_pre_o(
+        larql_models::WeightsView::dense(weights),
+        h,
+        layer,
+        shared_kv,
+    )?;
     let head_dim = weights.arch.head_dim_for_layer(layer);
     let start = head.checked_mul(head_dim)?;
     let end = start.checked_add(head_dim)?;
@@ -239,7 +255,11 @@ pub fn run_layer_with_subtracted_pre_o_heads(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_subtract_pre_o_heads(
-        weights, h, layer, heads, shared_kv,
+        larql_models::WeightsView::dense(weights),
+        h,
+        layer,
+        heads,
+        shared_kv,
     )?;
     Some((
         finish_layer_tail(weights, &h_post_attn, layer, ffn, ple_input),
@@ -265,7 +285,7 @@ pub fn run_layer_with_replaced_head_residual_delta(
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = crate::attention::run_attention_block_replace_head_residual_delta(
-        weights,
+        larql_models::WeightsView::dense(weights),
         h,
         layer,
         head,
@@ -322,8 +342,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let input = h(3, weights.hidden_size);
-        let (baseline, _, _) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
-            .expect("baseline layer failed");
+        let (baseline, _, _) = run_layer_with_ffn(
+            larql_models::WeightsView::dense(&weights),
+            &input,
+            0,
+            &ffn,
+            false,
+            None,
+            None,
+        )
+        .expect("baseline layer failed");
         let (mapped, _) =
             run_layer_with_mapped_pre_o_head(&weights, &input, 0, &ffn, 0, None, None, |head| {
                 Some(head.clone())
@@ -344,8 +372,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let input = h(2, weights.hidden_size);
-        let (baseline, _, _) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
-            .expect("baseline layer failed");
+        let (baseline, _, _) = run_layer_with_ffn(
+            larql_models::WeightsView::dense(&weights),
+            &input,
+            0,
+            &ffn,
+            false,
+            None,
+            None,
+        )
+        .expect("baseline layer failed");
         let (intervened, _) =
             run_layer_with_original_head_residual_delta(&weights, &input, 0, &ffn, 0, None, None)
                 .expect("original-delta layer failed");
@@ -365,8 +401,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let input = h(2, weights.hidden_size);
-        let (baseline, _, _) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
-            .expect("baseline layer failed");
+        let (baseline, _, _) = run_layer_with_ffn(
+            larql_models::WeightsView::dense(&weights),
+            &input,
+            0,
+            &ffn,
+            false,
+            None,
+            None,
+        )
+        .expect("baseline layer failed");
         let (intervened, _) =
             run_layer_with_zeroed_pre_o_heads(&weights, &input, 0, &ffn, &[], None, None)
                 .expect("zeroed layer failed");
@@ -383,8 +427,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let input = h(2, weights.hidden_size);
-        let (baseline, _, _) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
-            .expect("baseline layer failed");
+        let (baseline, _, _) = run_layer_with_ffn(
+            larql_models::WeightsView::dense(&weights),
+            &input,
+            0,
+            &ffn,
+            false,
+            None,
+            None,
+        )
+        .expect("baseline layer failed");
         let (intervened, _) =
             run_layer_with_zeroed_pre_o_heads(&weights, &input, 0, &ffn, &[0], None, None)
                 .expect("zeroed layer failed");
@@ -490,8 +542,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = WeightFfn { weights: &weights };
         let input = h(2, weights.hidden_size);
-        let (baseline, _, _) = run_layer_with_ffn(&weights, &input, 0, &ffn, false, None, None)
-            .expect("baseline layer failed");
+        let (baseline, _, _) = run_layer_with_ffn(
+            larql_models::WeightsView::dense(&weights),
+            &input,
+            0,
+            &ffn,
+            false,
+            None,
+            None,
+        )
+        .expect("baseline layer failed");
         let (mapped, _) = run_layer_with_mapped_head_residual_delta(
             &weights,
             &input,

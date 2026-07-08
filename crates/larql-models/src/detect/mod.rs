@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use crate::architectures::bitnet::BitnetArch;
 use crate::architectures::deepseek::DeepSeekArch;
 use crate::architectures::deepseek_v4::DeepSeekV4Arch;
 use crate::architectures::gemma2::Gemma2Arch;
@@ -134,6 +135,11 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         t if t.starts_with("granite") => Box::new(GraniteArch::from_config(model_config)),
         // TinyModel — research-scale decoder used for LARQL compile/walk work
         "tinymodel" => Box::new(TinyModelArch::from_config(model_config)),
+        // BitNet b1.58 (HF "bitnet", GGUF "bitnet-b1.58"). Recognised
+        // explicitly so a BitNet config can't silently collapse to the
+        // generic fallback; native-ternary inference is served by the
+        // larql-inference ternary path, not this trait. See BitnetArch docs.
+        t if t.starts_with("bitnet") => Box::new(BitnetArch::from_config(model_config)),
         // Unknown — generic fallback
         _ => Box::new(GenericArch::from_config(model_config)),
     }

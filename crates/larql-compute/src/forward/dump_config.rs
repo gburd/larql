@@ -139,13 +139,12 @@ impl DumpConfig {
     /// Read the three env vars and assemble a `DumpConfig`. Public so test
     /// fixtures can build one without touching the process env.
     pub fn from_env() -> Self {
+        // Read through the override-aware `options` helpers so tests can toggle
+        // these via the thread-local override (no `set_var`/`getenv` race).
         Self {
-            layer_dump_dir: std::env::var(ENV_CPU_DUMP_LAYERS).ok(),
-            stage_dump_dir: std::env::var(ENV_CPU_STAGE_DUMP).ok(),
-            stage_dump_layer: std::env::var(ENV_STAGE_DUMP_LAYER)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0),
+            layer_dump_dir: crate::options::env_value(ENV_CPU_DUMP_LAYERS),
+            stage_dump_dir: crate::options::env_value(ENV_CPU_STAGE_DUMP),
+            stage_dump_layer: crate::options::env_usize(ENV_STAGE_DUMP_LAYER).unwrap_or(0),
         }
     }
 
@@ -227,16 +226,12 @@ mod tests {
         // out a stale path. `get()` now returns a freshly-built
         // `DumpConfig` per call so flipping the env var actually
         // takes effect.
-        // Save + restore to keep the process env clean for other tests.
-        let prev = std::env::var(ENV_CPU_DUMP_LAYERS).ok();
-        std::env::set_var(ENV_CPU_DUMP_LAYERS, "/tmp/dump-a");
+        // Thread-local override (no `set_var`/`getenv` race); cleared at the end.
+        crate::options::set_env_override(ENV_CPU_DUMP_LAYERS, Some("/tmp/dump-a"));
         let a_dir = DumpConfig::get().layer_dump_dir;
-        std::env::set_var(ENV_CPU_DUMP_LAYERS, "/tmp/dump-b");
+        crate::options::set_env_override(ENV_CPU_DUMP_LAYERS, Some("/tmp/dump-b"));
         let b_dir = DumpConfig::get().layer_dump_dir;
-        match prev {
-            Some(v) => std::env::set_var(ENV_CPU_DUMP_LAYERS, v),
-            None => std::env::remove_var(ENV_CPU_DUMP_LAYERS),
-        }
+        crate::options::clear_fast_path_overrides();
         assert_eq!(a_dir, Some("/tmp/dump-a".to_string()));
         assert_eq!(b_dir, Some("/tmp/dump-b".to_string()));
     }

@@ -25,7 +25,6 @@ use super::{EngineBackend, KvHandle};
 use crate::async_compute_backend::AsyncComputeBackend;
 use crate::ffn::FfnBackend;
 use crate::forward::{embed_tokens_pub, run_ffn};
-use crate::model::ModelWeights;
 
 /// Per-layer FFN dispatch for the KV-cached engine path, MoE-aware.
 ///
@@ -37,7 +36,7 @@ use crate::model::ModelWeights;
 /// cache. When the hook declines (`None`) — or the model is dense — fall
 /// back to the standard dense FFN, preserving prior behaviour exactly.
 fn ffn_or_moe_layer(
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     h_post_attn: &Array2<f32>,
     layer: usize,
     ffn: &dyn FfnBackend,
@@ -47,7 +46,7 @@ fn ffn_or_moe_layer(
             return h_out;
         }
     }
-    run_ffn(weights, h_post_attn, layer, ffn, false).0
+    run_ffn(&weights, h_post_attn, layer, ffn, false).0
 }
 
 /// Prefill the K/V cache through every layer using `backend`'s
@@ -61,7 +60,7 @@ fn ffn_or_moe_layer(
 /// [`KvDispatch::clip_kv`] per-layer after this returns).
 pub fn kv_prefill_via_dispatch(
     backend: &dyn EngineBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     window: Option<usize>,
@@ -70,7 +69,7 @@ pub fn kv_prefill_via_dispatch(
     if prompt_ids.is_empty() {
         return None;
     }
-    let h = embed_tokens_pub(weights, prompt_ids);
+    let h = embed_tokens_pub(&weights, prompt_ids);
     kv_prefill_from_hidden_via_dispatch(backend, weights, ffn, &h, window, index)
 }
 
@@ -87,7 +86,7 @@ pub fn kv_prefill_via_dispatch(
 /// of this module.
 pub fn kv_prefill_from_hidden_via_dispatch(
     backend: &dyn EngineBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     initial_hidden: &Array2<f32>,
     window: Option<usize>,
@@ -134,7 +133,7 @@ pub fn kv_prefill_from_hidden_via_dispatch(
 #[allow(clippy::too_many_arguments)]
 pub fn kv_decode_step_via_dispatch(
     backend: &dyn EngineBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     handles: &mut [KvHandle],
     token_id: u32,
@@ -148,7 +147,7 @@ pub fn kv_decode_step_via_dispatch(
         num_layers,
         "kv_decode_step_via_dispatch: handles.len() must equal weights.num_layers"
     );
-    let h_new = embed_tokens_pub(weights, &[token_id]);
+    let h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut h_step = h_new;
 
     for (layer, handle) in handles.iter_mut().enumerate().take(num_layers) {
@@ -191,7 +190,7 @@ pub fn kv_decode_step_via_dispatch(
 /// the end so any deferred work clears before returning.
 pub fn kv_prefill_via_dispatch_async(
     backend: &dyn AsyncComputeBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     window: Option<usize>,
@@ -200,7 +199,7 @@ pub fn kv_prefill_via_dispatch_async(
     if prompt_ids.is_empty() {
         return None;
     }
-    let h = embed_tokens_pub(weights, prompt_ids);
+    let h = embed_tokens_pub(&weights, prompt_ids);
     kv_prefill_from_hidden_via_dispatch_async(backend, weights, ffn, &h, window, index)
 }
 
@@ -214,7 +213,7 @@ pub fn kv_prefill_via_dispatch_async(
 /// CPU paths, MM vs text must agree when text is the input.
 pub fn kv_prefill_from_hidden_via_dispatch_async(
     backend: &dyn AsyncComputeBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     initial_hidden: &Array2<f32>,
     window: Option<usize>,
@@ -258,7 +257,7 @@ pub fn kv_prefill_from_hidden_via_dispatch_async(
 #[allow(clippy::too_many_arguments)]
 pub fn kv_decode_step_via_dispatch_async(
     backend: &dyn AsyncComputeBackend,
-    weights: &ModelWeights,
+    weights: larql_models::WeightsView,
     ffn: &dyn FfnBackend,
     handles: &mut [KvHandle],
     token_id: u32,
@@ -272,7 +271,7 @@ pub fn kv_decode_step_via_dispatch_async(
         num_layers,
         "kv_decode_step_via_dispatch_async: handles.len() must equal weights.num_layers"
     );
-    let h_new = embed_tokens_pub(weights, &[token_id]);
+    let h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut h_step = h_new;
 
     for (layer, handle) in handles.iter_mut().enumerate().take(num_layers) {
@@ -330,15 +329,22 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let prompt = vec![0u32, 1];
 
-        let (_, mut handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
+        let (_, mut handles) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
 
         for step in 0..3 {
             let token = (2 + step) as u32;
             let abs_position = prompt.len() + step;
             let h_trait = kv_decode_step_via_dispatch(
                 &backend,
-                &weights,
+                larql_models::WeightsView::dense(&weights),
                 &ffn,
                 &mut handles,
                 token,
@@ -359,7 +365,14 @@ mod tests {
         let weights = make_test_weights();
         let backend = CpuBackend;
         let ffn = WeightFfn { weights: &weights };
-        let result = kv_prefill_via_dispatch(&backend, &weights, &ffn, &[], None, None);
+        let result = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &[],
+            None,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -372,10 +385,24 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let prompt = vec![0u32, 1, 2, 3];
 
-        let (h_sync, handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
-        let (h_async, handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
+        let (h_sync, handles_sync) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
+        let (h_async, handles_async) = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(h_sync, h_async, "async prefill hidden must match sync");
         assert_eq!(handles_sync.len(), handles_async.len());
@@ -395,10 +422,24 @@ mod tests {
         let prompt = vec![0u32, 1, 2, 3, 4];
         let window = Some(2);
 
-        let (h_sync, _) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).unwrap();
-        let (h_async, _) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, window, None).unwrap();
+        let (h_sync, _) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            window,
+            None,
+        )
+        .unwrap();
+        let (h_async, _) = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            window,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(h_sync, h_async, "windowed async prefill must match sync");
     }
@@ -410,17 +451,31 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let prompt = vec![0u32, 1, 2];
 
-        let (_, mut handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
-        let (_, mut handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
+        let (_, mut handles_sync) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, mut handles_async) = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
 
         let next_token = 3u32;
         let abs_position = prompt.len();
 
         let h_sync = kv_decode_step_via_dispatch(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &mut handles_sync,
             next_token,
@@ -431,7 +486,7 @@ mod tests {
         .unwrap();
         let h_async = kv_decode_step_via_dispatch_async(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &mut handles_async,
             next_token,
@@ -451,17 +506,31 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let prompt = vec![0u32, 1];
 
-        let (_, mut handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
-        let (_, mut handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
+        let (_, mut handles_sync) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, mut handles_async) = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &prompt,
+            None,
+            None,
+        )
+        .unwrap();
 
         for step in 0..3 {
             let token = (2 + step) as u32;
             let abs_position = prompt.len() + step;
             let h_sync = kv_decode_step_via_dispatch(
                 &backend,
-                &weights,
+                larql_models::WeightsView::dense(&weights),
                 &ffn,
                 &mut handles_sync,
                 token,
@@ -472,7 +541,7 @@ mod tests {
             .unwrap();
             let h_async = kv_decode_step_via_dispatch_async(
                 &backend,
-                &weights,
+                larql_models::WeightsView::dense(&weights),
                 &ffn,
                 &mut handles_async,
                 token,
@@ -490,7 +559,14 @@ mod tests {
         let weights = make_test_weights();
         let backend = CpuBackend;
         let ffn = WeightFfn { weights: &weights };
-        let result = kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &[], None, None);
+        let result = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &[],
+            None,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -512,13 +588,20 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let tokens = vec![0u32, 1, 2, 3];
 
-        let (h_text, handles_text) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &tokens, None, None).unwrap();
+        let (h_text, handles_text) = kv_prefill_via_dispatch(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &tokens,
+            None,
+            None,
+        )
+        .unwrap();
 
         let initial_hidden = embed_tokens_pub(&weights, &tokens);
         let (h_hidden, handles_hidden) = kv_prefill_from_hidden_via_dispatch(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &initial_hidden,
             None,
@@ -544,13 +627,20 @@ mod tests {
         let ffn = WeightFfn { weights: &weights };
         let tokens = vec![0u32, 1, 2, 3];
 
-        let (h_text, handles_text) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &tokens, None, None).unwrap();
+        let (h_text, handles_text) = kv_prefill_via_dispatch_async(
+            &backend,
+            larql_models::WeightsView::dense(&weights),
+            &ffn,
+            &tokens,
+            None,
+            None,
+        )
+        .unwrap();
 
         let initial_hidden = embed_tokens_pub(&weights, &tokens);
         let (h_hidden, handles_hidden) = kv_prefill_from_hidden_via_dispatch_async(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &initial_hidden,
             None,
@@ -573,7 +663,7 @@ mod tests {
         let empty_hidden = Array2::<f32>::zeros((0, weights.hidden_size));
         let result = kv_prefill_from_hidden_via_dispatch(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &empty_hidden,
             None,
@@ -583,7 +673,7 @@ mod tests {
 
         let result_async = kv_prefill_from_hidden_via_dispatch_async(
             &backend,
-            &weights,
+            larql_models::WeightsView::dense(&weights),
             &ffn,
             &empty_hidden,
             None,

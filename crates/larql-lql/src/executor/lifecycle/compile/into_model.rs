@@ -66,9 +66,11 @@ impl Session {
         let mut out = Vec::new();
         out.extend(collected.warnings);
         // MEMIT is opt-in via `LARQL_MEMIT_ENABLE=1`; see the matching
-        // block in the COMPILE INTO VINDEX path for the rationale.
-        let memit_enabled = std::env::var("LARQL_MEMIT_ENABLE")
-            .ok()
+        // block in the COMPILE INTO VINDEX path for the rationale. Read
+        // through the override-aware `larql_compute::options` helper so tests
+        // can toggle it without `std::env::set_var` (which races concurrent
+        // `getenv` on the decode path and SIGSEGVs libc).
+        let memit_enabled = larql_compute::options::env_value("LARQL_MEMIT_ENABLE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if !memit_facts.is_empty() && memit_enabled {

@@ -18,7 +18,7 @@ use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
 /// behavior of `predict_kquant_hidden` while exposing pre-layer, post-attention,
 /// optional attention-weight/FFN-activation, and post-layer hook points.
 pub fn predict_kquant_hidden_hooked(
-    weights: &mut ModelWeights,
+    weights: &ModelWeights,
     token_ids: &[u32],
     index: &dyn crate::KvIndex,
     capture_activation: bool,
@@ -31,19 +31,21 @@ pub fn predict_kquant_hidden_hooked(
         );
     }
 
+    let mut scratch = larql_models::DequantScratch::new();
     let mut h = embed_tokens_pub(weights, token_ids);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
     let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
 
     for layer in 0..weights.num_layers {
-        let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
+        let inserted = insert_q4k_layer_tensors(&mut scratch, weights, index, layer)?;
         let shared_kv = weights
             .arch
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
-        let ffn_backend = crate::ffn::WeightFfn { weights };
+        let view = larql_models::WeightsView::with_scratch(weights, &scratch);
+        let ffn_backend = crate::ffn::ViewFfn { view };
         let step = run_layer_with_capture_hooked(
-            weights,
+            view,
             &h,
             layer,
             &ffn_backend,
@@ -55,14 +57,14 @@ pub fn predict_kquant_hidden_hooked(
         );
 
         let Some((h_new, _, _, kv_out)) = step else {
-            remove_layer_tensors(weights, inserted);
+            remove_layer_tensors(&mut scratch, inserted);
             return Err(format!("Q4K hooked forward failed at layer {layer}"));
         };
         h = h_new;
         if let Some(kv) = kv_out {
             kv_cache.insert(layer, kv);
         }
-        remove_layer_tensors(weights, inserted);
+        remove_layer_tensors(&mut scratch, inserted);
     }
 
     Ok(h)

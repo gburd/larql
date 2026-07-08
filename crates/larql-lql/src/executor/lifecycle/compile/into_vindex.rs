@@ -144,8 +144,10 @@ impl Session {
         // form solve cannot separate installs from natives. Pure
         // compose column-replace is the default COMPILE path and is
         // what produces the working Gemma installs.
-        let memit_enabled = std::env::var("LARQL_MEMIT_ENABLE")
-            .ok()
+        // Read through the override-aware `larql_compute::options` helper so
+        // tests can toggle this without `std::env::set_var` (which races
+        // concurrent `getenv` on the decode path and SIGSEGVs libc).
+        let memit_enabled = larql_compute::options::env_value("LARQL_MEMIT_ENABLE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let memit_results = if !memit_facts.is_empty() && config.has_model_weights && memit_enabled

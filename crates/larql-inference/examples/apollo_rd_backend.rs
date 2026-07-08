@@ -593,7 +593,13 @@ fn logits_from_boundary(
     boundary: &[f32],
     crystal: usize,
 ) -> Vec<f32> {
-    let raw = forward_from_layer(weights, tokens, boundary, crystal, None);
+    let raw = forward_from_layer(
+        larql_inference::WeightsView::dense(weights),
+        tokens,
+        boundary,
+        crystal,
+        None,
+    );
     let last = raw.h_pre_norm.shape()[0] - 1;
     let h_last = raw.h_pre_norm.slice(s![last..=last, ..]).to_owned();
     hidden_to_raw_logits(weights, &h_last)

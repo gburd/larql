@@ -362,32 +362,44 @@ pub fn quantize_tq1_0(values: &[f32]) -> Result<Vec<u8>, ModelError> {
 
 // I2_S (Microsoft bitnet.cpp fork)
 //
-// Layout: pure 2-bit packing, 4 weights per byte, no per-block scale.
-// Per-channel scale lives in the adjacent `*_sub_norm.weight` F32
-// tensor and is applied at inference time.  We decode the trits at
-// unit scale; the larql extract pipeline keeps the `*_sub_norm`
-// weights as separate F32 tensors and applies them per-row when
-// needed.
+// STRIDED 128-element / 32-byte block layout. Elements are grouped
+// into blocks of 128; each block occupies 32 bytes. Within a block,
+// byte `p` (0..32) packs the four elements {p, p+32, p+64, p+96} at
+// bit-shifts 6, 4, 2, 0 respectively (group g in 0..4 -> shift
+// 6 - 2*g). General invariant for any block of B bytes: byte p holds
+// elements {p, p+B, p+2B, p+3B}.
 //
-// Bit pattern -> trit:
-//   0b00 -> 0
-//   0b01 -> +1
-//   0b10 -> -1
-//   0b11 -> undefined; we map to 0
+// The 2-bit code is UNSIGNED {0, 1, 2}; the ternary value is
+// `code - 1`:
+//   code 0 -> -1
+//   code 1 ->  0
+//   code 2 -> +1
+//   code 3 -> unused by the packer; we map to 0
+// A true zero tensor therefore packs to 0x55 bytes (0b01_01_01_01),
+// NOT 0x00.
 //
-// Iteration: byte b holds elements (b*4 + slot) for slot in 0..4,
-// where slot indexes the 2-bit field at bits (2*slot)..(2*slot+2).
-// Matches the bitnet.cpp encode/decode convention.
+// This matches `ggml-bitnet-mad.cpp` in microsoft/BitNet:
+//   - quantize_i2_s: q8 = src>0 ? 2 : (|src|<eps ? 1 : 0), packed at
+//     shift (6 - 2*group_idx) into byte (group_pos).
+//   - the AVX2 vec_dot: loadu 32 bytes; srli 6/4/2/0; & 0x3; group g
+//     pairs with activation lanes g*32 .. g*32+32.
+//
+// Per-tensor scale: a single f32 (= max|W| at quant time) is appended
+// immediately AFTER the n/4 packed-trit bytes (in the tensor's
+// 32-byte-aligned data region). dequantize_i2_s returns bare trits at
+// unit scale; the keep-quant load path captures that trailing scale
+// separately. The scale is NOT in `*_sub_norm.weight` (that is an
+// activation RMSNorm sized to the projection's input width, applied
+// in the forward pass, not a per-output-row weight scale).
+//
+// A naive contiguous "4 sequential trits per byte" decode (byte b ->
+// elements 4b..4b+4) scrambles every weight and produces fluent
+// garbage at inference time -- see the strided-layout regression
+// tests below.
 
 /// Decode I2_S bytes to f32 trits at unit scale.
 pub fn dequantize_i2_s(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
-    let n_blocks = check_block_input(
-        "I2_S",
-        data,
-        n_elements,
-        I2_S_BLOCK_ELEMS,
-        I2_S_BLOCK_BYTES,
-    )?;
+    let n_blocks = check_block_input("I2_S", data, n_elements, I2_S_BLOCK_ELEMS, I2_S_BLOCK_BYTES)?;
     let _ = n_blocks;
 
     // I2_S packing (microsoft/BitNet ggml-bitnet-mad.cpp).  Elements
@@ -437,10 +449,14 @@ pub fn dequantize_i2_s(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
     // Tail block (< 128 elements): a block of B bytes holds 4*B
     // elements with byte p carrying {p, p+B, p+2B, p+3B} at shifts
     // 6,4,2,0.  For the tail B = tail_elems/4 (tail_elems is a
-    // multiple of 4, guaranteed by check_block_input).  Real BitNet
-    // tensors are always multiples of 128 so this path is only hit
-    // by small test inputs, but keeping the general invariant makes
-    // the codec self-consistent.
+    // multiple of 4, guaranteed by check_block_input).
+    //
+    // NOT the upstream tail format: microsoft/BitNet packs a partial
+    // final block differently.  This is harmless because real BitNet
+    // tensors are always 128-multiples (this branch is only hit by
+    // small test inputs), and our encoder/decoder use the same
+    // convention so round-trips hold.  Do NOT rely on this tail
+    // layout matching a real GGUF's last partial block.
     if tail_elems > 0 {
         let byte_base = full_blocks * BLOCK_BYTES;
         let elem_base = full_blocks * BLOCK_ELEMS;
@@ -734,14 +750,62 @@ mod tests {
         assert_eq!(decoded, input, "strided round-trip");
     }
 
+    /// Full-block (>= 128 elements) round-trip — drives the
+    /// `full_blocks` path and the real +32/+64/+96 / 32-byte stride
+    /// (the partial-tail tests only exercise the tail branch).
+    #[test]
+    fn i2_s_full_block_round_trip() {
+        // 256 elements = two full 128-element blocks, no tail.
+        let mut input = vec![0.0f32; 256];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = match i % 3 {
+                0 => 1.0,
+                1 => -1.0,
+                _ => 0.0,
+            };
+        }
+        let bytes = quantize_i2_s(&input).unwrap();
+        assert_eq!(bytes.len(), 256 / 4, "two 32-byte blocks");
+        let decoded = dequantize_i2_s(&bytes, input.len()).unwrap();
+        assert_eq!(decoded, input, "full-block strided round-trip");
+    }
+
+    /// Pin a KNOWN byte pattern to known trits at the +32/+64/+96
+    /// strided offsets, computed by hand from microsoft's layout —
+    /// independent of the (self-inverse) round-trip tests, so it
+    /// fails if the stride or shift is wrong.
+    ///
+    /// Construct one full 128-element / 32-byte block where byte 0
+    /// carries the four group values and every other byte is 0x55
+    /// (all-zero trits).  Byte 0 = 0b10_00_01_00:
+    ///   bits 6..8 (group 0, element 0)   = 0b10 = code 2 -> +1
+    ///   bits 4..6 (group 1, element 32)  = 0b00 = code 0 -> -1
+    ///   bits 2..4 (group 2, element 64)  = 0b01 = code 1 ->  0
+    ///   bits 0..2 (group 3, element 96)  = 0b00 = code 0 -> -1
+    #[test]
+    fn i2_s_known_pattern_pins_strided_offsets() {
+        let mut bytes = vec![0x55u8; 32]; // all-zero-trit block
+        bytes[0] = 0b10_00_01_00;
+        let decoded = dequantize_i2_s(&bytes, 128).unwrap();
+        assert_eq!(decoded[0], 1.0, "group 0 (shift 6) -> element 0");
+        assert_eq!(decoded[32], -1.0, "group 1 (shift 4) -> element 32");
+        assert_eq!(decoded[64], 0.0, "group 2 (shift 2) -> element 64");
+        assert_eq!(decoded[96], -1.0, "group 3 (shift 0) -> element 96");
+        // Everything else in the block is a zero trit (0x55 bytes).
+        for (i, &v) in decoded.iter().enumerate() {
+            if i != 0 && i != 32 && i != 96 {
+                assert_eq!(v, 0.0, "element {i} should be zero trit");
+            }
+        }
+    }
+
     #[test]
     fn i2_s_dispatch_via_dequantize() {
         // A zero-weight tensor packs to 0x55 bytes; dispatch must
         // route I2_S to the strided decoder and recover zeros.
         let input = vec![0.0f32; 4];
         let bytes = quantize_i2_s(&input).unwrap();
-        let result =
-            super::super::dequantize(&bytes, super::super::TYPE_I2_S, 4).unwrap();
+        let result = super::super::dequantize(&bytes, super::super::TYPE_I2_S, 4).unwrap();
         assert_eq!(result, vec![0.0, 0.0, 0.0, 0.0]);
     }
 

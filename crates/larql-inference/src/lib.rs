@@ -68,6 +68,7 @@ pub mod model;
 pub mod prompt;
 pub mod residual;
 pub mod residual_diff;
+pub mod ternary;
 pub mod test_utils;
 pub mod ternary;
 pub mod tokenizer;
@@ -264,7 +265,7 @@ pub use layer_graph::{
     TemplateUniverse,
     WalkLayerGraph,
 };
-pub use model::{load_model_dir, resolve_model_path, ModelWeights};
+pub use model::{load_model_dir, resolve_model_path, DequantScratch, ModelWeights, WeightsView};
 pub use tokenizer::{decode_token, decode_token_raw, encode_prompt, load_tokenizer};
 pub use trace::{
     trace as trace_decomposed, trace_residuals, AnswerWaypoint, BoundaryStore, BoundaryWriter,

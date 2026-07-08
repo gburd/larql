@@ -55,7 +55,6 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         path: PathBuf::from("/nonexistent"),
         config: VindexConfig {
             version: 2,
-        bitnet_layout: None,
             model: "test/model".to_string(),
             family: "test".to_string(),
             source: None,
@@ -82,6 +81,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
             model_config: None,
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         },
         patched: std::sync::Arc::new(tokio::sync::RwLock::new(patched)),
         embeddings: Array2::<f32>::zeros((4, hidden)),
@@ -94,8 +94,6 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -135,7 +133,6 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
 
     let config = VindexConfig {
         version: 2,
-        bitnet_layout: None,
         model: "test/warmup-model".to_string(),
         family: "test".to_string(),
         source: None,
@@ -166,6 +163,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     let tok_json =
@@ -187,8 +185,6 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         weights_init: std::sync::Mutex::new(()),
-        bitnet_model: std::sync::OnceLock::new(),
-        bitnet_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -376,7 +372,6 @@ fn test_infer_mode_parsing() {
 fn test_config_has_inference_capability() {
     let mut config = VindexConfig {
         version: 2,
-        bitnet_layout: None,
         model: "test/model-4".to_string(),
         family: "test".to_string(),
         source: None,
@@ -396,6 +391,7 @@ fn test_config_has_inference_capability() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     // Browse level → no inference
@@ -1257,7 +1253,6 @@ fn test_infer_disabled_check() {
 fn test_infer_weights_required() {
     let config = VindexConfig {
         version: 2,
-        bitnet_layout: None,
         model: "test/model-4".to_string(),
         family: "test".to_string(),
         source: None,
@@ -1277,6 +1272,7 @@ fn test_infer_weights_required() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     // Browse level + no model weights → can't infer
     let can_infer = config.has_model_weights

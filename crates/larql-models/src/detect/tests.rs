@@ -365,6 +365,28 @@ fn test_detect_unknown_defaults_to_generic() {
 }
 
 #[test]
+fn test_detect_bitnet_is_explicit_not_generic() {
+    // BitNet must be recognised explicitly — never silently collapse to the
+    // generic fallback (which would mask wrong/default config behind a
+    // "generic" label). Both the HF and GGUF-derived model_type spellings.
+    for model_type in ["bitnet", "bitnet-b1.58", "bitnet_b1_58"] {
+        let config = serde_json::json!({
+            "model_type": model_type,
+            "hidden_size": 2560,
+            "num_hidden_layers": 30,
+            "rms_norm_eps": 1e-5
+        });
+        let arch = detect_from_json(&config);
+        assert_eq!(arch.family(), "bitnet", "model_type={model_type}");
+        // Epsilon is honoured from config, not hardcoded.
+        assert!(
+            (arch.norm_eps() - 1e-5).abs() < 1e-9,
+            "model_type={model_type}"
+        );
+    }
+}
+
+#[test]
 fn test_tensor_keys() {
     let config = serde_json::json!({"model_type": "gemma3_text"});
     let arch = detect_from_json(&config);

@@ -222,6 +222,7 @@ fn make_featured_source_dir() -> tempfile::TempDir {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     index
         .save_vindex(dir.path(), &mut config)

@@ -31,7 +31,7 @@ impl MarkovResidualCodecEngine {
     /// invalidate `cold_kv` because codec round-trip is lossy.
     pub(super) fn try_prefill_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
@@ -129,7 +129,7 @@ impl MarkovResidualCodecEngine {
     /// `cold_kv` so the next step recomputes against the decoded bytes.
     pub(super) fn decode_step_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
     ) -> Option<Array2<f32>> {
@@ -320,9 +320,9 @@ mod tests {
             ColdResidualCodec::Bf16,
             cpu_engine_backend(),
         );
-        let mut w = weights;
+        let w = weights;
         assert!(engine
-            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .try_prefill_via_dispatch(&w, &empty_index, &[0u32, 1])
             .is_none());
         assert!(engine.store.is_none());
         assert!(engine.kv_handle.is_none());
@@ -331,9 +331,9 @@ mod tests {
     #[test]
     fn try_prefill_via_dispatch_windowed_keeps_stored_under_w10_default() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(Some(8));
+        let (mut engine, weights, index) = fixture(Some(8));
         let h = engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2])
             .expect("prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         let rs = engine.store.as_ref().unwrap();
@@ -348,10 +348,10 @@ mod tests {
     #[test]
     fn try_prefill_via_dispatch_windowless_drops_stored_under_w10() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(None);
+        let (mut engine, weights, index) = fixture(None);
         let hidden = weights.hidden_size;
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2])
             .expect("prefill (windowless)");
         let rs = engine.store.as_ref().unwrap();
         assert!(rs.hot_kv.is_none());
@@ -366,9 +366,9 @@ mod tests {
         // window=2 against 4 tokens → prefill clip evicts 2 positions
         // into `cold_encoded` via the bf16 codec.
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(Some(2));
+        let (mut engine, weights, index) = fixture(Some(2));
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2, 3])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2, 3])
             .expect("prefill (overflow)");
         let rs = engine.store.as_ref().unwrap();
         let cold = rs.cold_encoded.as_ref().expect("cold_encoded populated");
@@ -381,8 +381,8 @@ mod tests {
     #[test]
     fn try_prefill_via_dispatch_full_mask_with_w10_disabled() {
         set_w10_disable(true);
-        let (mut engine, mut weights, index) = fixture(Some(8));
-        let res = engine.try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2]);
+        let (mut engine, weights, index) = fixture(Some(8));
+        let res = engine.try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2]);
         set_w10_disable(false);
         res.expect("prefill");
         let rs = engine.store.as_ref().unwrap();
@@ -393,22 +393,22 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(Some(4));
+        let (mut engine, weights, index) = fixture(Some(4));
         assert!(engine
-            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .decode_step_via_dispatch(&weights, &index, 0)
             .is_none());
     }
 
     #[test]
     fn decode_step_via_dispatch_windowed_appends_h_in_under_honly() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(Some(8));
+        let (mut engine, weights, index) = fixture(Some(8));
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         let hot_len_before = engine.store.as_ref().unwrap().hot_len;
         let h = engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         let rs = engine.store.as_ref().unwrap();
@@ -420,13 +420,13 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_windowless_uses_none_mask() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(None);
+        let (mut engine, weights, index) = fixture(None);
         let hidden = weights.hidden_size;
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill (windowless)");
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode (None mask)");
         let rs = engine.store.as_ref().unwrap();
         for slab in &rs.stored {
@@ -439,12 +439,12 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_full_mask_with_w10_disabled() {
         set_w10_disable(true);
-        let (mut engine, mut weights, index) = fixture(Some(8));
+        let (mut engine, weights, index) = fixture(Some(8));
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         let hot_len_before = engine.store.as_ref().unwrap().hot_len;
-        let res = engine.decode_step_via_dispatch(&mut weights, &index, 2);
+        let res = engine.decode_step_via_dispatch(&weights, &index, 2);
         set_w10_disable(false);
         res.expect("decode");
         let rs = engine.store.as_ref().unwrap();
@@ -458,13 +458,13 @@ mod tests {
         // position into cold_encoded (the None match arm constructs it).
         // Second decode extends an existing cold_encoded (Some arm).
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(Some(2));
+        let (mut engine, weights, index) = fixture(Some(2));
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         assert!(engine.store.as_ref().unwrap().cold_encoded.is_none());
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode 1");
         assert!(engine.store.as_ref().unwrap().cold_encoded.is_some());
         let n_before = engine
@@ -476,7 +476,7 @@ mod tests {
             .unwrap()[0]
             .n_positions;
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 3)
+            .decode_step_via_dispatch(&weights, &index, 3)
             .expect("decode 2");
         let n_after = engine
             .store
@@ -495,13 +495,13 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_with_profiling_records_stages() {
         set_w10_disable(false);
-        let (engine, mut weights, index) = fixture(Some(8));
+        let (engine, weights, index) = fixture(Some(8));
         let mut engine = engine.with_profiling(true);
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode");
         assert!(engine.profile.decode_total.count >= 1);
         assert!(engine.profile.state_capture.count >= 1);

@@ -132,7 +132,11 @@ fn predict_kquant_hidden_inner(
         // backend (attention already done locally; server handles dense-FFN +
         // expert dispatch + combine). Fall through to dense-only on None.
         if weights.arch.is_hybrid_moe() {
-            if let Some(h_post_attn) = crate::forward::run_attention_public(weights, &h, layer) {
+            if let Some(h_post_attn) = crate::forward::run_attention_public(
+                larql_models::WeightsView::dense(weights),
+                &h,
+                layer,
+            ) {
                 if let Some(h_out) = ffn_backend.forward_moe_full_layer(layer, &h_post_attn) {
                     h = h_out;
                     weights.tensors.remove(&q_key);
@@ -149,7 +153,7 @@ fn predict_kquant_hidden_inner(
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
         if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             layer,
             ffn_backend,

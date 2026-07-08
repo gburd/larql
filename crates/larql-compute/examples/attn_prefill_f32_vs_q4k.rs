@@ -61,7 +61,13 @@ struct Geom {
 fn main() {
     let backend = &CpuBackend;
     let min_secs = 0.4;
-    let seq = 907; // matches the representative-context end-to-end run
+    // Default 907 = representative long-context run; override with an arg to
+    // probe the short-prompt prefill regime (e.g. `… -- 5`), where the
+    // amortised q4k_matmul is bandwidth-bound and should win.
+    let seq: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(907);
 
     let geoms = [
         Geom {
@@ -98,8 +104,8 @@ fn main() {
         ];
         println!("── {} layer ──", g.name);
         println!(
-            "{:>4} | {:>12} | {:>10} | {:>10} | {:>8} | {:>14}",
-            "proj", "shape", "f32 ms", "q4k ms", "speedup", "q4k_matmul floor"
+            "{:>4} | {:>12} | {:>9} | {:>11} | {:>11} | {:>7} | {:>9}",
+            "proj", "shape", "f32 ms", "matvec×seq", "q4k_matmul", "mm/f32", "floor ms"
         );
 
         let mut tot_f32 = 0.0;
@@ -131,9 +137,21 @@ fn main() {
                 }
                 acc
             });
+            // q4k_matmul: the real amortised CPU kernel (Q4_K only — V is Q6_K).
+            let mm_ns = if !q6 {
+                bench(min_secs, || {
+                    let o = backend
+                        .q4k_matmul(&q_bytes, x.as_slice().unwrap(), num_rows, in_dim, seq)
+                        .unwrap();
+                    o[0] + o[seq * num_rows - 1]
+                })
+            } else {
+                f64::NAN
+            };
 
             let f32_ms = f32_ns / 1e6;
             let q4k_ms = q4k_ns / 1e6;
+            let mm_ms = mm_ns / 1e6;
             // Bandwidth floor for a hypothetical amortised q4k_matmul: f32 reads
             // 4 B/weight once; q4k reads ~0.56 B/weight once → best case the proj
             // shrinks by the byte ratio IF it were weight-bandwidth-bound. (At
@@ -147,12 +165,13 @@ fn main() {
             tot_f32 += f32_ms;
             tot_q4k += q4k_ms;
             println!(
-                "{:>4} | {:>12} | {:>10.3} | {:>10.3} | {:>7.2}× | {:>11.3} ms",
+                "{:>4} | {:>12} | {:>9.3} | {:>11.3} | {:>11.3} | {:>6.2}× | {:>6.3} ms",
                 label,
                 format!("[{num_rows}×{in_dim}]"),
                 f32_ms,
                 q4k_ms,
-                f32_ms / q4k_ms,
+                mm_ms,
+                f32_ms / mm_ms,
                 floor_ms
             );
         }

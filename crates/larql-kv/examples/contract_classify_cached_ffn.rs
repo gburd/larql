@@ -163,8 +163,15 @@ fn forward_no_cache(
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
         let walk_ffn = WalkFfn::new_unlimited(weights, index);
-        let (h_new, _, kv_out) =
-            run_layer_with_ffn(weights, &h, layer, &walk_ffn, false, None, shared_kv)?;
+        let (h_new, _, kv_out) = run_layer_with_ffn(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            layer,
+            &walk_ffn,
+            false,
+            None,
+            shared_kv,
+        )?;
         h = h_new;
         if let Some(kv) = kv_out {
             kv_cache.insert(layer, kv);
@@ -197,8 +204,15 @@ fn forward_with_cache(
         } else {
             // Cache miss — real compute for this layer.
             let walk_ffn = WalkFfn::new_unlimited(weights, index);
-            let (h_new, _, kv_out) =
-                run_layer_with_ffn(weights, &h, layer, &walk_ffn, false, None, None)?;
+            let (h_new, _, kv_out) = run_layer_with_ffn(
+                larql_inference::WeightsView::dense(weights),
+                &h,
+                layer,
+                &walk_ffn,
+                false,
+                None,
+                None,
+            )?;
             h = h_new;
             if let Some(kv) = kv_out {
                 kv_cache.insert(layer, kv);
@@ -211,8 +225,15 @@ fn forward_with_cache(
             .kv_shared_source_layer(layer)
             .and_then(|src| kv_cache.get(&src));
         let walk_ffn = WalkFfn::new_unlimited(weights, index);
-        let (h_new, _, kv_out) =
-            run_layer_with_ffn(weights, &h, layer, &walk_ffn, false, None, shared_kv)?;
+        let (h_new, _, kv_out) = run_layer_with_ffn(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            layer,
+            &walk_ffn,
+            false,
+            None,
+            shared_kv,
+        )?;
         h = h_new;
         if let Some(kv) = kv_out {
             kv_cache.insert(layer, kv);

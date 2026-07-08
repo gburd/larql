@@ -50,7 +50,7 @@ impl KvDispatch for MetalBackend {
 
     fn attention_step(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -64,7 +64,7 @@ impl KvDispatch for MetalBackend {
 
     fn attention_step_windowed(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         query: &Array2<f32>,
         kv: &mut KvHandle,
         layer: usize,
@@ -77,7 +77,7 @@ impl KvDispatch for MetalBackend {
 
     fn attention_prefill(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
@@ -88,7 +88,7 @@ impl KvDispatch for MetalBackend {
 
     fn recompute_kv_from_residuals(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         residuals: &Array2<f32>,
         layer: usize,
     ) -> Option<KvHandle> {
@@ -113,7 +113,7 @@ impl KvDispatch for MetalBackend {
 
     fn forward_from_layer(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         start_layer: usize,
         residuals: &ResidualHandle,
         token_ids: &[u32],
@@ -150,7 +150,7 @@ impl KvDispatch for MetalBackend {
 
     fn coarse_prefill(
         &self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         token_ids: &[u32],
         index: Option<&dyn larql_compute::KvIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
@@ -161,7 +161,7 @@ impl KvDispatch for MetalBackend {
 
     fn coarse_prefill_with_state(
         &self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         token_ids: &[u32],
         index: Option<&dyn larql_compute::KvIndex>,
         state: Option<&mut larql_compute::PerLayerDecodeState>,
@@ -283,7 +283,7 @@ impl KvDispatch for MetalBackend {
 
     fn coarse_decode_step(
         &self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         token_id: u32,
         index: Option<&dyn larql_compute::KvIndex>,
         _handle: &mut KvHandle,
@@ -295,7 +295,7 @@ impl KvDispatch for MetalBackend {
 
     fn coarse_decode_step_with_state(
         &self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         token_id: u32,
         index: Option<&dyn larql_compute::KvIndex>,
         handle: &mut KvHandle,
@@ -315,7 +315,7 @@ impl KvDispatch for MetalBackend {
 
     fn coarse_decode_step_with_state_masked(
         &self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         token_id: u32,
         index: Option<&dyn larql_compute::KvIndex>,
         _handle: &mut KvHandle,
@@ -523,11 +523,24 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_, mut kv) = m
-            .attention_prefill(&weights, &h_in, 0, None, None)
+            .attention_prefill(
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h = m
-            .attention_step(&weights, &h_new, &mut kv, 0, tokens.len(), None)
+            .attention_step(
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                tokens.len(),
+                None,
+            )
             .expect("attention_step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -539,11 +552,25 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_, mut kv) = m
-            .attention_prefill(&weights, &h_in, 0, None, None)
+            .attention_prefill(
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h = m
-            .attention_step_windowed(&weights, &h_new, &mut kv, 0, tokens.len(), 64, None)
+            .attention_step_windowed(
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                tokens.len(),
+                64,
+                None,
+            )
             .expect("windowed attention_step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -555,7 +582,13 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (h, kv) = m
-            .attention_prefill(&weights, &h_in, 0, None, None)
+            .attention_prefill(
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         assert_eq!(h.shape(), &[tokens.len(), weights.hidden_size]);
         assert_eq!(kv.cached_len(), tokens.len());
@@ -574,8 +607,16 @@ mod tests {
         let residuals =
             Array2::from_shape_vec((3, weights.hidden_size), vec![0.0; 3 * weights.hidden_size])
                 .unwrap();
-        let m_result = m.recompute_kv_from_residuals(&weights, &residuals, 0);
-        let cpu_result = cpu.recompute_kv_from_residuals(&weights, &residuals, 0);
+        let m_result = m.recompute_kv_from_residuals(
+            larql_models::WeightsView::dense(&weights),
+            &residuals,
+            0,
+        );
+        let cpu_result = cpu.recompute_kv_from_residuals(
+            larql_models::WeightsView::dense(&weights),
+            &residuals,
+            0,
+        );
         assert_eq!(
             m_result.is_some(),
             cpu_result.is_some(),
@@ -603,7 +644,12 @@ mod tests {
                 .unwrap();
         let handle = m.upload_boundary_residual(&residual).expect("upload");
         let h = m
-            .forward_from_layer(&weights, 1, &handle, &[0u32, 1, 2])
+            .forward_from_layer(
+                larql_models::WeightsView::dense(&weights),
+                1,
+                &handle,
+                &[0u32, 1, 2],
+            )
             .expect("forward_from_layer");
         assert_eq!(h.ncols(), weights.hidden_size);
     }
@@ -643,10 +689,10 @@ mod tests {
 
     #[test]
     fn coarse_decode_step_without_index_returns_none() {
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let m = backend();
         let mut handle = KvHandle::new(MetalCoarseHandle);
-        let result = m.coarse_decode_step(&mut weights, 0u32, None, &mut handle, 0);
+        let result = m.coarse_decode_step(&weights, 0u32, None, &mut handle, 0);
         assert!(result.is_none());
     }
 
@@ -659,9 +705,9 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
-        let result = m.coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx));
+        let result = m.coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx));
         let (h, _handle) = result.expect("Metal Q4K prefill succeeds");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -672,11 +718,11 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         let mut state = larql_compute::PerLayerDecodeState::with_capacity(weights.num_layers);
         let result =
-            m.coarse_prefill_with_state(&mut weights, &[0u32, 1, 2], Some(&idx), Some(&mut state));
+            m.coarse_prefill_with_state(&weights, &[0u32, 1, 2], Some(&idx), Some(&mut state));
         let (h, _handle) = result.expect("Metal Q4K prefill-with-state succeeds");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(state.is_complete_for(weights.num_layers));
@@ -688,13 +734,13 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         // Seed the KV cache via prefill.
         let (_h, mut handle) = m
-            .coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx))
+            .coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx))
             .expect("prefill seeds the cache");
-        let result = m.coarse_decode_step(&mut weights, 4u32, Some(&idx), &mut handle, 3);
+        let result = m.coarse_decode_step(&weights, 4u32, Some(&idx), &mut handle, 3);
         let h = result.expect("Metal Q4K decode step returns Some");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -707,10 +753,10 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         let (_h, mut handle) = m
-            .coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx))
+            .coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx))
             .expect("prefill seeds the cache");
         for mask in [
             larql_compute::StateDumpMask::Full,
@@ -719,7 +765,7 @@ mod tests {
         ] {
             let mut state = larql_compute::PerLayerDecodeState::with_capacity(weights.num_layers);
             let result = m.coarse_decode_step_with_state_masked(
-                &mut weights,
+                &weights,
                 5u32,
                 Some(&idx),
                 &mut handle,
@@ -736,11 +782,11 @@ mod tests {
 
     #[test]
     fn coarse_decode_step_with_state_masked_without_index_returns_none() {
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let m = backend();
         let mut handle = KvHandle::new(MetalCoarseHandle);
         let result = m.coarse_decode_step_with_state_masked(
-            &mut weights,
+            &weights,
             0u32,
             None,
             &mut handle,

@@ -19,9 +19,14 @@ pub fn prefill_with_kv(
     let seq_len = token_ids.len();
 
     for layer in layer_range {
-        let (h_post_attn, k_rope, v) =
-            crate::attention::gpu::run_attention_with_kv_backend(weights, &h, layer, Some(backend))
-                .unwrap();
+        let (h_post_attn, k_rope, v) = crate::attention::gpu::run_attention_with_kv_backend(
+            larql_models::WeightsView::dense(weights),
+            &h,
+            layer,
+            Some(backend),
+            None,
+        )
+        .unwrap();
 
         if backend.has_kv_cache() {
             let layer_hd = weights.arch.head_dim_for_layer(layer);

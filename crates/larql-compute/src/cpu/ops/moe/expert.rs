@@ -831,35 +831,24 @@ mod tests {
         );
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_env_in_thread<T: Send + 'static>(
         vars: &'static [(&'static str, Option<&'static str>)],
         f: impl FnOnce() -> T + Send + 'static,
     ) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(n, _)| (*n, std::env::var_os(n)))
-            .collect();
-        for (n, v) in vars {
-            match v {
-                Some(s) => std::env::set_var(n, s),
-                None => std::env::remove_var(n),
+        // Run on a fresh thread so the TLS-cached env reads (`Q4K_DIRECT`,
+        // `EXPERT_TIMING`) initialise from this dispatch's values rather than
+        // inheriting an earlier `false` from another thread. The override is
+        // thread-local, so it must be set *inside* the spawned thread (where the
+        // TLS statics initialise); it dies with the thread → no cleanup, no
+        // `std::env::set_var` (which races `getenv` → SIGSEGV), no lock.
+        std::thread::spawn(move || {
+            for (n, v) in vars {
+                crate::options::set_env_override(n, *v);
             }
-        }
-        // Cross thread boundary so TLS-cached env reads (`Q4K_DIRECT`,
-        // `EXPERT_TIMING`) initialise to the freshly-set value rather
-        // than inheriting an earlier `false` from this process's main
-        // thread.
-        let result = std::thread::spawn(f).join().expect("thread did not panic");
-        for (n, v) in previous {
-            match v {
-                Some(s) => std::env::set_var(n, s),
-                None => std::env::remove_var(n),
-            }
-        }
-        result
+            f()
+        })
+        .join()
+        .expect("thread did not panic")
     }
 
     /// `LARQL_Q4K_DIRECT=1` opts in to the q4k-direct matvec path inside

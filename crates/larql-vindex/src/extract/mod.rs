@@ -1,5 +1,7 @@
 //! Build pipeline — extract model weights into vindex format.
 
+pub mod bitnet_loader;
+pub mod bitnet_writer;
 pub mod build;
 pub mod build_from_vectors;
 pub mod build_helpers;

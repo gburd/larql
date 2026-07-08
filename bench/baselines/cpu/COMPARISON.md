@@ -1,5 +1,27 @@
 # larql vs llama.cpp — CPU decode on Gemma 3 4B Q4_K
 
+> **Update 2026-06-22 — prefill gap largely closed.** The q4k-direct prefill
+> work changed the picture: Q4_K/Q6_K attention (Q/K/V/O) and FFN (gate/up/down)
+> projections now run straight from the vindex bytes with no per-layer f32
+> dequant — `q4k_matmul`/`q6k_matmul` (the Q6_K twin, used by the default Q6_K
+> `down_proj` and `v_proj`), with a hand-written aarch64 NEON inner dot.
+> Apple M3 Max, CPU only (`-t 8`), same model + prompt as below.
+>
+> | Metric | larql (standard) | llama.cpp | Ratio |
+> |---|---:|---:|---:|
+> | Decode (tg, tok/s)                   | ~42              | ~38   | **~1.1× ahead** |
+> | Prefill (5-tok prompt, ms)           | 233              | ~70   | **~3.3× behind** (was 55×) |
+> | Prefill vs the May full-dequant path | 2746 → 233 ms    |       | **11.8× faster** |
+>
+> Decode is now at/ahead of llama.cpp; prefill went from 55× behind to ~3×. The
+> NEON `q4k_matmul` at seq=5 actually *beats* f32 AMX sgemm (1.0–1.3×) while
+> skipping the dequant. The remaining prefill gap is constant-factor kernel work
+> (our matmul vs llama.cpp's hand-tuned asm) plus batched attention, not dequant.
+> Numbers are same-session (machine warm from builds) — ratios hold; cold
+> absolutes run a touch faster. The 2026-05-15 baseline below is kept for history.
+
+---
+
 Recorded 2026-05-15 on Apple M3 Max, 12 threads, BLAS / Accelerate enabled,
 no GPU. Both engines load the same model weights — `output/larql-gemma-3-4b-it.gguf`
 quantized to Q4_K_M for llama.cpp, the matching `output/gemma3-4b-q4k-v2.vindex`

@@ -9,12 +9,12 @@ use super::ple::apply_per_layer_embedding;
 use crate::attention::{AttentionWeights, SharedKV};
 use crate::ffn::FfnBackend;
 use crate::residual::rms_norm_for_arch;
-use larql_models::ModelWeights;
+use larql_models::{ModelWeights, WeightsView};
 use ndarray::Array2;
 
 /// Public wrapper for run_attention — used by diagnostic/capture tooling.
 pub fn run_attention_public(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
 ) -> Option<Array2<f32>> {
@@ -22,14 +22,14 @@ pub fn run_attention_public(
 }
 
 /// Run attention for a single layer. Returns the post-attention residual.
-pub fn run_attention(weights: &ModelWeights, h: &Array2<f32>, layer: usize) -> Option<Array2<f32>> {
+pub fn run_attention(weights: WeightsView, h: &Array2<f32>, layer: usize) -> Option<Array2<f32>> {
     let (h_post_attn, _) = run_attention_inner(weights, h, layer, false, None)?;
     Some(h_post_attn)
 }
 
 /// Run attention with optional per-head weight capture and shared K/V.
 pub fn run_attention_inner(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
     capture_attention: bool,
@@ -48,7 +48,7 @@ pub fn run_attention_inner(
 
 /// Run attention returning post-processed K/V for caching (KV sharing source layers).
 pub fn run_attention_with_kv_cache(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
 ) -> Option<(Array2<f32>, SharedKV)> {
@@ -147,7 +147,7 @@ pub fn apply_layer_scalar(weights: &ModelWeights, h: &mut Array2<f32>, layer: us
 /// sequence as `predict_with_temperature` without duplicating logic.
 #[allow(clippy::type_complexity)]
 pub fn run_layer_with_ffn(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
     ffn: &dyn FfnBackend,
@@ -175,9 +175,9 @@ pub fn run_layer_with_ffn(
         let path = crate::forward::dump_config::cpu_layer_h_post_attn_path(dir, layer);
         let _ = std::fs::write(&path, &bytes);
     }
-    let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
+    let (h_post_ffn, activation) = run_ffn(&weights, &h_post_attn, layer, ffn, capture_activation);
+    let mut h_out = apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(&weights, &mut h_out, layer);
     Some((h_out, activation, kv_out))
 }
 
@@ -188,7 +188,7 @@ pub fn run_layer_with_ffn(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn run_layer_with_capture(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
     ffn: &dyn FfnBackend,
@@ -224,7 +224,7 @@ pub fn run_layer_with_capture(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn run_layer_with_capture_hooked(
-    weights: &ModelWeights,
+    weights: WeightsView,
     h: &Array2<f32>,
     layer: usize,
     ffn: &dyn FfnBackend,
@@ -261,13 +261,13 @@ pub fn run_layer_with_capture_hooked(
     }
     hook.on_post_attention(layer, &mut h_post_attn);
 
-    let (h_post_ffn, activation) = run_ffn(weights, &h_post_attn, layer, ffn, capture_activation);
+    let (h_post_ffn, activation) = run_ffn(&weights, &h_post_attn, layer, ffn, capture_activation);
     if let Some(ref act) = activation {
         hook.on_ffn_activation(layer, act);
     }
 
-    let mut h_out = apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(weights, &mut h_out, layer);
+    let mut h_out = apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(&weights, &mut h_out, layer);
     hook.on_post_layer(layer, &mut h_out);
 
     Some((h_out, activation, attn_weights, kv_out))
@@ -315,7 +315,8 @@ mod tests {
         let weights = make_test_weights();
         let ffn = StubFfn { weights: &weights };
         let h = Array2::from_elem((2, weights.hidden_size), 0.5f32);
-        let result = run_layer_with_ffn(&weights, &h, 0, &ffn, false, None, None);
+        let result =
+            run_layer_with_ffn(WeightsView::dense(&weights), &h, 0, &ffn, false, None, None);
         assert!(result.is_some(), "run_layer_with_ffn returned None");
         let (h_out, _act, _kv) = result.unwrap();
         assert_eq!(h_out.shape(), h.shape());
@@ -326,7 +327,7 @@ mod tests {
     fn run_attention_public_returns_post_attention_residual() {
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.5f32);
-        let h_post = run_attention_public(&weights, &h, 0)
+        let h_post = run_attention_public(WeightsView::dense(&weights), &h, 0)
             .expect("attention should return post-residual on standard weights");
         assert_eq!(h_post.shape(), h.shape());
         assert!(h_post.iter().all(|v| v.is_finite()));
@@ -336,7 +337,8 @@ mod tests {
     fn run_attention_returns_same_shape_as_input() {
         let weights = make_test_weights();
         let h = Array2::from_elem((3, weights.hidden_size), 0.1f32);
-        let h_post = run_attention(&weights, &h, 0).expect("attention should succeed");
+        let h_post =
+            run_attention(WeightsView::dense(&weights), &h, 0).expect("attention should succeed");
         assert_eq!(h_post.shape(), h.shape());
     }
 
@@ -344,9 +346,14 @@ mod tests {
     fn run_attention_inner_with_capture_returns_attention_weights() {
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
-        let (h_post, attn_w) =
-            run_attention_inner(&weights, &h, 0, /*capture_attention=*/ true, None)
-                .expect("inner attention");
+        let (h_post, attn_w) = run_attention_inner(
+            WeightsView::dense(&weights),
+            &h,
+            0,
+            /*capture_attention=*/ true,
+            None,
+        )
+        .expect("inner attention");
         assert_eq!(h_post.shape(), h.shape());
         assert!(
             attn_w.is_some(),
@@ -358,9 +365,14 @@ mod tests {
     fn run_attention_inner_without_capture_drops_attention_weights() {
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
-        let (h_post, attn_w) =
-            run_attention_inner(&weights, &h, 0, /*capture_attention=*/ false, None)
-                .expect("inner attention");
+        let (h_post, attn_w) = run_attention_inner(
+            WeightsView::dense(&weights),
+            &h,
+            0,
+            /*capture_attention=*/ false,
+            None,
+        )
+        .expect("inner attention");
         assert_eq!(h_post.shape(), h.shape());
         assert!(
             attn_w.is_none(),
@@ -372,8 +384,8 @@ mod tests {
     fn run_attention_with_kv_cache_returns_kv_pair() {
         let weights = make_test_weights();
         let h = Array2::from_elem((3, weights.hidden_size), 0.1f32);
-        let (h_post, (k, v)) =
-            run_attention_with_kv_cache(&weights, &h, 0).expect("kv cache attention");
+        let (h_post, (k, v)) = run_attention_with_kv_cache(WeightsView::dense(&weights), &h, 0)
+            .expect("kv cache attention");
         assert_eq!(h_post.shape(), h.shape());
         // K and V have the same shape (seq_len × kv_dim).
         assert_eq!(k.shape(), v.shape());
@@ -388,7 +400,7 @@ mod tests {
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
         let mut record = RecordHook::for_layers([0]);
         let result = run_layer_with_capture_hooked(
-            &weights,
+            WeightsView::dense(&weights),
             &h,
             /*layer=*/ 0,
             &ffn,
@@ -423,10 +435,11 @@ mod tests {
         let ffn = StubFfn { weights: &weights };
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
         // Run once to build a SharedKV.
-        let (_, fresh_kv) = run_attention_with_kv_cache(&weights, &h, 0).unwrap();
+        let (_, fresh_kv) =
+            run_attention_with_kv_cache(WeightsView::dense(&weights), &h, 0).unwrap();
         let mut hook = crate::forward::NoopHook;
         let result = run_layer_with_capture_hooked(
-            &weights,
+            WeightsView::dense(&weights),
             &h,
             0,
             &ffn,
@@ -448,7 +461,16 @@ mod tests {
         let weights = make_test_weights();
         let ffn = StubFfn { weights: &weights };
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
-        let result = run_layer_with_capture(&weights, &h, 0, &ffn, true, true, None, None);
+        let result = run_layer_with_capture(
+            WeightsView::dense(&weights),
+            &h,
+            0,
+            &ffn,
+            true,
+            true,
+            None,
+            None,
+        );
         let (h_out, act, attn_w, kv_out) = result.expect("non-hooked capture wrapper");
         assert_eq!(h_out.shape(), h.shape());
         assert!(act.is_some());
@@ -464,7 +486,9 @@ mod tests {
         let weights = make_test_weights();
         let ffn = StubFfn { weights: &weights };
         let h = Array2::from_elem((3, weights.hidden_size), 1.0f32);
-        let (h_out, _, _) = run_layer_with_ffn(&weights, &h, 0, &ffn, false, None, None).unwrap();
+        let (h_out, _, _) =
+            run_layer_with_ffn(WeightsView::dense(&weights), &h, 0, &ffn, false, None, None)
+                .unwrap();
         let differ = h
             .iter()
             .zip(h_out.iter())

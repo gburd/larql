@@ -294,12 +294,13 @@ pub fn build_moe_weights<'a>(
 /// aliasing to Q4_K. Lifted from inside `resolve_attn_weights` so the
 /// mapping is unit-testable in isolation.
 fn attn_str_to_format(s: &str) -> QuantFormat {
-    match s {
-        "Q4_K" => QuantFormat::Q4_K,
-        "Q6_K" => QuantFormat::Q6_K,
-        other => panic!(
-            "resolve_attn_weights: registry tag {other:?} has no compute::QuantFormat mapping"
-        ),
+    // Source the tag→format mapping from `from_registry_tag` (single source
+    // of truth) but keep the attention surface's supported-subset guard:
+    // only Q4_K / Q6_K have a q8k attention matvec, so anything else still
+    // fails loudly rather than silently aliasing.
+    match QuantFormat::from_registry_tag(s) {
+        Some(f @ (QuantFormat::Q4_K | QuantFormat::Q6_K)) => f,
+        _ => panic!("resolve_attn_weights: registry tag {s:?} has no compute::QuantFormat mapping"),
     }
 }
 
@@ -377,14 +378,15 @@ pub fn resolve_attn_weights<'a>(
 /// didn't emit per-matrix tags. Lifted from inside `resolve_ffn_weights`
 /// so the mapping is unit-testable in isolation.
 fn ffn_str_to_format(s: &str, fallback: QuantFormat) -> QuantFormat {
-    match s {
-        "Q4_K" => QuantFormat::Q4_K,
-        "Q6_K" => QuantFormat::Q6_K,
-        "Q4_0" => QuantFormat::Q4_0,
-        "" => fallback,
-        other => panic!(
-            "resolve_ffn_weights: registry tag {other:?} has no compute::QuantFormat mapping"
-        ),
+    // Empty tag = legacy uniform-stride writer (no per-matrix tags) → fallback.
+    if s.is_empty() {
+        return fallback;
+    }
+    // Mapping from `from_registry_tag` (single source of truth); the FFN
+    // surface supports Q4_K / Q6_K / Q4_0, anything else fails loudly.
+    match QuantFormat::from_registry_tag(s) {
+        Some(f @ (QuantFormat::Q4_K | QuantFormat::Q6_K | QuantFormat::Q4_0)) => f,
+        _ => panic!("resolve_ffn_weights: registry tag {s:?} has no compute::QuantFormat mapping"),
     }
 }
 

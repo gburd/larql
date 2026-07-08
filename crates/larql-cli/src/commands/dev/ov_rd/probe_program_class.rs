@@ -641,7 +641,10 @@ fn capture_target_features(
                 .kv_shared_source_layer(layer)
                 .and_then(|src| kv_cache.get(&src));
             let (_, pre_o, all_weights) = run_attention_block_with_pre_o_and_all_attention_weights(
-                weights, &h, layer, shared_kv,
+                larql_models::WeightsView::dense(weights),
+                &h,
+                layer,
+                shared_kv,
             )
             .ok_or_else(|| {
                 format!(
@@ -683,7 +686,7 @@ fn capture_target_features(
                 .and_then(|src| kv_cache.get(&src));
             let ffn = WeightFfn { weights };
             run_layer_with_ffn(
-                weights,
+                larql_inference::WeightsView::dense(weights),
                 &h,
                 layer,
                 &ffn,

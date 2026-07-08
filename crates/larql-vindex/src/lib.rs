@@ -55,10 +55,9 @@ pub use tokenizers;
 // Config
 pub use config::dtype::StorageDtype;
 pub use config::types::{
-    ComplianceGate, DownMetaRecord, DownMetaTopK, ExtractLevel, FfnLayout, BitnetLayout,
-    BitnetTensorEntry, Fp4Config, LayerBands,
-    MoeConfig, Precision, ProjectionFormat, Projections, QuantFormat, VindexConfig,
-    VindexLayerInfo, VindexModelConfig, VindexSource,
+    BitnetLayout, BitnetTensorEntry, ComplianceGate, DownMetaRecord, DownMetaTopK, ExtractLevel,
+    FfnLayout, Fp4Config, LayerBands, MoeConfig, Precision, ProjectionFormat, Projections,
+    QuantFormat, VindexConfig, VindexLayerInfo, VindexModelConfig, VindexSource,
 };
 
 // Error

@@ -99,6 +99,152 @@ pub fn generate_kquant_cpu_remote(
     out
 }
 
+/// KV-cached autoregressive generation: one prefill over the prompt, then
+/// one [`super::cached::predict_kquant_decode_step`] per token — O(n) decode
+/// instead of the full-recompute O(n²) of [`generate_kquant_cpu`]. Greedy.
+///
+/// Falls back to the naive loop when the arch doesn't support cached decode
+/// (hybrid MoE, KV-shared layers — see `supports_cached_decode`).
+pub fn generate_kquant_cpu_cached(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+) -> Vec<(String, u32)> {
+    generate_kquant_cpu_constrained_cached(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        |_, _| {},
+    )
+}
+
+/// KV-cached variant of [`generate_kquant_cpu_constrained`]: same mask
+/// contract (called on raw logits before each greedy pick, `-inf` to
+/// exclude), same EOS policy, prefill + per-token decode steps instead of
+/// full recompute. Falls back to the naive loop when cached decode is
+/// unsupported for the arch.
+pub fn generate_kquant_cpu_constrained_cached<M>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mask_fn: M,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+{
+    generate_kquant_cpu_constrained_cached_streaming(
+        weights,
+        tokenizer,
+        prompt_ids,
+        max_tokens,
+        index,
+        mask_fn,
+        |_, _| {},
+    )
+}
+
+/// Streaming-callback sibling of [`generate_kquant_cpu_constrained_cached`]:
+/// fires `on_token(id, text)` after each pick so callers can render tokens
+/// as they decode (the showcase/demo path).
+pub fn generate_kquant_cpu_constrained_cached_streaming<M, F>(
+    weights: &mut ModelWeights,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    index: &VectorIndex,
+    mut mask_fn: M,
+    mut on_token: F,
+) -> Vec<(String, u32)>
+where
+    M: FnMut(&[u32], &mut Vec<f32>),
+    F: FnMut(u32, &str),
+{
+    if !super::cached::supports_cached_decode(weights) {
+        return generate_kquant_cpu_constrained(
+            weights, tokenizer, prompt_ids, max_tokens, index, mask_fn,
+        );
+    }
+    let mut out: Vec<(String, u32)> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 || prompt_ids.is_empty() {
+        return out;
+    }
+
+    let eos = crate::layer_graph::EosConfig::builtin();
+    let mut sampler =
+        crate::layer_graph::Sampler::new(crate::layer_graph::SamplingConfig::greedy());
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+
+    let (h, mut cache, _timings) =
+        super::cached::predict_kquant_prefill(weights, prompt_ids, index);
+    let last = h.nrows().saturating_sub(1);
+    let mut h_last = h.slice(ndarray::s![last..last + 1, ..]).to_owned();
+
+    // Prefer the dequant-free direct-matvec step — the staged step's cost
+    // is dominated by re-dequantising every layer's tensors. Parity with
+    // the staged step was restored by the q4_common f16 subnormal fix
+    // (subnormal scales decoded 2× → garbled K on outlier layers; probe
+    // `examples/ave_direct_step_parity.rs`, post-fix hidden cosine
+    // 0.99995, identical top-k). `LARQL_DIRECT_DECODE_STEP=0` forces the
+    // staged step for A/B runs.
+    let direct = std::env::var("LARQL_DIRECT_DECODE_STEP")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+        && super::cached::supports_direct_matvec_decode(weights, index);
+    let backend = larql_compute::default_backend();
+
+    for step in 0..max_tokens {
+        let mut logits = crate::forward::hidden_to_raw_logits(weights, &h_last);
+        mask_fn(&generated, &mut logits);
+
+        let id = match sampler.sample_with_history(&logits, &generated) {
+            Some(id) => id,
+            None => break,
+        };
+        // Same sanity bail as the naive loop: a non-finite pick means the
+        // mask wiped everything.
+        let score = *logits.get(id as usize).unwrap_or(&f32::NEG_INFINITY);
+        if !score.is_finite() {
+            break;
+        }
+        let tok = tokenizer.decode(&[id], true).unwrap_or_default();
+        let stop = eos.is_eos_with_tokenizer(id, &tok, tokenizer);
+        on_token(id, &tok);
+        out.push((tok, id));
+        generated.push(id);
+        if stop || step + 1 == max_tokens {
+            break;
+        }
+
+        // Feed the picked token through one cached step; its absolute RoPE
+        // position is prompt_len + step.
+        let abs_position = prompt_ids.len() + step;
+        let h_next = if direct {
+            super::cached::predict_kquant_decode_step_direct(
+                weights,
+                id,
+                index,
+                &*backend,
+                &mut cache,
+                abs_position,
+            )
+        } else {
+            super::cached::predict_kquant_decode_step(weights, id, index, &mut cache, abs_position)
+                .map(|(h, _t)| h)
+        };
+        match h_next {
+            Some(h) => h_last = h,
+            None => break,
+        }
+    }
+    out
+}
+
 /// Constrained variant of [`generate_kquant_cpu`]. Greedy under the mask.
 pub fn generate_kquant_cpu_constrained<M>(
     weights: &mut ModelWeights,
@@ -348,6 +494,78 @@ mod tests {
         let out =
             generate_kquant_cpu_remote(&mut weights, &tokenizer, &[0u32, 1], 2, &index, &remote);
         assert!(out.len() <= 2);
+    }
+
+    /// Parity gate for the KV-cached decode loop: on the same fixture,
+    /// prompt and mask, the cached path must emit exactly the ids the
+    /// naive full-recompute path emits (the timing win is only real on a
+    /// kernel that says the same thing — parity before tok/s).
+    #[test]
+    fn cached_constrained_matches_naive_loop_on_fixture() {
+        let index;
+        let tokenizer;
+        let naive = {
+            let mut weights = make_test_q4k_weights();
+            index = make_test_q4k_vindex(&weights);
+            tokenizer = make_test_tokenizer(weights.vocab_size);
+            generate_kquant_cpu_constrained(
+                &mut weights,
+                &tokenizer,
+                &[0u32, 1, 2],
+                4,
+                &index,
+                |_, _| {},
+            )
+        };
+        // Fresh weights for the cached run — both paths mutate layer
+        // tensor scratch, a shared instance would hide state leakage.
+        let mut weights = make_test_q4k_weights();
+        let cached = generate_kquant_cpu_constrained_cached(
+            &mut weights,
+            &tokenizer,
+            &[0u32, 1, 2],
+            4,
+            &index,
+            |_, _| {},
+        );
+        let naive_ids: Vec<u32> = naive.iter().map(|(_, id)| *id).collect();
+        let cached_ids: Vec<u32> = cached.iter().map(|(_, id)| *id).collect();
+        assert_eq!(naive_ids, cached_ids);
+    }
+
+    /// Cached path under a forcing mask emits exactly the forced ids, and
+    /// the unconstrained wrapper runs.
+    #[test]
+    fn cached_constrained_obeys_a_forcing_mask() {
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let schedule = [7u32, 3, 9];
+        let out = generate_kquant_cpu_constrained_cached(
+            &mut weights,
+            &tokenizer,
+            &[0u32, 1],
+            schedule.len(),
+            &index,
+            |generated, logits| {
+                let want = schedule[generated.len()];
+                for (i, l) in logits.iter_mut().enumerate() {
+                    if i as u32 != want {
+                        *l = f32::NEG_INFINITY;
+                    }
+                }
+                if let Some(l) = logits.get_mut(want as usize) {
+                    if !l.is_finite() {
+                        *l = 0.0;
+                    }
+                }
+            },
+        );
+        let ids: Vec<u32> = out.iter().map(|(_, id)| *id).collect();
+        assert_eq!(ids, schedule);
+
+        let plain = generate_kquant_cpu_cached(&mut weights, &tokenizer, &[0u32, 1], 2, &index);
+        assert!(plain.len() <= 2);
     }
 
     /// `generate_kquant_cpu_constrained_streaming` wraps the sampled

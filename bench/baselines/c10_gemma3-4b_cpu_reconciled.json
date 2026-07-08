@@ -42,5 +42,5 @@
     "ollama num_gpu=0 needs a warmup call after any GPU-mode use (mode switch forces a model reload); short unwarmed measurements are unreliable for a CPU baseline."
   ],
   "mechanism_confirms_C12": "The reconciled ~1.6-1.8x gap is the same kernel-quality gap the C12 diagnosis identified: 1.73x per-core, larql's NEON intrinsics (LLVM-lowered) vs llama.cpp's hand-asm Q4K x Q8K SDOT (two-super-block interleave + prefetch). Both attention and FFN already run the int8 Q8_K SDOT kernel. The lever remains C12 (hand-asm kernel), unchanged.",
-  "still_owed": "26B-A4B llama.cpp CPU baseline (needs a 26B GGUF, not local) -- that is the number that actually pins the medium-term tier."
+  "still_owed": "CLEARED 2026-06-10 -- see c10_gemma4-26b-a4b_cpu_reconciled.json (llama.cpp 32.1 vs larql 7.1 default / 9.7 with LARQL_Q4K_DIRECT_ATTN; the 26B gap is f32-residency byte traffic, not the C12 kernel)."
 }

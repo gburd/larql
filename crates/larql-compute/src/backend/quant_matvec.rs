@@ -15,6 +15,7 @@
 //! Adding a new quant format = `QuantFormat` variant + match arm in
 //! `quant_matvec` + per-format helper for the fast path.
 
+use crate::cpu::ops::ternary_matvec::BitLinearWeight;
 use crate::QuantFormat;
 use larql_models::quant::ggml::LEGACY_BLOCK_ELEMS;
 
@@ -74,6 +75,11 @@ pub trait QuantMatVec {
                 let (q8_x, q8_scales) = crate::cpu::ops::q4_common::quantize_to_q8(x);
                 self.q8_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
             }
+            // Ternary is served by [`Self::ternary_matvec`] with a
+            // `BitLinearWeight` — the per-channel scales can't ride this
+            // `&[u8]`-only signature, so `quant_matvec` returns `None` (loud
+            // missing capability), same as Q8_0's dedicated-kernel story.
+            QuantFormat::I2S => None,
             QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
     }
@@ -112,6 +118,10 @@ pub trait QuantMatVec {
                 let x_f32 = dequantise_q8(q8_x, q8_scales);
                 self.quant_matvec(format, weights, &x_f32, num_rows, hidden)
             }
+            // Ternary has its own int8-activation (A8) quantisation and weight
+            // container — it doesn't consume the legacy block-32 Q8 input.
+            // Use [`Self::ternary_matvec`] with a `BitLinearWeight`.
+            QuantFormat::I2S => None,
             QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
     }
@@ -289,6 +299,20 @@ pub trait QuantMatVec {
         _num_rows: usize,
         _hidden: usize,
     ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// BitNet ternary (I2_S) matvec: `out[N] = W[N, K] · x[K]` where `W` is a
+    /// 1.58-bit ternary [`BitLinearWeight`] (packed trits + per-channel
+    /// scales) and `x` is f32. This is the dedicated ternary entry point —
+    /// `quant_matvec` returns `None` for `QuantFormat::I2S` because the
+    /// per-channel scales can't ride its `&[u8]`-only signature.
+    ///
+    /// Backends with a ternary kernel (the CPU A8 sign-select path) override;
+    /// the default returns `None`. The implementation owns the activation
+    /// quantisation (W1.58·A8: int8-quantise `x` internally), so callers pass
+    /// raw f32 — mirroring how `q4k_matvec` takes f32 input.
+    fn ternary_matvec(&self, _w: &BitLinearWeight, _x: &[f32]) -> Option<Vec<f32>> {
         None
     }
 

@@ -40,7 +40,6 @@ pub use local_walk::LocalWalkExecutor;
 
 use crate::attention::SharedKV;
 use crate::ffn::FfnBackend;
-use crate::model::ModelWeights;
 use ndarray::Array2;
 
 /// Whether an executor owns its K/V state internally (`Fused`) or
@@ -95,7 +94,7 @@ pub trait LayerExecutor {
     /// `None` by default — engines should not call this on `Fused`.
     fn run_prefill_layer(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         layer: usize,
         hidden_in: &Array2<f32>,
         ffn: &dyn FfnBackend,
@@ -119,7 +118,7 @@ pub trait LayerExecutor {
     /// `None` by default.
     fn run_decode_layer(
         &self,
-        weights: &ModelWeights,
+        weights: larql_models::WeightsView,
         layer: usize,
         hidden_in: &Array2<f32>,
         prior_kv: &SharedKV,
@@ -172,13 +171,22 @@ mod tests {
         let weights = crate::test_utils::make_test_weights();
         let ffn = crate::ffn::WeightFfn { weights: &weights };
         let hidden = Array2::<f32>::zeros((1, weights.hidden_size));
-        assert!(exec.run_prefill_layer(&weights, 0, &hidden, &ffn).is_none());
+        assert!(exec
+            .run_prefill_layer(larql_models::WeightsView::dense(&weights), 0, &hidden, &ffn)
+            .is_none());
 
         // SharedKV = (K, V) as Array2<f32>: shape doesn't matter — the
         // default impl returns None before touching either tensor.
         let kv: SharedKV = (Array2::<f32>::zeros((1, 1)), Array2::<f32>::zeros((1, 1)));
         assert!(exec
-            .run_decode_layer(&weights, 0, &hidden, &kv, 0, &ffn)
+            .run_decode_layer(
+                larql_models::WeightsView::dense(&weights),
+                0,
+                &hidden,
+                &kv,
+                0,
+                &ffn
+            )
             .is_none());
     }
 

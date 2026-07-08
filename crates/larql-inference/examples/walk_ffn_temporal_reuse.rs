@@ -16,7 +16,7 @@
 
 use larql_inference::load_tokenizer;
 use larql_inference::research::predict_with_ffn_trace;
-use larql_inference::vindex::{insert_q4k_layer_tensors, WalkFfn};
+use larql_inference::vindex::{insert_q4k_layer_tensors_resident, WalkFfn};
 use ndarray::Array1;
 
 const K: usize = 2048; // active-pool size for Jaccard
@@ -116,7 +116,7 @@ fn main() {
     let _ = index.load_gate_vectors_q4(&dir);
     let tok = load_tokenizer(&dir).expect("tok");
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant attn");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant attn");
     }
     let nl = weights.num_layers;
 

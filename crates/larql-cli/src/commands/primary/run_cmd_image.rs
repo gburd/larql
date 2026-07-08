@@ -250,7 +250,7 @@ pub fn run_with_images(
         // Materialise f32 attention tensors into `weights.tensors` so the
         // engine's attention dispatch reads f32 even though the on-disk
         // tensors are Q4K.
-        larql_inference::vindex::ensure_attn_tensors_dequantised(&mut weights, &idx);
+        larql_inference::vindex::ensure_attn_tensors_dequantised_resident(&mut weights, &idx);
         Some(idx)
     } else {
         None

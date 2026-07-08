@@ -1,0 +1,139 @@
+{
+  "test_id": "C10-26B-A4B",
+  "model": "gemma-4-26B-A4B-it (Q4_K)",
+  "machine": "M3 Max, 128GB, 8 threads, battery 100% throughout (verified, see power_state_lesson)",
+  "date": "2026-06-10",
+  "purpose": "The missing 26B-A4B CPU decode baseline that pins the medium-term achievability tier (ROADMAP.md gate rule on the ~62% row). Also resolves the runbook's in-process-1.8-vs-loopback-4.4 question and localises the larql-vs-llama.cpp MoE gap.",
+  "method": {
+    "prompt": "Write a long detailed essay about the history of the Roman empire, covering its founding, rise, and fall: (n=128 decode steps, 5 warmup, generation-friendly)",
+    "threads": 8,
+    "larql_inproc": "larql bench <vindex> --cpu -n 128 --warmup 5 --threads 8 -> LocalMoeFfn (in-process experts, KV-cached, generate_with_engine_resident)",
+    "larql_inproc_q4k_attn": "same + LARQL_Q4K_DIRECT_ATTN=1 (task #16 decode path: Q/K/V/O via q4k/q6k matvec from index bytes instead of f32-resident BLAS)",
+    "larql_loopback": "larql serve <vindex> --port 8081 --experts 0-127 (NOT --ffn-only; that mode breaks the expert endpoints) + RAYON_NUM_THREADS=8 larql run --moe-shards 0-127=http://127.0.0.1:8081 --engine standard -n 133, warm (one discarded n=20 run)",
+    "llama_bench": "llama-bench -m /tmp/gemma4-26b-Q4_K_M.gguf -dev BLAS -ngl 0 -p 64 -n 128 -r 3 -t 8 (GGUF built 2026-06-06 from the cached google/gemma-4-26B-A4B-it safetensors via llama.cpp HEAD convert + llama-quantize Q4_K_M; build d48a56eff (9430))",
+    "drift_check": "llama-bench tg128 r=1 re-run AFTER the larql legs: 30.45 vs 32.08 before (~5%) -> machine state stable across the matrix"
+  },
+  "decode_tok_s_t8": {
+    "llama_bench_ngl0": 32.08,
+    "llama_bench_ngl0_stddev": 1.41,
+    "llama_bench_drift_check": 30.45,
+    "larql_inproc_default": 7.1,
+    "larql_inproc_q4k_direct_attn": 9.7,
+    "larql_loopback_shard": 7.3
+  },
+  "decode_ms_per_tok_t8": {
+    "llama_bench_ngl0": 31.2,
+    "larql_inproc_default": 140.47,
+    "larql_inproc_q4k_direct_attn": 103.54
+  },
+  "prefill": {
+    "llama_bench_pp64_tok_s": 80.26,
+    "larql_inproc_default_ms": 6587,
+    "larql_inproc_q4k_attn_ms": 652,
+    "note": "larql OFF prefill includes the lazy f32 dequant of attention tensors; the q4k-direct flag skips ensure_attn_tensors_dequantised entirely -> 10x TTFT. Different prompt lengths than pp64; not directly comparable to llama.cpp."
+  },
+  "reconciled_gap_x": {
+    "default_vs_llamacpp": 4.5,
+    "q4k_attn_vs_llamacpp": 3.3,
+    "note": "Much wider than the 4B dense gap (1.6-1.8x) -- but the mechanism is NOT kernel quality (C12). It is byte traffic: the in-process MoE path keeps attention + dense FFN slab + lm_head f32-RESIDENT."
+  },
+  "mechanism_byte_ledger_per_token": {
+    "attention_qkvo": {"params_b": 1.04, "larql_default": "f32 4.15 GB", "llama_cpp": "Q4_K ~0.58 GB"},
+    "dense_ffn_slab_2112": {"params_b": 0.54, "larql_default": "f32 2.14 GB", "llama_cpp": "Q4_K ~0.30 GB"},
+    "lm_head_vocab_262144": {"params_b": 0.74, "larql_default": "f32 2.95 GB", "llama_cpp": "Q4_K ~0.42 GB"},
+    "experts_top8_of_128": {"params_b": 1.43, "larql_default": "Q4_K 0.80 GB", "llama_cpp": "Q4_K ~0.80 GB"},
+    "total": {"larql_default_gb": 10.0, "larql_q4k_attn_gb": 6.4, "llama_cpp_gb": 2.1},
+    "implied_bandwidth_gb_s": {"larql_default": 71, "larql_q4k_attn": 62, "llama_cpp": 67},
+    "verdict": "All three legs run bandwidth-saturated at ~62-71 GB/s. The byte ratio (10.0/2.1 = 4.8x) explains essentially the whole measured 4.5x gap; the expert kernel (already int8 Q8_K SDOT) is only ~8% of default-path bytes and is NOT the bottleneck. The A/B confirms the model: cutting attention 4.15->0.58 GB predicted ~100 ms/tok, measured 103.5."
+  },
+  "resolution_inproc_vs_loopback": {
+    "verdict": "The runbook's 'in-process 1.8 < loopback 4.4' anomaly was two artifacts, not a real inversion. The 1.8 was a cold/short-n (n=8) smoke; warm AC numbers are in-process 7.1 vs loopback 7.3 -- effectively equal. The loopback's second process contributes extra cores that roughly cancel its ~660 KB/token/direction HTTP+JSON serialization cost.",
+    "loopback_wire_per_token": "~330 KB sent + ~330 KB recv (30 layers x hidden x f32, both directions)"
+  },
+  "power_state_lesson": {
+    "verdict": "The entire first measurement session (2026-06-09 night) was invalidated by the laptop silently running on BATTERY and draining 100->31%. Symptoms: monotonic decline 6.3->3.2->2.2 on identical commands, bimodal swings, and finally llama.cpp itself collapsing 34.3->1.05 tok/s (~30x, far beyond the 1.5-3x thermal class). Spotlight (mds_stores 91% after 30+ GB of model I/O) stacked on top.",
+    "discipline_addition": "C10 method now REQUIRES: pmset -g batt shows AC (or 100%), and a cross-engine drift check bracketing the matrix (llama-bench before AND after). A fast number on a degraded machine is a price floor; a slow number proves nothing."
+  },
+  "secondary_findings": [
+    "larql bench --moe-shards still calls the pre-C1 generate_with_remote_moe (no KV engine) and fails on CPU with the #146 error signature ('decode_token_with_moe returned None during prefill') regardless of server mode. larql run --moe-shards --engine standard is the working loopback instrument. Fix tracked: route bench through the C1 resident path.",
+    "larql serve --ffn-only does NOT serve the MoE expert endpoints the client needs ('bad expert response'); use --experts 0-127.",
+    "LARQL_DECODE_STAGES=1 records expert time only in the REMOTE branch of moe_ffn_block_cpu; the local-expert branch (LocalMoeFfn) is unrecorded, and the bench table never prints stages anyway.",
+    "gemma4-26B-A4B CPU in llama.cpp is NOT slow upstream (the runbook's open question): 32 tok/s tg128. The earlier 1-core observation was machine-load confound.",
+    "llama.cpp pays only 1.25x going dense-4B (43 tok/s) -> MoE-26B (32); active-param math holds (26B-A4B active FFN MACs are ~0.73x the 4B dense FFN's)."
+  ],
+  "roadmap_implications": {
+    "tier_gate": "Gate rule on the medium-term row: 'if 10 tok/s ~ llama.cpp-on-26B-CPU this rises toward 70'. Measured llama.cpp = 32, i.e. the >=10 target is ~3x BELOW what a mature engine proves the hardware does -> favorable branch, tier 62% -> 70%.",
+    "path_to_10": "LARQL_Q4K_DIRECT_ATTN alone reaches 9.7. Remaining f32 components are the same fix class: dense slab q4k (2.14->0.30 GB) + lm_head q4k (2.95->0.42 GB) -> ~2.0-2.3 GB/token -> ~15-20 tok/s at larql kernel efficiency (C12 1.6-1.8x residual vs llama.cpp). The lever is quantized RESIDENCY (engineering, parity-gated), not new research.",
+    "q4k_direct_attn_reframed": "Task #16's end-to-end verdict ('~0% at representative ctx') was measured on the network-bound loopback path. On the in-process path the flag is worth 1.36x decode + 10x TTFT. Promote from 'keep opt-in, don't headline' to the default for in-process CPU MoE once parity is re-confirmed at n>=128 (unit parity + e2e Paris already green from #16)."
+  },
+  "artifacts": {
+    "larql_inproc_off": "bench/baselines/_c10_26b_larql_inproc_off.json",
+    "larql_inproc_q4k_attn": "bench/baselines/_c10_26b_larql_inproc_q4kattn.json",
+    "first_session_invalid": "bench/baselines/_c10_26b_larql_inproc.json (2026-06-09, battery-confounded; kept for the power-state lesson only)"
+  },
+  "update_2026_06_11_quantized_residency": {
+    "what": "Built the residency levers the 06-10 analysis named: LARQL_Q4K_LM_HEAD (q4k lm_head in the resident decode loop, larql-kv generation.rs) + LARQL_Q4K_DIRECT_FFN (q4k dense slab via ffn_decode_step_native in moe_ffn_block_cpu_with_index, with padded-down handling for the 2112-stored-as-2304 layout, exact-parity tested) + C12 v2 fused gate+up hand-asm (q4k_q8k_gate_up_asm, bit-exact, under LARQL_Q4K_ASM). All opt-in, default off = byte-identical; 1148+755+686 tests green, clippy clean.",
+    "decode_tok_s_t8_n128_warm": {
+      "default_f32_resident": 7.6,
+      "full_residency_attn_lmh_ffn": 13.9,
+      "full_residency_plus_asm": 15.9,
+      "llama_bench_bracket_start": 32.54,
+      "llama_bench_bracket_end": 28.8
+    },
+    "verdict": "MEDIUM-TERM TARGET (>=10 tok/s on 26B-A4B CPU) PASSED at 15.9 on M3 Max (caveat: 128 GB M3 Max has more memory bandwidth than the 64 GB consumer class the tier names). Gap to llama.cpp now ~1.9x (was 4.5x). End bracket shows ~11% thermal drift after sustained load, so the later (flag) legs are if anything understated.",
+    "kernel_microbench": "Fused gate_up: neon 9.89 GiB/s (horizontal-sum-bound, the worst kernel in the file) -> asm 19.82 GiB/s (2.00x, exceeds the single-matrix asm's 18.4 -- shared activation loads + two independent SDOT chains fill the stall slots). Single-matrix kernels reproduce 2026-06-02 exactly (neon 17.7-18.2, asm 18.2-18.5, scalar 9.36).",
+    "honest_negative": "4B legacy bench A/B is e2e-NEUTRAL for the fused asm (23.2 vs 22.9; StandardEngine 26.2 both) -- the local direct-decode FFN deliberately uses two SEPARATE rayon-parallel matvecs (cached.rs), so q4k_q8k_gate_up_into's production consumers are the remote expert server (q8k_wire) and walk-FFN paths, not the local bench rows. The spec's 'production FFN gate/up uses it directly' was stale. The 26B's 13.9->15.9 ASM gain comes from the matvec_into callers (experts gate/up/down, lm_head, dense slab gate/up).",
+    "remaining_to_llamacpp": "~1.9x: (a) Q6_K asm (down projections + 26B dense-slab down -- no asm today); (b) the q4k-direct ATTENTION path runs the f32-activation q4k_matvec (q4_common), not the int8 q8k kernel -- route it through q4k_q8k + asm; (c) instruction-count reduction toward the 28 GiB/s single-kernel target; (d) optionally a rayon-chunked fused gate_up for the local decode paths (+~12% on gate/up portion).",
+    "raw_rows": "bench/baselines/_qres_{off,full,full_asm}.json"
+  },
+  "update_2026_06_11_int8_attention": {
+    "what": "LARQL_Q4K_ATTN_INT8: the Q4K-direct attention projections move from the f32-activation kernels (quant_matvec -> q4k_matvec/q6k_matvec) to the int8 Q8_K SDOT kernels (q4k_q8k/q6k_q8k matvec_into, asm-aware, rayon-chunked; Q/K/V share one Q8_K quantisation of h_norm, O quantises the GQA context separately). Same numerics class as the dense-model production attention (attention_decode_step_native). Motivated by the stage split: attn was ~54% of decode at only ~26% of bytes (f32-activation kernel ~3x worse per byte than the expert path). Also: LARQL_DECODE_STAGES now records LOCAL expert time (was remote-only) and the bench MoE row prints the split.",
+    "decode_tok_s_t8_n128_warm_ac": {
+      "full_stack_f32act_attn": 16.7,
+      "full_stack_plus_attn_int8": 21.7,
+      "llama_bench_bracket": 33.2
+    },
+    "stage_split_ms_per_token": {
+      "before": {"attn": 32.7, "experts": 16.5, "dense": 8.1, "lm_head": 6.7},
+      "after": {"attn": 19.3, "experts": 16.0, "dense": 8.2, "lm_head": 6.6},
+      "note": "Order-swapped A/B (both orders run) — the one anomalous experts=23.7 reading was second-position noise; A reproduces 16.7/32.7 exactly in either position."
+    },
+    "verdict": "Gap to llama.cpp now 1.53x (was 4.5x at the 06-10 baseline, 2.0x after residency+asm). The byte-residency gap is CLOSED; the remainder is C12 kernel-rate + per-step overhead territory: attn still ~30 GB/s effective vs experts ~50 (RoPE/GQA/KV-concat f32 + Q6_K V has no asm), Q6_K asm (dense down + V), instruction-count toward 28 GiB/s, KV-concat copies the cache every step (O(ctx) per layer).",
+    "parity": "q8k_direct_proj chunking bit-exact vs whole-matrix kernel call (Q4_K + Q6_K); int8-vs-f32-activation within 2% scale-relative (the Q8_K activation quant the production dense path already carries). Flags default off = byte-identical.",
+    "raw_row": "bench/baselines/_qres_full_int8attn.json"
+  },
+  "update_2026_06_11_q6k_asm": {
+    "what": "q6k_q8k_matvec_asm under the same LARQL_Q4K_ASM gate: TBL-replicate for the hi2 unpack (replaces 4 scalar multiplies + vector rebuild per 16-elem group) + q4k-style vector-lane scale accumulate (replaces 16 horizontal addv + scalar muls per super-block). Bit-exact vs scalar (first try, same as the q4k and gate_up asm kernels).",
+    "isolated": "neon 9.97 -> asm 11.21 GiB/s (+12.4%) on the 2560x10240 down shape. Q6_K's 6-bit unpack is inherently heavier than Q4_K's, so the ceiling is lower.",
+    "e2e_26b": "NEUTRAL within noise: 21.6 vs 21.7 tok/s (attn 19.3->19.1 ms from the V projection, dense 8.2->8.0 from the down) -- the Q6_K streams are only ~13% of full-stack bytes (~3 ms), so +12% of that is ~0.4 ms. Keep: bit-exact, free, and the 4B dense down is Q6_K too (not re-measured).",
+    "remaining_lever_ranking": "At 46 ms/token (21.7 tok/s) vs llama.cpp ~30 ms: (1) q4k_q8k instruction-count reduction 18.4->28 GiB/s touches ~35 ms of the 46 (experts + attn projections + lm_head + dense gate/up) -- THE remaining lever, but the spec's own gate applies: needs Instruments port-saturation attribution before guessing at the asm restructure; (2) attention non-projection overhead ~7 ms (RoPE/GQA f32, KV-concat copies the cache every step -- grows with ctx); (3) per-super-block Rust glue (unpack_scales_mins + sum2) possibly partly hidden by OoO overlap -- measure, don't assume.",
+    "raw_row": "bench/baselines/_qres_full_q6kasm.json"
+  },
+  "update_2026_06_11_v3_kernel_and_roofline_crossover": {
+    "measurement_first": "Criterion decomposition of the v1 asm matvec (attn_proj shape, single thread): asm block alone 16.3 cyc/SB, Rust glue alone 19.2 cyc/SB, full 29.6 — the glue (unpack_scales_mins + i32 scale array + scalar sum2 + 2x software f16_to_f32 + epilogue) costs as much as the asm and only ~3.6 cyc are OoO-hidden. Overturned the 'glue may be hidden' guess; justified folding the glue into the asm.",
+    "built": "q4k_sb_contrib_asm (v2: whole super-block in one asm block — TBL-vectorised 6-bit scale/min unpack, sum2 via smull/smlal2 over the i16 Q8_K sums, hardware fcvt for d/dmin, exact-order f32 epilogue) then q4k_row_dot_asm (v3: the super-block LOOP inside the asm, constants hoisted per row; the 144-byte header+quants layout lets one walking pointer do the whole row with zero pointer arithmetic). LARQL_Q4K_ASM now routes to v3. All bit-exact vs scalar on first run (fcvt h->s is exact; scvtf rounds identically to Rust `as f32`; same multiplication tree).",
+    "isolated_single_thread": {"v1": "18.3 GiB/s (29.7 cyc/SB)", "v2": "22.5 (24.1)", "v3": "23.8 (22.9)", "asm_only_floor": "33.3 (16.3)"},
+    "e2e_26b_full_stack": "FLAT: 21.3 vs 21.7 tok/s (bracket 33.4). THE FINDING: at 8 threads the q4k_q8k streams are now MEMORY-BANDWIDTH-BOUND — v3 could demand ~190 GB/s aggregate but effective e2e throughput is ~47 GB/s (2.2 GB / 46.9 ms) vs llama.cpp's ~70 GB/s (2.1 GB / 30 ms). The single-core compute-bound roofline reading (2026-06-02) was correct THEN and the kernel work closed it; the multi-thread regime has crossed over.",
+    "strategic_implication": "C12's '28 GiB/s single-kernel target' is NO LONGER the path to llama.cpp parity at 8 threads. The remaining 1.55x is EFFECTIVE-BANDWIDTH UTILISATION: llama.cpp extracts ~70 GB/s from the same machine, larql ~47. Candidate sinks (unmeasured, next session's measurement-first target): rayon fork-join gaps (~180+ parallel sections per token leave the memory system idle at every join), compute-only phases with idle DRAM (GQA/RoPE/quantize ~7 ms), per-expert task granularity. The v3 kernel win is still banked: real at low thread counts and it lowers the compute floor everywhere.",
+    "raw_row": "bench/baselines/_qres_full_v3.json"
+  },
+  "update_2026_06_12_serial_cuts": {
+    "measurement": "MT shape sweep: the rayon-chunked matvecs sustain 72-113 GiB/s at every production shape (104 MB arm = 113 from DRAM; experts-granularity arm 104) — the parallel sections were ACQUITTED. /usr/bin/sample of a live decode then attributed the gap: ~51k of ~68k thread-samples parked in cvwait/ulock/workq (workers asleep during serial main-thread sections). Named sinks: attention non-projection ~20% of wall (KV-concat zeros+bzero+memmove 5%, per-head cblas_sgemv GQA + scalar libm-exp softmax 5%, norms/RoPE), cpu_moe_forward glue ~12%, dense-slab step ~8% (scalar gelu + serial requantise), lm_head argmax epilogue 4.6% (serial softmax+top-k over 262K logits + ~3 MB temporaries), allocator madvise churn ~3%.",
+    "built": "(1) q4_lm_head_argmax — decode-loop argmax over RAW q4k lm_head logits (scaling/softcap/temperature are monotone -> identical token selection), parallel max, no softmax, no temporaries; wired into argmax_next_token_resident. (2) gqa_attention_decode_step rayon-parallel over heads (per-head math unchanged, disjoint output chunks). (3) dense-slab activation loop rayon-chunked in both cached.rs twins (same libm calls per element — bit-identical).",
+    "e2e": "n=128: 21.7 -> 23.5 tok/s (42.6 ms; lm_head stage 6.6->3.7 ms) — measured under a DEGRADED bracket (llama-bench 27.1; battery 87% discharging post-compile). Same-state gap 1.15x; vs the clean-bracket llama.cpp 33 ≈ 1.35x. n=512: 16.0 tok/s (62.6 ms) — the O(ctx) tax (~20 ms/token by step 500) is now the dominant remaining structural item.",
+    "remaining": "(1) KV append-in-place (engine KvHandle contract change): kills the per-layer per-step cache realloc+copy (grows with ctx; the n=512 run pays ~20 ms/token extra); (2) cpu_moe_forward serial glue (~12%: router, per-position copies, combine, build_moe_weights per layer per token); (3) madvise churn -> buffer reuse across steps; (4) remaining attention serial (norms/RoPE/concat-copy).",
+    "raw_rows": "bench/baselines/_qres_full_serialcuts.json"
+  },
+  "update_2026_06_12_kv_append_in_place": {
+    "what": "CpuKvHandle rewritten from SharedKV tuples to growable row-major Vec buffers (rows x kv_dim valid prefix): append_row is amortised O(kv_dim). The q4k-direct attention step split into decode_step_project_q4k_direct / decode_step_attend_q4k_direct — the dispatch path projects, APPENDS IN PLACE, then attends over zero-copy views; no concat, no clone. The old monolithic form is kept as a legacy wrapper (owned-concat) for engine walk-loops that hold SharedKV tuples. The f32 fallback path now MOVES state out (take_shared) instead of cloning. append_kv (used by other engines) and clip_kv also lose their per-call O(ctx) rebuilds. gqa_attention_decode_step made generic over array storage (views + owned).",
+    "why_it_was_huge": "The old attention_step did as_shared_kv().cloned() (full-cache clone) + zeros((total,kv_dim)) x2 + four assigns per LAYER per STEP — at ctx 130 that is ~190 MB/token of pure memory churn, growing linearly with context.",
+    "e2e": {
+      "n128_warm": "23.5 -> 27.9 tok/s (35.8 ms/tok); llama-bench bracket 33.6/31.0 -> gap ~1.15x",
+      "n512": "16.0 -> 24.8 tok/s (p50 37.9 ms); llama.cpp tg512 = 32.0 -> long-ctx gap 1.29x (llama.cpp barely degrades with ctx; remaining larql ctx-growth is GQA compute, which is real work)",
+      "text_sanity": "4B through the resident engine with ALL flags (DIRECT_ATTN+INT8+LM_HEAD+ASM): 'The capital of France is **Paris**.' — coherent, correct."
+    },
+    "cumulative_arc": "7.6 -> 13.9 (residency) -> 16.7 (+asm) -> 21.7 (+int8 attn) -> 23.5 (+serial cuts) -> 27.9 (+kv append-in-place): 3.7x total; gap to llama.cpp 4.5x -> ~1.15x short-ctx / 1.29x long-ctx.",
+    "tests": "692 compute + 1213 inference + 755 kv green (incl. the kv-engine parity oracles over the dispatch path); clippy clean on touched files.",
+    "raw_rows": "bench/baselines/_qres_full_kvappend.json"
+  }
+}

@@ -62,12 +62,17 @@ pub fn predict_split_pass(
 
     for layer in layer_range.clone() {
         // Run attention only (CPU BLAS, no FFN)
-        let (h_post_attn, _attn_proj, _) =
-            crate::attention::run_attention_block_gpu(weights, &h, layer, false, None)
-                .unwrap_or_else(|| {
-                    // Fallback: identity (shouldn't happen with valid weights)
-                    (h.clone(), h.clone(), None)
-                });
+        let (h_post_attn, _attn_proj, _) = crate::attention::run_attention_block_gpu(
+            larql_models::WeightsView::dense(weights),
+            &h,
+            layer,
+            false,
+            None,
+        )
+        .unwrap_or_else(|| {
+            // Fallback: identity (shouldn't happen with valid weights)
+            (h.clone(), h.clone(), None)
+        });
 
         // Compute pre-FFN norm (this is the FFN input)
         let pre_ffn_key = if arch.has_post_norms() {

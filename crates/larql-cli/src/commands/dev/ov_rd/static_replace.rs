@@ -231,7 +231,7 @@ pub(super) fn run_static_replace(
         }
         let stratum = record.stratum.as_deref().unwrap_or("unknown");
         let baseline_hidden =
-            larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None);
+            larql_inference::vindex::predict_kquant_hidden(&weights, &token_ids, &index, None);
         let baseline_logits = final_logits(&weights, &baseline_hidden);
         let baseline_logp = log_softmax(&baseline_logits);
         let baseline_top1 = argmax(&baseline_logits);
@@ -345,8 +345,12 @@ pub(super) fn fit_static_means(
         for layer in 0..weights.num_layers {
             let inserted = insert_q4k_layer_tensors(weights, index, layer)?;
             if let Some(layer_heads) = heads_by_layer.get(&layer) {
-                let (_, pre_o) = run_attention_block_with_pre_o(weights, &h, layer)
-                    .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
+                let (_, pre_o) = run_attention_block_with_pre_o(
+                    larql_models::WeightsView::dense(weights),
+                    &h,
+                    layer,
+                )
+                .ok_or_else(|| format!("pre-W_O capture failed at layer {layer}"))?;
                 let head_dim = weights.arch.head_dim_for_layer(layer);
                 for head in layer_heads {
                     let start = head.head * head_dim;
@@ -365,9 +369,15 @@ pub(super) fn fit_static_means(
 
             {
                 let ffn = WeightFfn { weights };
-                if let Some((h_new, _, _)) =
-                    run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None)
-                {
+                if let Some((h_new, _, _)) = run_layer_with_ffn(
+                    larql_inference::WeightsView::dense(weights),
+                    &h,
+                    layer,
+                    &ffn,
+                    false,
+                    ple_inputs.get(layer),
+                    None,
+                ) {
                     h = h_new;
                 }
             }

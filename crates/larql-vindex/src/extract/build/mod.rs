@@ -483,8 +483,15 @@ mod tests {
         let weights = make_weights();
         let tok = tokenizer();
         let mut cb = SilentBuildCallbacks;
-        super::build_vindex_dense_only(&weights, &tok, "test/unit", dir.path(), StorageDtype::F32, &mut cb)
-            .unwrap();
+        super::build_vindex_dense_only(
+            &weights,
+            &tok,
+            "test/unit",
+            dir.path(),
+            StorageDtype::F32,
+            &mut cb,
+        )
+        .unwrap();
 
         // Present: the dense pieces the BitNet loader needs.
         assert!(
@@ -547,11 +554,22 @@ mod tests {
         let weights = make_weights();
         let tok = tokenizer();
         let mut cb = SilentBuildCallbacks;
-        super::build_vindex_dense_only(&weights, &tok, "test/unit", dir.path(), StorageDtype::F32, &mut cb)
-            .unwrap();
+        super::build_vindex_dense_only(
+            &weights,
+            &tok,
+            "test/unit",
+            dir.path(),
+            StorageDtype::F32,
+            &mut cb,
+        )
+        .unwrap();
         let mut lcb = SilentLoadCallbacks;
         let idx = VectorIndex::load_vindex_with_range(dir.path(), &mut lcb, None);
-        assert!(idx.is_ok(), "dense-only vindex failed to load: {:?}", idx.err());
+        assert!(
+            idx.is_ok(),
+            "dense-only vindex failed to load: {:?}",
+            idx.err()
+        );
     }
 
     // ── build output file inventory ──────────────────────────────────────

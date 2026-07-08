@@ -24,13 +24,14 @@ impl MarkovResidualCodecEngine {
     /// `prefill_quant` in that case).
     pub(super) fn prefill_via_executor_impl(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
 
         let backend = executor.backend();
         let num_layers = weights.num_layers;
@@ -41,7 +42,7 @@ impl MarkovResidualCodecEngine {
 
         for layer in 0..num_layers {
             stored.push(h.clone());
-            let (h_out, _kv) = executor.run_prefill_layer(weights, layer, &h, ffn)?;
+            let (h_out, _kv) = executor.run_prefill_layer(view, layer, &h, ffn)?;
             h = h_out;
         }
 
@@ -74,7 +75,7 @@ impl MarkovResidualCodecEngine {
                 let mut tmp = EncodedColdLayer::empty(hidden_size);
                 tmp.append(self.codec, overflow);
                 let decoded = tmp.decode(self.codec);
-                let (k, v) = recompute_kv(weights, &decoded, layer, 0, backend, Some(index))
+                let (k, v) = recompute_kv(view, &decoded, layer, 0, backend, Some(index))
                     .expect("cold K/V pre-computation failed");
                 cold_kv.push((k, v));
                 let mut enc = EncodedColdLayer::empty(hidden_size);
@@ -98,13 +99,14 @@ impl MarkovResidualCodecEngine {
     /// that `executor.dispatch_kind() != Fused`.
     pub(super) fn decode_step_via_executor_impl(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         executor: &dyn LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
     ) -> Option<Array2<f32>> {
-        ensure_attn_tensors_dequantised(weights, index);
+        ensure_attn_tensors_dequantised(&mut self.dequant_scratch, weights, index);
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
 
         let backend = executor.backend();
         let rs = self.store.take()?;
@@ -121,7 +123,7 @@ impl MarkovResidualCodecEngine {
             let prior_kv: SharedKV = if let Some(cold_kv) = &rs.cold_kv {
                 let (k_cold, v_cold) = &cold_kv[layer];
                 let (k_hot, v_hot) =
-                    recompute_kv(weights, h_hot, layer, hot_abs_start, backend, Some(index))?;
+                    recompute_kv(view, h_hot, layer, hot_abs_start, backend, Some(index))?;
                 let c = k_cold.shape()[0];
                 let kv_dim = k_cold.shape()[1];
                 let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
@@ -148,19 +150,12 @@ impl MarkovResidualCodecEngine {
                     }
                     _ => (h_hot.clone(), hot_abs_start),
                 };
-                recompute_kv(
-                    weights,
-                    &h_full,
-                    layer,
-                    full_abs_start,
-                    backend,
-                    Some(index),
-                )?
+                recompute_kv(view, &h_full, layer, full_abs_start, backend, Some(index))?
             };
 
             new_stored.push(h_new.clone());
             let (h_out, _new_kv) =
-                executor.run_decode_layer(weights, layer, &h_new, &prior_kv, abs_position, ffn)?;
+                executor.run_decode_layer(view, layer, &h_new, &prior_kv, abs_position, ffn)?;
             h_new = h_out;
         }
 

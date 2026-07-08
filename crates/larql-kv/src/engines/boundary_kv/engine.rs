@@ -217,6 +217,52 @@ impl KvEngine for BoundaryKvEngine {
         Ok(hidden)
     }
 
+    /// Resident-path prefill: forwards to the inner `StandardEngine`'s
+    /// resident form (threads `index` → Q4K-direct attention family) and
+    /// keeps the boundary frame emission identical to [`Self::prefill`].
+    fn prefill_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+    ) -> Result<Array2<f32>, EngineError> {
+        if token_ids.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        let hidden = self
+            .inner
+            .prefill_resident(weights, ffn, index, token_ids)?;
+        self.abs_position = token_ids.len();
+        if self.maybe_emit_frame(weights, &hidden).is_err() {
+            return Err(EngineError::BackendFailure {
+                details: "boundary frame emit failed".into(),
+            });
+        }
+        Ok(hidden)
+    }
+
+    /// Resident-path decode: forwards to the inner `StandardEngine`'s
+    /// resident form; frame emission identical to [`Self::decode_step`].
+    fn decode_step_resident(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+    ) -> Result<Array2<f32>, EngineError> {
+        let hidden = self
+            .inner
+            .decode_step_resident(weights, ffn, index, token_id)?;
+        self.abs_position += 1;
+        if self.maybe_emit_frame(weights, &hidden).is_err() {
+            return Err(EngineError::BackendFailure {
+                details: "boundary frame emit failed".into(),
+            });
+        }
+        Ok(hidden)
+    }
+
     fn memory_bytes(&self) -> usize {
         self.inner.memory_bytes()
     }
@@ -231,7 +277,7 @@ impl KvEngine for BoundaryKvEngine {
 
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
@@ -254,7 +300,7 @@ impl KvEngine for BoundaryKvEngine {
 
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
@@ -746,12 +792,78 @@ mod tests {
         assert!(chain.is_empty());
     }
 
-    // ── Q4K paths ──
+    // ── Resident + Q4K-quant forwarding paths ──
     //
-    // `prefill_quant` / `decode_step_quant` delegate to `StandardEngine`, whose
-    // CPU fallback uses `ensure_attn_tensors_dequantised`. The synthetic
-    // `make_test_vindex` fixture doesn't carry Q4K attn slices, so the CPU
-    // fallback panics — these paths are Metal-only end-to-end. The
-    // delegation surface itself is a one-line passthrough; the underlying
-    // behaviour is covered by `standard.rs`'s Q4K tests.
+    // `prefill_resident`/`decode_step_resident`/`prefill_quant`/`decode_step_quant`
+    // forward to the inner `StandardEngine` (threading `index` → Q4K-direct) and
+    // emit a boundary frame identically to the plain path. The `make_test_q4k_*`
+    // fixtures carry Q4K attn slices, so the CPU dequant fallback runs (the same
+    // fixtures `resident_identity_tests` and `unlimited_context`'s quant tests
+    // use). chunk_tokens=2 + a 2-token prefill lands on a boundary, exercising
+    // the frame-emit branch on each.
+
+    #[test]
+    fn prefill_and_decode_resident_forward_and_emit() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let ffn = NullFfn;
+        let mut eng = BoundaryKvEngine::new(config("seq", 2));
+        let h = eng
+            .prefill_resident(&weights, &ffn, &index, &[0u32, 1])
+            .expect("prefill_resident");
+        assert!(h.iter().all(|v| v.is_finite()));
+        assert_eq!(eng.abs_position(), 2);
+        assert_eq!(
+            eng.archive().total_frames(),
+            Some(1),
+            "landed on boundary → frame"
+        );
+        let h2 = eng
+            .decode_step_resident(&weights, &ffn, &index, 2)
+            .expect("decode_step_resident");
+        assert!(h2.iter().all(|v| v.is_finite()));
+        assert_eq!(eng.abs_position(), 3);
+    }
+
+    #[test]
+    fn prefill_and_decode_quant_forward_and_emit() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut eng = BoundaryKvEngine::new(config("seq", 2));
+        let h = eng
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill_quant");
+        assert!(h.iter().all(|v| v.is_finite()));
+        assert_eq!(eng.archive().total_frames(), Some(1));
+        let h2 = eng
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
+            .expect("decode_step_quant");
+        assert!(h2.iter().all(|v| v.is_finite()));
+        assert_eq!(eng.abs_position(), 3);
+    }
+
+    #[test]
+    fn resident_and_quant_reject_empty_prompt() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut eng = BoundaryKvEngine::new(config("s", 4));
+        assert!(matches!(
+            eng.prefill_resident(&weights, &ffn, &index, &[]),
+            Err(EngineError::EmptyPrompt)
+        ));
+        assert!(matches!(
+            eng.prefill_quant(&weights, &ffn, &index, &[], &*backend),
+            Err(EngineError::EmptyPrompt)
+        ));
+    }
 }

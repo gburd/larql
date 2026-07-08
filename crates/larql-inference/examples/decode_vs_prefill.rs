@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Separate weight handles so CPU's per-layer dequant inserts don't
     // race with Metal's forward on a shared ModelWeights.
     let mut w_metal = larql_vindex::load_model_weights_kquant(&vindex_path, &mut cb)?;
-    let mut w_cpu = larql_vindex::load_model_weights_kquant(&vindex_path, &mut cb)?;
+    let w_cpu = larql_vindex::load_model_weights_kquant(&vindex_path, &mut cb)?;
 
     let wrap = wrap_chat_prompt(&vindex_path, Some(cfg.model.as_str()), &prompt);
     let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*w_metal.arch, &wrap.prompt)?;
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // twice.
     let t0 = Instant::now();
     let cpu_hidden_full =
-        larql_inference::vindex::predict_kquant_hidden(&mut w_cpu, &appended_ids, &index, None);
+        larql_inference::vindex::predict_kquant_hidden(&w_cpu, &appended_ids, &index, None);
     let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let cpu_last = cpu_hidden_full
         .row(cpu_hidden_full.nrows().saturating_sub(1))
@@ -216,9 +216,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Re-run CPU full-prefill with the layer-dump env var set so we can
     // walk the two paths side by side. Cheap relative to the Metal
     // prefill we already paid for.
-    let mut w_cpu2 = larql_vindex::load_model_weights_kquant(&vindex_path, &mut cb)?;
-    let _ =
-        larql_inference::vindex::predict_kquant_hidden(&mut w_cpu2, &appended_ids, &index, None);
+    let w_cpu2 = larql_vindex::load_model_weights_kquant(&vindex_path, &mut cb)?;
+    let _ = larql_inference::vindex::predict_kquant_hidden(&w_cpu2, &appended_ids, &index, None);
 
     println!(
         "  B) Metal prefill({} tok) + decode(1 tok) took {:>5.1} + {:>5.1} ms",

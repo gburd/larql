@@ -161,10 +161,11 @@ pub fn predict_honest(
                     for (rel_idx, abs_layer) in layer_range.clone().enumerate() {
                         let (h_post_attn, k_rope, v) =
                             crate::attention::gpu::run_attention_with_kv_backend(
-                                weights,
+                                larql_models::WeightsView::dense(weights),
                                 &h_cpu,
                                 abs_layer,
                                 Some(backend),
+                                None,
                             )
                             .unwrap();
 
@@ -217,8 +218,14 @@ pub fn predict_honest(
     if !used_gpu {
         let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
         for layer in layer_range {
-            let (h_post_attn, _, _) =
-                crate::attention::run_attention_block_gpu(weights, &h, layer, false, None).unwrap();
+            let (h_post_attn, _, _) = crate::attention::run_attention_block_gpu(
+                larql_models::WeightsView::dense(weights),
+                &h,
+                layer,
+                false,
+                None,
+            )
+            .unwrap();
             let (h_out, _) =
                 crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
             h = h_out;

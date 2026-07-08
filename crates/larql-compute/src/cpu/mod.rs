@@ -19,6 +19,7 @@
 //! - `ops/linalg`:     Cholesky factor/solve, `ridge_decomposition_solve`
 
 pub mod ops;
+pub mod spin_pool;
 
 // Re-export for backward compatibility (used by benchmarks/examples)
 pub mod q4 {
@@ -91,6 +92,23 @@ impl QuantMatVec for CpuBackend {
         Some(out)
     }
 
+    fn q4k_matmul(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        // Amortised Q4_K matmul: decode each weight super-block to f32 once
+        // and reuse it across all `seq_len` activation columns — reads the
+        // Q4_K weight a single time, vs `seq_len ×` for repeated
+        // `q4k_matvec` or 4× the bytes for the dequant→sgemm prefill path.
+        let mut out = vec![0.0f32; seq_len * num_rows];
+        ops::q4_common::q4k_matmul_into(&mut out, x, q4k_data, num_rows, hidden, seq_len);
+        Some(out)
+    }
+
     fn q6k_matvec(
         &self,
         q6k_data: &[u8],
@@ -117,11 +135,28 @@ impl QuantMatVec for CpuBackend {
         Some((out_a, out_b))
     }
 
+    fn ternary_matvec(
+        &self,
+        w: &ops::ternary_matvec::BitLinearWeight,
+        x: &[f32],
+    ) -> Option<Vec<f32>> {
+        // Best-available A8 kernel for the target (NEON sign-select on
+        // aarch64, scalar int8 elsewhere). The kernel int8-quantises `x`
+        // internally (W1.58·A8). Shape errors surface as `None`.
+        let mut y = vec![0.0f32; w.rows];
+        ops::ternary_matvec::matvec_i2s_a8_f32_into(w, x, &mut y).ok()?;
+        Some(y)
+    }
+
     fn supports_quant(&self, format: crate::QuantFormat) -> bool {
         use crate::QuantFormat;
         matches!(
             format,
-            QuantFormat::Q4_0 | QuantFormat::Q4_K | QuantFormat::Q4_KF | QuantFormat::Q6_K
+            QuantFormat::Q4_0
+                | QuantFormat::Q4_K
+                | QuantFormat::Q4_KF
+                | QuantFormat::Q6_K
+                | QuantFormat::I2S
         )
     }
 }
@@ -186,6 +221,51 @@ mod cpu_backend_tests {
     }
 
     // ── QuantMatVec ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cpu_backend_ternary_matvec_matches_direct_kernel() {
+        use crate::cpu::ops::ternary_matvec::{matvec_i2s_a8_f32_into, BitLinearWeight};
+        use crate::QuantFormat;
+
+        // CpuBackend advertises and serves the ternary (I2_S) format.
+        assert!(CpuBackend.supports_quant(QuantFormat::I2S));
+
+        let (rows, cols) = (6usize, 64usize);
+        // Deterministic ternary trits packed 4/byte (codes 0/1/2 → 0/+1/-1).
+        let mut s = 0x1234_5678u64;
+        let mut bytes = vec![0u8; rows * cols / 4];
+        for b in bytes.iter_mut() {
+            let mut bv = 0u8;
+            for slot in 0..4 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let code = ((s >> 33) % 3) as u8; // 0,1,2
+                bv |= code << (2 * slot);
+            }
+            *b = bv;
+        }
+        let scales: Vec<f32> = (0..rows).map(|r| 0.1 + 0.05 * r as f32).collect();
+        let w = BitLinearWeight::new(rows, cols, bytes, scales).unwrap();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.013).sin()).collect();
+
+        // Backend dispatch must match calling the kernel directly.
+        let via_backend = CpuBackend
+            .ternary_matvec(&w, &x)
+            .expect("ternary_matvec Some");
+        let mut direct = vec![0.0f32; rows];
+        matvec_i2s_a8_f32_into(&w, &x, &mut direct).unwrap();
+        assert_eq!(via_backend.len(), rows);
+        for (a, b) in via_backend.iter().zip(&direct) {
+            assert_eq!(a.to_bits(), b.to_bits(), "backend {a} vs direct {b}");
+        }
+    }
+
+    #[test]
+    fn cpu_backend_ternary_matvec_shape_error_is_none() {
+        use crate::cpu::ops::ternary_matvec::BitLinearWeight;
+        let w = BitLinearWeight::new(2, 8, vec![0u8; 4], vec![1.0, 1.0]).unwrap();
+        // x length != cols → kernel errors → None (loud missing capability).
+        assert!(CpuBackend.ternary_matvec(&w, &[0.0; 4]).is_none());
+    }
 
     #[test]
     fn cpu_backend_q4_matvec_returns_some() {

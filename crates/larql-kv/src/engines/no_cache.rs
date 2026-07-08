@@ -22,6 +22,11 @@ use larql_inference::{cpu_engine_backend, EngineBackend};
 pub struct NoCacheEngine {
     tokens: Vec<u32>,
     backend: Box<dyn EngineBackend>,
+    /// Engine-owned f32 dequant scratch for the Q4K path — `prefill_quant`/
+    /// `decode_step_quant` populate it; `prefill`/`decode_step` resolve the
+    /// forward through a `WeightsView::with_scratch` over it. Empty on the
+    /// dense path. Keeps `weights` immutable (no `weights.tensors` mutation).
+    dequant_scratch: larql_inference::DequantScratch,
 }
 
 impl NoCacheEngine {
@@ -33,6 +38,7 @@ impl NoCacheEngine {
         Self {
             tokens: Vec::new(),
             backend,
+            dequant_scratch: larql_inference::DequantScratch::new(),
         }
     }
 }
@@ -68,8 +74,9 @@ impl KvEngine for NoCacheEngine {
             return Err(EngineError::EmptyPrompt);
         }
         self.tokens = token_ids.to_vec();
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
         let (hidden, _cache) = kv_prefill_run(
-            weights,
+            view,
             ffn,
             token_ids,
             None,
@@ -89,8 +96,9 @@ impl KvEngine for NoCacheEngine {
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
         self.tokens.push(token_id);
+        let view = larql_inference::WeightsView::with_scratch(weights, &self.dequant_scratch);
         let (hidden, _cache) = kv_prefill_run(
-            weights,
+            view,
             ffn,
             &self.tokens,
             None,
@@ -105,18 +113,22 @@ impl KvEngine for NoCacheEngine {
 
     fn prefill_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_ids: &[u32],
         backend: &dyn larql_inference::ComputeBackend,
     ) -> Result<Array2<f32>, EngineError> {
-        // Phase-1 pattern: dequant Q4K attn tensors into `weights.tensors`,
-        // then run the f32 prefill path. Q4K FFN dispatches through a
+        // Phase-1 pattern: dequant Q4K attn tensors into the engine-owned
+        // scratch, then run the f32 prefill path. Q4K FFN dispatches through a
         // `WalkFfn` constructed from the vindex (the bench passes
         // `NullFfn` because Q4K FFN is engine-side; using `_ffn` would
         // silently skip the FFN). See `kv-dispatch-quantization.md`.
-        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        larql_inference::vindex::ensure_attn_tensors_dequantised(
+            &mut self.dequant_scratch,
+            weights,
+            index,
+        );
         let walk_ffn = larql_inference::vindex::WalkFfn::from_config(
             weights,
             index,
@@ -128,13 +140,17 @@ impl KvEngine for NoCacheEngine {
 
     fn decode_step_quant(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
         backend: &dyn larql_inference::ComputeBackend,
     ) -> Result<Array2<f32>, EngineError> {
-        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        larql_inference::vindex::ensure_attn_tensors_dequantised(
+            &mut self.dequant_scratch,
+            weights,
+            index,
+        );
         let walk_ffn = larql_inference::vindex::WalkFfn::from_config(
             weights,
             index,
@@ -154,7 +170,7 @@ impl KvEngine for NoCacheEngine {
 
     fn prefill_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
@@ -163,19 +179,27 @@ impl KvEngine for NoCacheEngine {
         // No K/V cache so we don't need to drive the per-layer loop
         // through the executor; the existing prefill (which honors the
         // FFN parameter) is the right path. Just dequant first.
-        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        larql_inference::vindex::ensure_attn_tensors_dequantised(
+            &mut self.dequant_scratch,
+            weights,
+            index,
+        );
         self.prefill(weights, ffn, token_ids)
     }
 
     fn decode_step_quant_via_executor(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         _executor: &dyn larql_inference::layer_executor::LayerExecutor,
         ffn: &dyn FfnBackend,
         index: &larql_inference::larql_vindex::VectorIndex,
         token_id: u32,
     ) -> Result<Array2<f32>, EngineError> {
-        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        larql_inference::vindex::ensure_attn_tensors_dequantised(
+            &mut self.dequant_scratch,
+            weights,
+            index,
+        );
         self.decode_step(weights, ffn, token_id)
     }
 
@@ -332,13 +356,13 @@ mod tests {
     #[test]
     fn prefill_quant_cpu_fallback_runs_end_to_end() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = NoCacheEngine::new();
         let h = engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1, 2], &*backend)
             .expect("prefill_quant cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -346,17 +370,17 @@ mod tests {
     #[test]
     fn decode_step_quant_cpu_fallback_appends_token() {
         use larql_inference::ffn::NullFfn;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let ffn = NullFfn;
         let mut engine = NoCacheEngine::new();
         engine
-            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .prefill_quant(&weights, &ffn, &index, &[0u32, 1], &*backend)
             .expect("prefill_quant");
         let mem_before = engine.memory_bytes();
         let h = engine
-            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .decode_step_quant(&weights, &ffn, &index, 2, &*backend)
             .expect("decode_step_quant cpu fallback");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(
@@ -381,14 +405,14 @@ mod tests {
     fn prefill_quant_via_executor_dequants_and_runs_prefill() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = NoCacheEngine::new();
         let h = engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32, 1])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32, 1])
             .expect("prefill via executor");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert_eq!(engine.window_tokens(), 2);
@@ -398,18 +422,18 @@ mod tests {
     fn decode_step_quant_via_executor_appends_token() {
         use larql_inference::ffn::NullFfn;
         use larql_inference::layer_executor::LocalWalkExecutor;
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let executor = LocalWalkExecutor::new(&*backend);
         let ffn = NullFfn;
         let mut engine = NoCacheEngine::new();
         engine
-            .prefill_quant_via_executor(&mut weights, &executor, &ffn, &index, &[0u32])
+            .prefill_quant_via_executor(&weights, &executor, &ffn, &index, &[0u32])
             .expect("prefill");
         let mem_before = engine.memory_bytes();
         let h = engine
-            .decode_step_quant_via_executor(&mut weights, &executor, &ffn, &index, 1)
+            .decode_step_quant_via_executor(&weights, &executor, &ffn, &index, 1)
             .expect("decode via executor");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.memory_bytes() > mem_before);

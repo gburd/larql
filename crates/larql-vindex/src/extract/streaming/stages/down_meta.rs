@@ -146,8 +146,8 @@ impl<'a> StreamingContext<'a> {
                 continue;
             }
 
-            // Same `LARQL_SUMMARY_FEATURES_PER_EXPERT` env that gates the
-            // gate-vectors SVD path also caps how many down_proj feature
+            // The `--summary-features-per-expert` cap (which gates the
+            // gate-vectors SVD path) also caps how many down_proj feature
             // columns we compute meta for. Without this cap, many-experts
             // MoE explodes:
             //   43 layers × 256 experts × 2048 features × (vocab × hidden)
@@ -155,12 +155,8 @@ impl<'a> StreamingContext<'a> {
             // With K=64: ~32× speedup → ~2 hrs total. Limitation: records
             // meta for the first K columns rather than the SVD-selected
             // most-important features. Acceptable for the summary tier —
-            // full meta is still available via the default
-            // `--summary-features-per-expert 0`.
-            let summary_k = std::env::var("LARQL_SUMMARY_FEATURES_PER_EXPERT")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
+            // full meta is still available with the default `0`.
+            let summary_k = self.summary_features_per_expert;
 
             let mut feature_offset = 0usize;
             for w_down in &down_matrices {

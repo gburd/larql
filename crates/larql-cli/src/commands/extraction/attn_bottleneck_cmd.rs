@@ -149,7 +149,11 @@ pub fn run(args: AttnBottleneckArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 7. Full attention (end-to-end via run_attention_public)
     let start = Instant::now();
     for _ in 0..iters {
-        let _ = larql_inference::forward::run_attention_public(weights, &x, layer);
+        let _ = larql_inference::forward::run_attention_public(
+            larql_inference::WeightsView::dense(weights),
+            &x,
+            layer,
+        );
     }
     let full_attn_us = start.elapsed().as_micros() as f64 / iters as f64;
 

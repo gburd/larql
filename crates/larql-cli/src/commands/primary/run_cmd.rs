@@ -297,6 +297,17 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return experts::run(&vindex_path, &args);
     }
 
+    // BitNet b1.58 native-ternary vindex: served by the ternary forward
+    // (`larql_inference::ternary`), not the dense engine dispatch — detect
+    // early and route, bypassing the walk_cmd path the dense run delegates to.
+    // A failed config load falls through so the dense path surfaces the error.
+    if larql_vindex::load_vindex_config(&vindex_path)
+        .map(|c| c.bitnet_layout.is_some())
+        .unwrap_or(false)
+    {
+        return run_bitnet(&vindex_path, &args);
+    }
+
     if let Some(ref ffn_url) = args.ffn {
         let prompt = args.prompt.as_deref().ok_or(
             "--ffn requires a prompt argument (chat mode not yet supported with --ffn-dispatch batch)",
@@ -415,6 +426,91 @@ fn run_chat(
 
         let walk_args = build_walk_args(vindex_path, prompt, args);
         if let Err(e) = walk_cmd::run(walk_args) {
+            eprintln!("Error: {e}");
+        }
+    }
+}
+
+/// Serve a BitNet b1.58 native-ternary vindex.
+///
+/// BitNet uses a separate ternary forward (`larql_inference::ternary`) rather
+/// than the dense engine dispatch, so it bypasses the `walk_cmd` path that the
+/// dense `run_once` / `run_chat` delegate to. Greedy streaming generation;
+/// no prompt drops into a simple stdin REPL. EOS is sourced the same way as
+/// the dense path (`EosConfig::from_vindex_dir`).
+///
+/// MVP scope (P-A): raw prompt encode (no chat-template rendering yet) and
+/// greedy sampling. Chat-template + sampling-flag parity with the dense path
+/// are follow-ups; see ROADMAP "Productization plan" P-A.
+fn run_bitnet(
+    vindex_path: &std::path::Path,
+    args: &RunArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_inference::layer_graph::generate::{eos::EosConfig, SamplingConfig};
+    use larql_inference::ternary;
+
+    let model = ternary::load_bitnet_model(vindex_path)?;
+    let tokenizer =
+        larql_vindex::tokenizers::Tokenizer::from_file(vindex_path.join("tokenizer.json"))
+            .map_err(|e| format!("load tokenizer.json: {e}"))?;
+    let eos = EosConfig::from_vindex_dir(vindex_path);
+    let max_tokens = args.max_tokens;
+    let verbose = args.verbose;
+
+    let generate_one = |prompt: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let enc = tokenizer
+            .encode(prompt, true)
+            .map_err(|e| format!("encode prompt: {e}"))?;
+        let mut stdout = io::stdout();
+        let emitted = ternary::generate_streaming_bitnet(
+            &model,
+            &tokenizer,
+            enc.get_ids(),
+            max_tokens,
+            SamplingConfig::greedy(),
+            &eos,
+            |_id, delta, _ms| {
+                print!("{delta}");
+                let _ = stdout.flush();
+            },
+        );
+        println!();
+        if verbose {
+            eprintln!("[bitnet] {emitted} tokens");
+        }
+        Ok(())
+    };
+
+    if let Some(prompt) = args.prompt.as_deref() {
+        return generate_one(prompt);
+    }
+
+    // Chat REPL (single-turn, no multi-turn template — BitNet MVP).
+    eprintln!(
+        "larql chat (bitnet) — {} (Ctrl-D to exit)",
+        vindex_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("model")
+    );
+    let stdin = io::stdin();
+    loop {
+        eprint!("> ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                eprintln!();
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(Box::new(e)),
+        }
+        let prompt = line.trim();
+        if prompt.is_empty() {
+            continue;
+        }
+        if let Err(e) = generate_one(prompt) {
             eprintln!("Error: {e}");
         }
     }
@@ -688,8 +784,12 @@ fn run_with_moe_shards(
             // Dequantize attn + dense FFN to f32 for every layer, kept resident
             // for the whole generation (experts are not loaded on the client).
             for layer in 0..weights.num_layers {
-                larql_inference::vindex::insert_q4k_layer_tensors(&mut weights, &index, layer)
-                    .map_err(|e| format!("failed to dequantize layer {layer} to f32: {e}"))?;
+                larql_inference::vindex::insert_q4k_layer_tensors_resident(
+                    &mut weights,
+                    &index,
+                    layer,
+                )
+                .map_err(|e| format!("failed to dequantize layer {layer} to f32: {e}"))?;
             }
             let moe_ffn = larql_inference::ffn::RemoteMoeFfn {
                 weights: &weights,
@@ -881,6 +981,14 @@ fn run_with_remote_ffn(
         )
     }
     .map_err(|e| format!("remote-ffn generate failed ({dispatch}): {e}"))?;
+
+    if std::env::var("LARQL_DEBUG_TOKENS").is_ok() {
+        eprintln!(
+            "[debug] dispatch={dispatch} iters={predispatch_iters} n_tokens={} tokens={:?}",
+            result.tokens.len(),
+            result.tokens
+        );
+    }
 
     for tok in &result.tokens {
         print!("{tok}");

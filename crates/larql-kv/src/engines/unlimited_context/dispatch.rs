@@ -28,7 +28,7 @@ impl UnlimitedContextEngine {
     /// append a single row in-place rather than re-allocating.
     pub(super) fn try_prefill_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &VectorIndex,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
@@ -92,7 +92,7 @@ impl UnlimitedContextEngine {
     /// count crosses `window_size`.
     pub(super) fn decode_step_via_dispatch(
         &mut self,
-        weights: &mut ModelWeights,
+        weights: &ModelWeights,
         index: &VectorIndex,
         token_id: u32,
     ) -> Option<Array2<f32>> {
@@ -197,9 +197,9 @@ mod tests {
             weights.hidden_size,
         );
         let mut engine = UnlimitedContextEngine::with_backend(4, cpu_engine_backend());
-        let mut w = weights;
+        let w = weights;
         assert!(engine
-            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .try_prefill_via_dispatch(&w, &empty_index, &[0u32, 1])
             .is_none());
         assert!(engine.kv_handle.is_none());
         assert!(engine.current_window_kv.is_none());
@@ -211,9 +211,9 @@ mod tests {
         // doesn't populate `current_window_kv`; Metal's kv cache is the
         // truth.
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(4);
+        let (mut engine, weights, index) = fixture(4);
         let h = engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2])
             .expect("prefill");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(engine.current_window_kv.is_none());
@@ -228,8 +228,8 @@ mod tests {
         // W10 off → engine pre-allocates `[window_cap, kv_dim]` per
         // layer and copies the prefill K/V rows in.
         set_w10_disable(true);
-        let (mut engine, mut weights, index) = fixture(8);
-        let res = engine.try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2]);
+        let (mut engine, weights, index) = fixture(8);
+        let res = engine.try_prefill_via_dispatch(&weights, &index, &[0u32, 1, 2]);
         set_w10_disable(false);
         res.expect("prefill");
         let kv = engine
@@ -245,10 +245,10 @@ mod tests {
     #[test]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(4);
+        let (mut engine, weights, index) = fixture(4);
         // kv_handle is None → early return.
         assert!(engine
-            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .decode_step_via_dispatch(&weights, &index, 0)
             .is_none());
     }
 
@@ -258,13 +258,13 @@ mod tests {
         // The dispatch decode runs through the `if !matches!(mask, HOnly)`
         // skip branch and still bumps the per-step counters.
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(4);
+        let (mut engine, weights, index) = fixture(4);
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         let kv_len_before = engine.current_window_kv_len;
         let h = engine
-            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .decode_step_via_dispatch(&weights, &index, 2)
             .expect("decode");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert_eq!(engine.current_window_kv_len, kv_len_before + 1);
@@ -280,12 +280,12 @@ mod tests {
         // W10 off → Full mask. Each layer's K/V row blits into the
         // pre-allocated window_kv buffer at `current_window_kv_len`.
         set_w10_disable(true);
-        let (mut engine, mut weights, index) = fixture(8);
+        let (mut engine, weights, index) = fixture(8);
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32, 1])
             .expect("prefill");
         let kv_len_before = engine.current_window_kv_len;
-        let res = engine.decode_step_via_dispatch(&mut weights, &index, 2);
+        let res = engine.decode_step_via_dispatch(&weights, &index, 2);
         set_w10_disable(false);
         res.expect("decode");
         assert_eq!(engine.current_window_kv_len, kv_len_before + 1);
@@ -307,13 +307,13 @@ mod tests {
         // window=2: prefill 2 → token count == window → close_window
         // fires inside the dispatch decode and resets the window.
         set_w10_disable(false);
-        let (mut engine, mut weights, index) = fixture(2);
+        let (mut engine, weights, index) = fixture(2);
         engine
-            .try_prefill_via_dispatch(&mut weights, &index, &[0u32])
+            .try_prefill_via_dispatch(&weights, &index, &[0u32])
             .expect("prefill");
         let cp_before = engine.checkpoints.len();
         engine
-            .decode_step_via_dispatch(&mut weights, &index, 1)
+            .decode_step_via_dispatch(&weights, &index, 1)
             .expect("decode that triggers window-close");
         // close_window() emits a checkpoint and resets
         // current_window_tokens (the legacy emit path).

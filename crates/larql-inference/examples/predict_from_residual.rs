@@ -84,8 +84,12 @@ fn run_full_forward(
             }
         }
 
-        let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(weights, &h, layer)
-            .ok_or_else(|| format!("attention failed at layer {layer}"))?;
+        let (h_post_attn, _) = forward::layer::run_attention_with_kv_cache(
+            larql_inference::WeightsView::dense(weights),
+            &h,
+            layer,
+        )
+        .ok_or_else(|| format!("attention failed at layer {layer}"))?;
         let (h_post_ffn, _) = forward::run_ffn(weights, &h_post_attn, layer, &dense_ffn, false);
         let mut h_out = forward::ple::apply_per_layer_embedding(
             weights,

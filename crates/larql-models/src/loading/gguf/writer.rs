@@ -344,4 +344,42 @@ mod tests {
         assert_eq!(&bytes[8..16], &0u64.to_le_bytes()); // n_tensors
         assert_eq!(&bytes[16..24], &0u64.to_le_bytes()); // n_metadata
     }
+
+    #[test]
+    fn serializes_every_scalar_value_type_and_counts_tensors() {
+        // `round_trips_through_the_reader` exercises String / U32 / F32 / Bool /
+        // Array; this pins the remaining integer + float widths so
+        // `value_type_tag` and `write_value_payload` are covered for every
+        // `GgufValue` arm (and `tensor_count` for both empty and non-empty).
+        let mut w = GgufWriter::new();
+        w.meta("t.u8", GgufValue::U8(0x12))
+            .meta("t.i8", GgufValue::I8(-3))
+            .meta("t.u16", GgufValue::U16(0x1234))
+            .meta("t.i16", GgufValue::I16(-300))
+            .meta("t.i32", GgufValue::I32(-70_000))
+            .meta("t.u64", GgufValue::U64(0x1122_3344_5566_7788))
+            .meta("t.i64", GgufValue::I64(-5_000_000_000))
+            .meta("t.f64", GgufValue::F64(123.456_789))
+            // Array of a non-default element type recurses the payload writer.
+            .meta(
+                "t.i16_array",
+                GgufValue::Array(vec![GgufValue::I16(-1), GgufValue::I16(2)]),
+            );
+
+        assert_eq!(w.tensor_count(), 0);
+        w.tensor(GgufTensor {
+            name: "blk.0.weight".into(),
+            dims: vec![4, 4],
+            ggml_type: 0, // F32
+            data: vec![0u8; 4 * 4 * 4],
+        });
+        assert_eq!(w.tensor_count(), 1);
+
+        // Serializing drives `write_value` (tag + payload) for every metadata
+        // type above; the header counts must reflect what we added.
+        let bytes = w.to_bytes();
+        assert_eq!(&bytes[0..4], &GGUF_MAGIC.to_le_bytes());
+        assert_eq!(&bytes[8..16], &1u64.to_le_bytes()); // n_tensors
+        assert_eq!(&bytes[16..24], &9u64.to_le_bytes()); // n_metadata
+    }
 }

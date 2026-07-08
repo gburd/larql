@@ -1,0 +1,23 @@
+{
+  "timestamp": "1781204777",
+  "model": "output/gemma4-26b-a4b-q4k.vindex",
+  "prompt": "Write a long detailed essay about the history of the Roman empire, covering its founding, rise, and fall:",
+  "tokens": 128,
+  "wire": null,
+  "concurrent": 1,
+  "results": [
+    {
+      "backend": "larql-cpu-moe (standard)",
+      "prefill_ms": 878.4857499999999,
+      "ms_per_tok": {
+        "mean": 63.034867456692886,
+        "p50": 62.892792,
+        "p99": 70.413875
+      },
+      "tok_per_s": 15.864235784854062,
+      "wire_bytes_per_tok": null,
+      "n_steps": 127,
+      "note": "in-process experts, KV-cached"
+    }
+  ]
+}

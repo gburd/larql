@@ -14,13 +14,17 @@ pub(super) struct GridRuntimeConfig {
 
 impl GridRuntimeConfig {
     pub fn from_env() -> Self {
+        // Read through the override-aware `options` helpers so tests can toggle
+        // these via the thread-local override (NOT `std::env::set_var`, which
+        // races concurrent `getenv` on the decode path → SIGSEGV). Behaviour is
+        // identical: `env_usize` = `var().ok().and_then(parse)`, `env_flag` =
+        // `var().is_ok()` (presence-as-truth, any value incl. empty).
+        use larql_compute::options::{env_flag, env_usize};
         Self {
-            moe_top_k_override: std::env::var(ENV_MOE_TOP_K)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok()),
-            skip_moe: std::env::var(ENV_SKIP_MOE).is_ok(),
-            timing_enabled: std::env::var(ENV_MOE_TIMING).is_ok(),
-            split_disabled: std::env::var(ENV_MOE_NO_SPLIT).is_ok(),
+            moe_top_k_override: env_usize(ENV_MOE_TOP_K),
+            skip_moe: env_flag(ENV_SKIP_MOE),
+            timing_enabled: env_flag(ENV_MOE_TIMING),
+            split_disabled: env_flag(ENV_MOE_NO_SPLIT),
             token_policy: TokenSelectionPolicy::from_env(),
         }
     }
@@ -38,34 +42,30 @@ mod tests {
 
     #[test]
     fn from_env_returns_default_when_no_vars_set() {
-        // Ensure none of the env vars are set so we exercise the default
-        // arms of every `.is_ok()` / `.parse().ok()` chain.
-        let prev_topk = std::env::var(ENV_MOE_TOP_K).ok();
-        let prev_skip = std::env::var(ENV_SKIP_MOE).ok();
-        let prev_timing = std::env::var(ENV_MOE_TIMING).ok();
-        let prev_split = std::env::var(ENV_MOE_NO_SPLIT).ok();
-        std::env::remove_var(ENV_MOE_TOP_K);
-        std::env::remove_var(ENV_SKIP_MOE);
-        std::env::remove_var(ENV_MOE_TIMING);
-        std::env::remove_var(ENV_MOE_NO_SPLIT);
+        // Force every MoE var to act as unset via the thread-local override
+        // (NOT `std::env::set_var`, which races concurrent `getenv` on the
+        // decode path → SIGSEGV) so we exercise the default arms of every
+        // `env_usize` / `env_flag` read regardless of the ambient process env.
+        // Cleared on drop; per-thread, so no cross-test leakage.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                larql_compute::options::clear_fast_path_overrides();
+            }
+        }
+        let _clear = Clear;
+        for var in [
+            ENV_MOE_TOP_K,
+            ENV_SKIP_MOE,
+            ENV_MOE_TIMING,
+            ENV_MOE_NO_SPLIT,
+        ] {
+            larql_compute::options::set_env_override(var, None);
+        }
 
         let cfg = GridRuntimeConfig::from_env();
         assert!(cfg.moe_top_k_override.is_none());
         assert!(!cfg.skip_moe);
-
-        // Restore.
-        if let Some(v) = prev_topk {
-            std::env::set_var(ENV_MOE_TOP_K, v);
-        }
-        if let Some(v) = prev_skip {
-            std::env::set_var(ENV_SKIP_MOE, v);
-        }
-        if let Some(v) = prev_timing {
-            std::env::set_var(ENV_MOE_TIMING, v);
-        }
-        if let Some(v) = prev_split {
-            std::env::set_var(ENV_MOE_NO_SPLIT, v);
-        }
     }
 
     #[test]

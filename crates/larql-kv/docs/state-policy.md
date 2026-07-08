@@ -165,13 +165,21 @@ The trait is a sketch, not a v1 commitment. Names and signatures
 will move; the *shape* — what an engine has to be able to answer
 — is the load-bearing claim.
 
+> **Update (resolved in §8 Q1, 2026-05-24):** `fallback_mode` was
+> retired. There is no implicit per-engine fallback. An engine that
+> can't serve returns a typed `EngineError` (e.g. `RetrievalMiss`);
+> composition is explicit via `AnyEngine::{Kv, Retrieval}`, not a
+> hidden fall-through. The `fallback_mode` accessor below and the
+> "`Apollo` falls through to `StandardEngine`" example are kept for
+> the historical record only — neither is implemented.
+
 ```rust
 pub trait StatePolicy {
     fn canonical_state(&self) -> CanonicalStateKind;
     fn derivative_state(&self) -> &[DerivativeKind];
     fn correctness_contract(&self) -> CorrectnessContract;
     fn calibration_requirements(&self) -> CalibrationRequirements;
-    fn fallback_mode(&self) -> FallbackMode;
+    fn fallback_mode(&self) -> FallbackMode; // retired — see note above
     fn memory_accounting(&self) -> MemoryAccounting;
     fn execution_requirements(&self) -> ExecutionRequirements;
 }
@@ -188,11 +196,12 @@ Each accessor's purpose:
 - **`calibration_requirements`** — does the engine need a
   calibration corpus before serving (`BoundaryPerLayerEngine`
   yes; `StandardEngine` no)? What does it calibrate over?
-- **`fallback_mode`** — what does the engine do when its contract
-  can't hold? (`Apollo` falls through to `StandardEngine` on a
-  store miss; `MarkovResidualEngine` cannot fall back — its
-  contract is conditional on architecture, and the architecture
-  is a static fact.)
+- **`fallback_mode`** *(retired — see the note above §4)* — the
+  original idea was "what does the engine do when its contract can't
+  hold?" The resolved design has no implicit fallback: `Apollo`
+  surfaces a store miss as `EngineError::RetrievalMiss` (the caller
+  decides), and `MarkovResidualEngine` cannot fall back anyway — its
+  contract is conditional on architecture, a static fact.
 - **`memory_accounting`** — `hot_bytes()` + `cold_bytes()` split,
   attributed to canonical vs derivative. Required to surface
   things like the `UnlimitedContextEngine` window-shadow

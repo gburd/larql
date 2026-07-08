@@ -99,6 +99,7 @@ fn make_compile_bench_vindex(tag: &str, with_down_weights: bool) -> PathBuf {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 

@@ -12,7 +12,7 @@
 //!
 //! Usage: `cargo run --release --example walk_ffn_decode_timing -- [VINDEX_DIR]`
 
-use larql_inference::vindex::{insert_q4k_layer_tensors, WalkFfn, WalkFfnConfig};
+use larql_inference::vindex::{insert_q4k_layer_tensors_resident, WalkFfn, WalkFfnConfig};
 use larql_inference::{load_tokenizer, predict_with_ffn};
 use larql_models::ModelWeights;
 use std::sync::Arc;
@@ -69,7 +69,7 @@ fn main() {
     );
     let tok = load_tokenizer(&dir).expect("tok");
     for layer in 0..weights.num_layers {
-        insert_q4k_layer_tensors(&mut weights, &index, layer).expect("dequant attn");
+        insert_q4k_layer_tensors_resident(&mut weights, &index, layer).expect("dequant attn");
     }
 
     let nl = weights.num_layers;

@@ -79,7 +79,7 @@ fn cached_decode_matches_uncached_tokens() {
 
     let mut cb = SilentLoadCallbacks;
     let mut weights_a = load_model_weights_kquant(&vindex_path, &mut cb).expect("load weights A");
-    let mut weights_b = load_model_weights_kquant(&vindex_path, &mut cb).expect("load weights B");
+    let weights_b = load_model_weights_kquant(&vindex_path, &mut cb).expect("load weights B");
     let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb).expect("load index");
     index.load_attn_kquant(&vindex_path).expect("load attn Q4K");
     index
@@ -107,7 +107,7 @@ fn cached_decode_matches_uncached_tokens() {
     for step in 1..STEPS {
         let abs_position = prompt_ids.len() + (step - 1);
         let (h_new, _) =
-            predict_kquant_decode_step(&mut weights_a, next_id, &index, &mut cache, abs_position)
+            predict_kquant_decode_step(&weights_a, next_id, &index, &mut cache, abs_position)
                 .expect("cached decode step");
         next_id = argmax_token(&weights_a, &tokenizer, &h_new);
         cached_ids.push(next_id);
@@ -115,12 +115,12 @@ fn cached_decode_matches_uncached_tokens() {
 
     // ── Path B: uncached predict_kquant_hidden per step ──────────────
     let mut ids = prompt_ids.clone();
-    let h_full = predict_kquant_hidden(&mut weights_b, &ids, &index, None);
+    let h_full = predict_kquant_hidden(&weights_b, &ids, &index, None);
     let mut next_id = argmax_token(&weights_b, &tokenizer, &h_full);
     let mut uncached_ids = vec![next_id];
     ids.push(next_id);
     for _ in 1..STEPS {
-        let h_full = predict_kquant_hidden(&mut weights_b, &ids, &index, None);
+        let h_full = predict_kquant_hidden(&weights_b, &ids, &index, None);
         next_id = argmax_token(&weights_b, &tokenizer, &h_full);
         uncached_ids.push(next_id);
         ids.push(next_id);
@@ -192,7 +192,7 @@ fn direct_matvec_decode_matches_dequant_path() {
     for step in 1..STEPS {
         let abs_position = prompt_ids.len() + (step - 1);
         let (h_new, _) =
-            predict_kquant_decode_step(&mut weights_b, next_id, &index, &mut cache_b, abs_position)
+            predict_kquant_decode_step(&weights_b, next_id, &index, &mut cache_b, abs_position)
                 .expect("dequant decode step");
         next_id = argmax_token(&weights_b, &tokenizer, &h_new);
         dequant_ids.push(next_id);
@@ -225,5 +225,40 @@ fn direct_matvec_decode_matches_dequant_path() {
         any_match,
         "direct and dequant decode disagree on every position — looks like a structural bug, \
          not Q8 rounding drift: {direct_ids:?} vs {dequant_ids:?}"
+    );
+
+    // ── One-step hidden-state cosine gate ─────────────────────────────
+    // Token-level "any match" tolerates a lot; the hidden state does not.
+    // From identical caches and an identical input token, the direct step
+    // must track the dequant step at ≥0.999 cosine. The q4_common f16
+    // subnormal bug sat at 0.929 here (post-QK-norm K corruption on
+    // subnormal-scale blocks) while this test's token assertions passed.
+    let (h_a, mut cache_a, _) = predict_kquant_prefill(&mut weights_a, &prompt_ids, &index);
+    let first = argmax_token(&weights_a, &tokenizer, &h_a);
+    let (_, mut cache_b, _) = predict_kquant_prefill(&mut weights_b, &prompt_ids, &index);
+    let h_direct = predict_kquant_decode_step_direct(
+        &mut weights_a,
+        first,
+        &index,
+        &backend,
+        &mut cache_a,
+        prompt_ids.len(),
+    )
+    .expect("direct step");
+    let (h_dequant, _) =
+        predict_kquant_decode_step(&weights_b, first, &index, &mut cache_b, prompt_ids.len())
+            .expect("dequant step");
+    let a = h_direct.row(0);
+    let b = h_dequant.row(0);
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let cos = dot / (na * nb);
+    eprintln!("one-step hidden cosine (direct vs dequant): {cos:.6}");
+    assert!(
+        cos >= 0.999,
+        "direct decode step no longer tracks the dequant step: hidden cosine {cos:.6} \
+         (norms {na:.1} vs {nb:.1}) — kernel-level decode divergence, run \
+         examples/ave_q4k_row_audit.rs"
     );
 }

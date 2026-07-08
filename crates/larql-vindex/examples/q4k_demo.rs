@@ -61,6 +61,7 @@ fn main() {
         "demo/q4k",
         &out_f32,
         5,
+        0, // summary_features_per_expert (off)
         ExtractLevel::All,
         StorageDtype::F32,
         QuantFormat::None,
@@ -84,6 +85,7 @@ fn main() {
         "demo/q4k",
         &out_q4k,
         5,
+        0, // summary_features_per_expert (off)
         ExtractLevel::All,
         StorageDtype::F32,
         QuantFormat::Q4K,
@@ -131,9 +133,12 @@ fn main() {
 
     // ── Manifest preview ──
 
-    println!("\n── attn_weights_q4k_manifest.json (first 2 entries) ──");
-    let attn_manifest =
-        std::fs::read_to_string(out_q4k.join("attn_weights_q4k_manifest.json")).unwrap();
+    // K-quant writer emits `attn_weights_kquant_manifest.json` (the old
+    // `attn_weights_q4k_manifest.json` name is a legacy fallback). Use the
+    // canonical filename constant so this demo tracks future renames.
+    let attn_manifest_name = larql_vindex::format::filenames::ATTN_WEIGHTS_KQUANT_MANIFEST_JSON;
+    println!("\n── {attn_manifest_name} (first 2 entries) ──");
+    let attn_manifest = std::fs::read_to_string(out_q4k.join(attn_manifest_name)).unwrap();
     let attn_entries: Vec<serde_json::Value> = serde_json::from_str(&attn_manifest).unwrap();
     for entry in attn_entries.iter().take(2) {
         println!("  {{ key: {},", entry["key"].as_str().unwrap());

@@ -27,7 +27,7 @@ pub struct ExtendOutput {
 ///
 /// `abs_start` is the absolute position of the *first new token*.
 pub fn rs_extend_from_checkpoint(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     token_ids: &[u32],
     prior_kv: Vec<SharedKV>,
     abs_start: usize,
@@ -39,6 +39,7 @@ pub fn rs_extend_from_checkpoint(
         abs_start,
         &larql_compute::CpuBackend,
         None,
+        None,
     )
 }
 
@@ -49,12 +50,13 @@ pub fn rs_extend_from_checkpoint(
 /// full window — a real overhead on growing caches.
 #[allow(clippy::too_many_arguments)]
 pub fn rs_extend_from_checkpoint_backend(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     token_ids: &[u32],
     prior_kv: Vec<SharedKV>,
     abs_start: usize,
     backend: &dyn ComputeBackend,
     moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<ExtendOutput> {
     let num_layers = weights.num_layers;
 
@@ -70,7 +72,7 @@ pub fn rs_extend_from_checkpoint_backend(
 
     for (i, &token_id) in token_ids.iter().enumerate() {
         let abs_position = abs_start + i;
-        let mut h = embed_tokens_pub(weights, &[token_id]);
+        let mut h = embed_tokens_pub(&weights, &[token_id]);
 
         for (layer, kv_slot) in kv_cache.iter_mut().enumerate() {
             let kv_entry: Option<&SharedKV> = if kv_slot.0.shape()[0] > 0 {
@@ -79,18 +81,28 @@ pub fn rs_extend_from_checkpoint_backend(
                 None
             };
 
-            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-                weights,
-                &h,
-                layer,
-                kv_entry,
-                abs_position,
-                Some(backend),
-            )?;
+            let (h_post_attn, new_kv) =
+                larql_inference::attention::run_attention_block_decode_step_auto(
+                    weights,
+                    &h,
+                    layer,
+                    kv_entry,
+                    abs_position,
+                    Some(backend),
+                    index.map(|v| v as &dyn larql_compute::KvIndex),
+                )?;
 
-            let bffn = BackendFfn { weights, backend };
-            let h_out =
-                crate::engines::layer_ffn_or_moe(weights, &h_post_attn, layer, &bffn, moe_ffn);
+            let bffn = BackendFfn {
+                weights: weights.canonical(),
+                backend,
+            };
+            let h_out = crate::engines::layer_ffn_or_moe(
+                weights.canonical(),
+                &h_post_attn,
+                layer,
+                &bffn,
+                moe_ffn,
+            );
             h = h_out;
             *kv_slot = new_kv;
         }
@@ -115,6 +127,103 @@ pub fn rs_extend_from_checkpoint_backend(
     })
 }
 
+/// In-place multi-token extend for the decode hot path (the W8.2/in-place twin
+/// of [`rs_extend_from_checkpoint_backend`]). Appends each token's K/V row into
+/// the caller's **doubling-capacity** `kv_cache` buffers — starting at logical
+/// row `prior_len` — and attends over the growing `[..len]` views, instead of
+/// rebuilding an owned `[len+1, kv_dim]` concat every layer every step (the
+/// O(window²) cost the owned-concat form pays). On return each buffer holds
+/// `prior_len + token_ids.len()` logical rows (track that count in the caller —
+/// the buffers are over-allocated, so `shape()[0]` is capacity, not length).
+///
+/// Per-layer fallback: if a layer has no Q4K attn bytes the in-place projection
+/// returns `None`, so this writes the owned-concat result back into the buffer
+/// for that layer — buffers stay consistent. Same numerics as the owned-concat
+/// form (engine-level A/B test), only the cache representation differs.
+#[allow(clippy::too_many_arguments)]
+pub fn rs_extend_inplace(
+    weights: larql_inference::WeightsView,
+    token_ids: &[u32],
+    kv_cache: &mut [SharedKV],
+    prior_len: usize,
+    abs_start: usize,
+    backend: &dyn ComputeBackend,
+    moe_ffn: Option<&dyn larql_inference::ffn::FfnBackend>,
+    index: Option<&larql_vindex::VectorIndex>,
+) -> Option<Array2<f32>> {
+    let num_layers = weights.num_layers;
+    if token_ids.is_empty() || kv_cache.len() != num_layers {
+        return None;
+    }
+    let idx_kv: Option<&dyn larql_compute::KvIndex> =
+        index.map(|v| v as &dyn larql_compute::KvIndex);
+    let mut last_hidden: Option<Array2<f32>> = None;
+
+    for (i, &token_id) in token_ids.iter().enumerate() {
+        let abs_position = abs_start + i;
+        // Logical row count of every buffer at the start of this token: the
+        // prior window length plus the tokens already appended this call.
+        let len = prior_len + i;
+        let mut h = embed_tokens_pub(&weights, &[token_id]);
+
+        for (layer, (k_buf, v_buf)) in kv_cache.iter_mut().enumerate() {
+            let h_post_attn =
+                match larql_inference::attention::run_attention_block_decode_step_auto_inplace(
+                    weights,
+                    &h,
+                    layer,
+                    k_buf,
+                    v_buf,
+                    len,
+                    abs_position,
+                    Some(backend),
+                    idx_kv,
+                ) {
+                    Some(hp) => hp,
+                    None => {
+                        // Q4K-direct off / no attn bytes: owned concat over the
+                        // `[..len]` view, then replace the buffer.
+                        let prior: SharedKV = (
+                            k_buf.slice(ndarray::s![..len, ..]).to_owned(),
+                            v_buf.slice(ndarray::s![..len, ..]).to_owned(),
+                        );
+                        let prior_ref = if len > 0 { Some(&prior) } else { None };
+                        let (hp, new_kv) =
+                            larql_inference::attention::run_attention_block_decode_step_auto(
+                                weights,
+                                &h,
+                                layer,
+                                prior_ref,
+                                abs_position,
+                                Some(backend),
+                                idx_kv,
+                            )?;
+                        *k_buf = new_kv.0;
+                        *v_buf = new_kv.1;
+                        hp
+                    }
+                };
+
+            let bffn = BackendFfn {
+                weights: weights.canonical(),
+                backend,
+            };
+            let h_out = crate::engines::layer_ffn_or_moe(
+                weights.canonical(),
+                &h_post_attn,
+                layer,
+                &bffn,
+                moe_ffn,
+            );
+            h = h_out;
+        }
+
+        last_hidden = Some(h);
+    }
+
+    last_hidden
+}
+
 /// CPU Q4K variant of [`rs_extend_from_checkpoint_backend`].
 ///
 /// Uses `WalkFfn` (reads Q4K bytes directly from `index`) for FFN instead of
@@ -122,7 +231,7 @@ pub fn rs_extend_from_checkpoint_backend(
 /// uses the dequantised f32 tensors already inserted by
 /// `ensure_attn_tensors_dequantised`. Call that before this function.
 pub fn rs_extend_from_checkpoint_quant(
-    weights: &ModelWeights,
+    weights: larql_inference::WeightsView,
     index: &VectorIndex,
     token_ids: &[u32],
     prior_kv: Vec<SharedKV>,
@@ -145,8 +254,9 @@ pub fn rs_extend_from_checkpoint_quant(
     // Hoist WalkFfn out of both loops. Previously this rebuilt the
     // WalkFfn once per (token, layer) — N×34 times per extend call.
     // It's now once total. WalkFfn carries no per-(token,layer) state.
-    let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-        .with_backend(backend);
+    let walk_ffn =
+        WalkFfn::from_config(weights.canonical(), index, WalkFfnConfig::dense(num_layers))
+            .with_backend(backend);
 
     // Per-stage timing. `LARQL_INSTRUMENT_UNLIMITED=1` enables the
     // verbose stderr line; `profiler` is the structured channel used by
@@ -171,7 +281,7 @@ pub fn rs_extend_from_checkpoint_quant(
         } else {
             None
         };
-        let mut h = embed_tokens_pub(weights, &[token_id]);
+        let mut h = embed_tokens_pub(&weights, &[token_id]);
         if let Some(start) = t_embed_start {
             t_embed += start.elapsed().as_secs_f64() * 1e6;
         }
@@ -191,7 +301,7 @@ pub fn rs_extend_from_checkpoint_quant(
                 None
             };
             let attn_native = larql_inference::vindex::attention_decode_step_native(
-                weights,
+                weights.canonical(),
                 index,
                 backend,
                 &h,
@@ -226,7 +336,7 @@ pub fn rs_extend_from_checkpoint_quant(
                 None
             };
             let ffn_native = larql_inference::vindex::ffn_decode_step_native(
-                weights,
+                weights.canonical(),
                 index,
                 backend,
                 &h_post_attn,
@@ -236,7 +346,7 @@ pub fn rs_extend_from_checkpoint_quant(
                 t_ffn_helper_misses += 1;
             }
             let h_out = ffn_native.unwrap_or_else(|| {
-                let (h, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+                let (h, _) = run_ffn(&weights, &h_post_attn, layer, &walk_ffn, false);
                 h
             });
             if let Some(start) = t_ffn_start {
@@ -335,7 +445,8 @@ mod tests {
     fn extend_empty_tokens_returns_none() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let result = rs_extend_from_checkpoint(&weights, &[], prior, 0);
+        let result =
+            rs_extend_from_checkpoint(larql_inference::WeightsView::dense(&weights), &[], prior, 0);
         assert!(result.is_none(), "empty token_ids should return None");
     }
 
@@ -343,7 +454,12 @@ mod tests {
     fn extend_wrong_prior_len_returns_none() {
         let weights = make_test_weights();
         // prior has 0 layers but model has 2 — mismatch
-        let result = rs_extend_from_checkpoint(&weights, &[0u32], Vec::new(), 0);
+        let result = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            Vec::new(),
+            0,
+        );
         assert!(result.is_none(), "prior length mismatch should return None");
     }
 
@@ -351,8 +467,13 @@ mod tests {
     fn extend_single_token_from_empty_prior() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output = rs_extend_from_checkpoint(&weights, &[0u32], prior, 0)
-            .expect("single token extend should succeed");
+        let output = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            prior,
+            0,
+        )
+        .expect("single token extend should succeed");
         assert_eq!(output.last_hidden.shape(), &[1, weights.hidden_size]);
         assert!(output.last_hidden.iter().all(|v| v.is_finite()));
     }
@@ -361,8 +482,13 @@ mod tests {
     fn extend_kv_cache_grows_with_each_token() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output =
-            rs_extend_from_checkpoint(&weights, &[0u32, 1, 2], prior, 0).expect("3-token extend");
+        let output = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32, 1, 2],
+            prior,
+            0,
+        )
+        .expect("3-token extend");
         // After 3 tokens from empty prior, K has 3 rows per layer
         let kv_dim = weights.num_kv_heads * weights.head_dim;
         for (k, v) in &output.kv_cache {
@@ -375,8 +501,13 @@ mod tests {
     fn extend_checkpoint_is_last_row_of_kv_cache() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output =
-            rs_extend_from_checkpoint(&weights, &[0u32, 1], prior, 0).expect("2-token extend");
+        let output = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32, 1],
+            prior,
+            0,
+        )
+        .expect("2-token extend");
         // new_checkpoint should be the last row of each K/V
         for (layer, ((k_cache, v_cache), (k_ckpt, v_ckpt))) in output
             .kv_cache
@@ -401,8 +532,20 @@ mod tests {
     fn extend_abs_start_shifts_rope() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let out0 = rs_extend_from_checkpoint(&weights, &[0u32], prior.clone(), 0).unwrap();
-        let out5 = rs_extend_from_checkpoint(&weights, &[0u32], prior, 5).unwrap();
+        let out0 = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            prior.clone(),
+            0,
+        )
+        .unwrap();
+        let out5 = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            prior,
+            5,
+        )
+        .unwrap();
         // Different abs_start → different RoPE → different K
         let k0 = &out0.kv_cache[0].0;
         let k5 = &out5.kv_cache[0].0;
@@ -417,7 +560,13 @@ mod tests {
     fn extend_output_logits_are_finite() {
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let output = rs_extend_from_checkpoint(&weights, &[0u32], prior, 0).unwrap();
+        let output = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            prior,
+            0,
+        )
+        .unwrap();
         let logits = hidden_to_raw_logits(&weights, &output.last_hidden);
         assert!(logits.iter().all(|v| v.is_finite()));
     }
@@ -427,10 +576,21 @@ mod tests {
         // Extending from a non-empty checkpoint should not panic and should be finite.
         let weights = make_test_weights();
         let prior = empty_prior(&weights);
-        let first = rs_extend_from_checkpoint(&weights, &[0u32], prior, 0).unwrap();
+        let first = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[0u32],
+            prior,
+            0,
+        )
+        .unwrap();
         // Use the checkpoint from the first extend as the prior for the second
-        let second = rs_extend_from_checkpoint(&weights, &[1u32], first.new_checkpoint.clone(), 1)
-            .expect("extend from non-empty prior");
+        let second = rs_extend_from_checkpoint(
+            larql_inference::WeightsView::dense(&weights),
+            &[1u32],
+            first.new_checkpoint.clone(),
+            1,
+        )
+        .expect("extend from non-empty prior");
         assert_eq!(second.last_hidden.shape(), &[1, weights.hidden_size]);
         assert!(second.last_hidden.iter().all(|v| v.is_finite()));
     }
@@ -443,7 +603,15 @@ mod tests {
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let prior = empty_prior(&weights);
-        let out = rs_extend_from_checkpoint_quant(&weights, &index, &[], prior, 0, &*backend, None);
+        let out = rs_extend_from_checkpoint_quant(
+            larql_inference::WeightsView::dense(&weights),
+            &index,
+            &[],
+            prior,
+            0,
+            &*backend,
+            None,
+        );
         assert!(out.is_none(), "empty token_ids should return None");
     }
 
@@ -453,7 +621,7 @@ mod tests {
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let out = rs_extend_from_checkpoint_quant(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &index,
             &[0u32],
             Vec::new(),
@@ -471,7 +639,7 @@ mod tests {
         let backend = larql_compute::cpu_backend();
         let prior = empty_prior(&weights);
         let out = rs_extend_from_checkpoint_quant(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &index,
             &[0u32, 1, 2],
             prior,
@@ -497,7 +665,7 @@ mod tests {
         let index = larql_inference::test_utils::make_test_vindex(&weights);
         let backend = larql_compute::cpu_backend();
         let first = rs_extend_from_checkpoint_quant(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &index,
             &[0u32, 1],
             empty_prior(&weights),
@@ -507,7 +675,7 @@ mod tests {
         )
         .expect("first extend");
         let second = rs_extend_from_checkpoint_quant(
-            &weights,
+            larql_inference::WeightsView::dense(&weights),
             &index,
             &[2u32],
             first.kv_cache.clone(),

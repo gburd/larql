@@ -11,6 +11,27 @@ fn lql_path(path: impl AsRef<std::path::Path>) -> String {
     path.as_ref().display().to_string().replace('\\', "\\\\")
 }
 
+/// RAII guard that forces `LARQL_MEMIT_ENABLE=1` on the current thread via the
+/// `larql_compute::options` thread-local override and clears it on drop.
+/// Replaces `std::env::set_var`/`remove_var`, which mutate process-global env
+/// and race the concurrent `getenv` other parallel tests drive on the decode
+/// path → SIGSEGV in libc. The COMPILE paths read this flag through
+/// `larql_compute::options::env_value`, so the override is honoured.
+struct MemitEnableGuard;
+
+impl MemitEnableGuard {
+    fn on() -> Self {
+        larql_compute::options::set_env_override("LARQL_MEMIT_ENABLE", Some("1"));
+        MemitEnableGuard
+    }
+}
+
+impl Drop for MemitEnableGuard {
+    fn drop(&mut self) {
+        larql_compute::options::clear_fast_path_overrides();
+    }
+}
+
 // ── Session state: no backend ──
 
 #[test]
@@ -4673,9 +4694,13 @@ fn compile_into_vindex_with_memit_enabled_runs_solver_path() {
     ))
     .unwrap();
 
-    std::env::set_var("LARQL_MEMIT_ENABLE", "1");
+    // Toggle MEMIT on for the duration of this call via the thread-local
+    // override (NOT `std::env::set_var`, which races concurrent `getenv` on
+    // the decode path that other parallel tests drive → SIGSEGV). Production
+    // reads this through `larql_compute::options::env_value`, so the override
+    // wins. Cleared on guard drop.
+    let _memit = MemitEnableGuard::on();
     let result = session.execute(&stmt);
-    std::env::remove_var("LARQL_MEMIT_ENABLE");
 
     // Random-init weights mean the MEMIT solve might not produce
     // a useful delta but the code path runs end-to-end.
@@ -4755,10 +4780,11 @@ fn compile_into_model_with_memit_enabled_runs() {
     ))
     .unwrap();
 
-    // Toggle MEMIT on for the duration of this call.
-    std::env::set_var("LARQL_MEMIT_ENABLE", "1");
+    // Toggle MEMIT on for the duration of this call via the thread-local
+    // override (NOT `std::env::set_var`, which races concurrent `getenv` on
+    // the decode path → SIGSEGV). See `compile_into_vindex_with_memit_enabled_runs_solver_path`.
+    let _memit = MemitEnableGuard::on();
     let result = session.execute(&stmt);
-    std::env::remove_var("LARQL_MEMIT_ENABLE");
 
     // The MEMIT solve may or may not converge cleanly with random-init
     // weights — accept either outcome but exercise the path.

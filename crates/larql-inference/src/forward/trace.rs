@@ -39,7 +39,8 @@ pub fn capture_spec_residuals(weights: &ModelWeights, token_ids: &[u32]) -> Spec
     let mut post_layer_last = Vec::with_capacity(weights.num_layers);
 
     for layer in 0..weights.num_layers {
-        let h_post_attn = match run_attention(weights, &h, layer) {
+        let h_post_attn = match run_attention(larql_models::WeightsView::dense(weights), &h, layer)
+        {
             Some(pa) => pa,
             None => h.clone(),
         };
@@ -89,13 +90,13 @@ pub fn trace_forward_attn_only_with_head_zero(
     for layer in 0..=max_layer {
         let heads_to_zero = head_zero_map.get(&layer).unwrap_or(&empty);
         let h_post_attn = if heads_to_zero.is_empty() {
-            match run_attention(weights, &h, layer) {
+            match run_attention(larql_models::WeightsView::dense(weights), &h, layer) {
                 Some(p) => p,
                 None => h.clone(),
             }
         } else {
             match crate::attention::run_attention_block_zero_pre_o_heads(
-                weights,
+                larql_models::WeightsView::dense(weights),
                 &h,
                 layer,
                 heads_to_zero,
@@ -134,15 +135,19 @@ pub fn trace_forward_attn_only_capture_pre_o(
     for layer in 0..=max_layer {
         if capture_layers.contains(&layer) {
             // Capture both the post-attention residual (advances h) and pre_o.
-            if let Some((h_post_attn, pre_o)) =
-                crate::attention::run_attention_block_with_pre_o(weights, &h, layer)
-            {
+            if let Some((h_post_attn, pre_o)) = crate::attention::run_attention_block_with_pre_o(
+                larql_models::WeightsView::dense(weights),
+                &h,
+                layer,
+            ) {
                 captures.insert(layer, pre_o);
                 h = h_post_attn;
             } else {
                 // Skip layer with degenerate weights — leave h unchanged.
             }
-        } else if let Some(h_post_attn) = run_attention(weights, &h, layer) {
+        } else if let Some(h_post_attn) =
+            run_attention(larql_models::WeightsView::dense(weights), &h, layer)
+        {
             h = h_post_attn;
         }
     }
@@ -161,7 +166,15 @@ pub fn forward_to_layer(
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
 
     for layer in 0..=stop_layer {
-        h = match run_layer_with_ffn(weights, &h, layer, &ffn, false, ple_inputs.get(layer), None) {
+        h = match run_layer_with_ffn(
+            larql_models::WeightsView::dense(weights),
+            &h,
+            layer,
+            &ffn,
+            false,
+            ple_inputs.get(layer),
+            None,
+        ) {
             Some((h_new, _, _)) => h_new,
             None => continue,
         };
@@ -239,7 +252,7 @@ pub fn capture_ffn_activation_matrix(
         // truncation that happens there.
         let need_activation = l == layer;
         let (h_new, activation, _, _) = crate::forward::layer::run_layer_with_capture(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             l,
             &ffn,
@@ -439,7 +452,7 @@ pub fn trace_forward_full_hooked(
         let need_attention = capture_attention && is_capture_layer;
 
         let (h_new, activation, attn_weights, _) = match run_layer_with_capture_hooked(
-            weights,
+            larql_models::WeightsView::dense(weights),
             &h,
             layer,
             ffn,

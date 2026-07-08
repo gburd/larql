@@ -14,18 +14,21 @@ use ndarray::{s, Array2};
 /// next step recomputes from `stored`. Bit-equivalent to the
 /// non-cached path under fixed RoPE positions.
 ///
-/// Invariants when `hot_kv = Some(kv)`:
+/// Invariants when `hot_kv = Some(kv)` (logical length is `hot_len`, not
+/// `shape()[0]` — both `stored` and `hot_kv` may be over-allocated):
 ///   - `kv.len() == stored.len()` (one entry per layer)
-///   - `kv[l].0.shape()[0] == stored[l].shape()[0]` for every `l`
-///   - row `i` of `kv[l]` corresponds to row `i` of `stored[l]` at
-///     RoPE position `next_position - stored[l].shape()[0] + i`
+///   - `kv[l].0` and `stored[l]` agree on their first `hot_len` rows
+///   - row `i` (`i < hot_len`) of `kv[l]` corresponds to row `i` of
+///     `stored[l]` at RoPE position `next_position - hot_len + i`
 pub struct RsStore {
     /// Per-layer residual stream. **Possibly over-allocated**: with W8.2,
     /// the dispatch hot path pre-allocates `stored[l]` to a doubling
     /// capacity and only the first `hot_len` rows are logically valid.
     /// Readers that want the row count **must** use [`Self::hot_len`],
-    /// not `stored[l].shape()[0]`. Non-dispatch paths (CPU walk,
-    /// rs_extend_from_checkpoint_*) still write narrow arrays where
+    /// not `stored[l].shape()[0]`. The resident walk's cache_eligible
+    /// path (`rs_decode_step_inner`) now appends in place into the same
+    /// doubling buffer; only the windowed/cold rebuild and
+    /// `rs_extend_from_checkpoint_*` still write narrow arrays where
     /// `hot_len == shape()[0]`.
     pub stored: Vec<Array2<f32>>,
     /// Per-layer cold residuals. **Doubling-capacity** as of 2026-05-19

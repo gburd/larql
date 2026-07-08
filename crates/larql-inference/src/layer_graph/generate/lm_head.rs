@@ -18,11 +18,13 @@ impl LmHeadPolicy {
     }
 }
 
+/// `1`/`true`/`on`/`yes` → true, everything else (incl. unset) → false.
+/// Delegates to the override-aware `options::env_opt_in` (identical vocabulary)
+/// so tests can toggle the flag via the thread-local override instead of
+/// `std::env::set_var`, which races concurrent `getenv` on the decode path →
+/// SIGSEGV.
 fn env_bool(name: &str) -> bool {
-    matches!(
-        std::env::var(name).as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
-    )
+    larql_compute::options::env_opt_in(name)
 }
 
 /// Top-K logits lookup that transparently handles models with tied
@@ -322,19 +324,27 @@ mod tests {
 
     #[test]
     fn env_bool_recognises_truthy_values() {
-        std::env::remove_var("LARQL_TEST_LMHEAD_ENV_BOOL");
-        assert!(!env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"));
+        // Toggle via the thread-local override (NOT `std::env::set_var`, which
+        // races concurrent `getenv` on the decode path → SIGSEGV). Cleared on
+        // drop so a panicking assert can't leak into a later test.
+        const VAR: &str = "LARQL_LM_HEAD_SKIP_Q4K";
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                larql_compute::options::clear_fast_path_overrides();
+            }
+        }
+        let _clear = Clear;
+
+        larql_compute::options::set_env_override(VAR, None);
+        assert!(!env_bool(VAR));
         for &v in &["1", "true", "on", "yes"] {
-            std::env::set_var("LARQL_TEST_LMHEAD_ENV_BOOL", v);
-            assert!(
-                env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"),
-                "value {v:?} should be truthy"
-            );
+            larql_compute::options::set_env_override(VAR, Some(v));
+            assert!(env_bool(VAR), "value {v:?} should be truthy");
         }
         // Falsy: anything else.
-        std::env::set_var("LARQL_TEST_LMHEAD_ENV_BOOL", "no");
-        assert!(!env_bool("LARQL_TEST_LMHEAD_ENV_BOOL"));
-        std::env::remove_var("LARQL_TEST_LMHEAD_ENV_BOOL");
+        larql_compute::options::set_env_override(VAR, Some("no"));
+        assert!(!env_bool(VAR));
     }
 
     #[test]
